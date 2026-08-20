@@ -1,0 +1,77 @@
+{
+  "skill_name": "grounded-build",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Use grounded-build to create a plan for replacing this repository's physical attempt_N rollback copies with auditable Git history. Claude and Codex are both available; Codex must perform final review. Do not implement.",
+      "expected_output": "The host selects Plan mode, freezes the request and Git SHA, obtains isolated Claude/Codex drafts and mutual cross-reviews, synthesizes evidence-backed plan and batch artifacts, runs a fresh Codex final review, and stops for user approval.",
+      "files": [],
+      "assertions": [
+        "Planning does not create an implementation branch or modify the original checkout.",
+        "The two initial drafts cannot see one another.",
+        "Repository claims cite named evidence rather than agent agreement.",
+        "Implementation does not begin without explicit approval."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I only have Claude. Start two separate Claude planners to investigate why this project's terminal tasks frequently report FAIL, make them review each other, and have both review the synthesized plan.",
+      "expected_output": "The host uses two isolated Claude instances, honestly records that provider diversity is false, performs mutual cross-review and dual final review, and produces a plan without claiming cross-model validation.",
+      "files": [],
+      "assertions": [
+        "Planner A and Planner B have separate processes, worktrees, and initial contexts.",
+        "provider_diversity is false while process isolation is preserved.",
+        "Both final reviewer slots must pass the same candidate.",
+        "Same-provider agreement is not represented as independent factual proof."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Audit my existing implementation plan with Claude and Codex. They disagree about whether the run should cover items 01-09 or all 22 items, and that choice changes the measurement design.",
+      "expected_output": "The workflow treats scope as a user/product boundary, preserves both evidence-backed positions, records the user's adjudication, and does not silently let a reviewer expand the plan.",
+      "files": [],
+      "assertions": [
+        "The disagreement is preserved instead of resolved by majority vote.",
+        "A material scope choice enters NEEDS_USER_DECISION.",
+        "The applied decision records actor and reason.",
+        "Final reviewers receive the authoritative decision."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "The verified plan is approved. Implement it in batches with Claude as the host and a fresh Claude process as reviewer because Codex quota is exhausted.",
+      "expected_output": "The host selects Implement mode, reads the transplanted implementation contract, snapshots the exported plan and batch manifest, and uses an isolated same-family reviewer without resetting budgets or touching the original checkout before finalization.",
+      "files": [],
+      "assertions": [
+        "Planning and implementation use separate run IDs and state roots.",
+        "Same-family review uses a separate process, context, and fixed-SHA worktree.",
+        "Reviewer infrastructure failure is not classified as code FAIL.",
+        "Only current-SHA PASS and required evidence permit batch acceptance."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "I already have a complete plan and batch manifest. Use grounded-build only to implement them; do not spend tokens generating two new plans.",
+      "expected_output": "The host routes directly to Implement mode and does not initialize or invoke the Plan mode workflow.",
+      "files": [],
+      "assertions": [
+        "No planning-agent calls are made.",
+        "The existing plan and batch manifest are independently snapshotted.",
+        "The implementation acceptance contract is still reviewed.",
+        "The original project remains untouched until explicit finalization."
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Resume run 20260819-abc123. First determine whether it is a planning run or implementation run; do not guess or initialize a replacement.",
+      "expected_output": "The host checks the mode-specific state roots and resumes only through the owning workflow at its reported phase.",
+      "files": [],
+      "assertions": [
+        "The host does not copy state between planning and implementation modes.",
+        "The host does not reset budgets or silently create a new run.",
+        "Frozen artifacts are validated before work resumes.",
+        "The reported mode, phase, and run path are included in the response."
+      ]
+    }
+  ]
+}
