@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,6 +29,23 @@ MAX_INVOCATIONS_PER_ASSIGNMENT = 3
 MAX_SYNTHESIS_SUBMISSIONS = 2
 TERMINAL_STATUSES = {"READY", "ABANDONED"}
 SKILL_ROOT = Path(__file__).resolve().parent.parent
+
+#: Codex's tool policy for a planning invocation, expressed as command-line overrides.
+#:
+#: These used to be written into a synthetic ``config.toml`` inside the private home, which
+#: silently REPLACED the user's own. A codex configured against a self-hosted gateway lost its
+#: provider, its base URL, and the bearer token that lives beside them, fell back to the vendor
+#: default endpoint, and returned 401 -- reported as a planning failure rather than as the
+#: configuration loss it was. ``-c`` layers over the file instead of erasing it (``codex --help``:
+#: "Override a configuration value that would otherwise be loaded from ~/.codex/config.toml"), so
+#: the policy is enforced without the workflow having to own the file, and it is visible in the
+#: dry-run where a written file was not.
+CODEX_POLICY_OVERRIDES = (
+    "-c", 'default_permissions="grounded_build"',
+    "-c", 'permissions.grounded_build.filesystem='
+          '{"~/.codex"="deny",":workspace_roots"={"."="read"}}',
+    "-c", "tools.web_search=false",
+)
 
 
 DRAFT_SCHEMA: dict[str, Any] = {
@@ -320,7 +338,29 @@ def required_final_reviewers(state: dict[str, Any]) -> dict[str, str]:
     return {"F": selected}
 
 
+def planning_worktrees(state: dict[str, Any]) -> list[Path]:
+    """Every checkout this run registered with git, newest layout first, without duplicates."""
+    if state.get("worktree"):
+        return [Path(state["worktree"])]
+    seen: dict[str, None] = {}
+    for path in (state.get("worktrees") or {}).values():
+        seen.setdefault(path, None)
+    return [Path(path) for path in seen]
+
+
 def reviewer_worktree(state: dict[str, Any], slot: str, provider: str) -> Path:
+    """The checkout an invocation reads.
+
+    One per run, shared. The slots do not need a copy each: the tree is detached at the frozen
+    baseline and mounted ``--ro-bind``, so no invocation can alter what another one sees, and the
+    isolation that matters -- separate process, separate sandbox, separate private home, disjoint
+    context files -- is not a property of the directory. A second checkout added nothing but a
+    second thing to validate, to lose track of when an attempt is killed, and to fail to clean up.
+
+    Runs initialized before this collapse keep their per-slot map and still resolve here.
+    """
+    if state.get("worktree"):
+        return Path(state["worktree"])
     if slot in {"A", "B"}:
         return Path(state["worktrees"][slot])
     for candidate, candidate_provider in state["planners"].items():
@@ -344,6 +384,7 @@ def agent_command(
         atomic_json(schema_path, schema)
         return [
             "codex", "-a", "never", "exec", "--ephemeral", "-s", "read-only",
+            *CODEX_POLICY_OVERRIDES,
             "-C", str(worktree), "--add-dir", str(context), "--output-schema", str(schema_path),
             "-o", str(raw), prompt,
         ]
@@ -355,6 +396,68 @@ def agent_command(
         "--disallowedTools", "Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch",
         "--add-dir", str(context), "--no-session-persistence", prompt,
     ]
+
+
+def sandbox_destination(source: Path, private_home: Path) -> Path:
+    """Where a host file appears inside the sandbox.
+
+    Anything under the real home is mirrored into the private home at the same relative path, so
+    ``~`` keeps resolving the way the file's own contents assume — a config that says
+    ``model_catalog_json = "~/.codex/models.json"`` finds it. Anything else is bound where it is.
+    """
+    try:
+        return private_home / source.relative_to(Path.home())
+    except ValueError:
+        return source
+
+
+def provider_trust_store(provider: str) -> list[Path]:
+    """The files a CLI needs in order to be itself: credentials AND the configuration around them.
+
+    The workflow used to name one file per provider and treat it as the whole credential store.
+    That is true of an ``auth.json``, and false of every deployment that authenticates through a
+    configured provider block: for those the token lives in ``config.toml`` beside the ``base_url``
+    it belongs to, and a sandbox holding one without the other has a key to a door it cannot find.
+
+    So the store is discovered, not declared. For codex that means its config, its auth file if it
+    keeps one, and whatever ``model_catalog_json`` points at — a real path in real installations,
+    and a startup failure when it is missing. Only files that exist are returned; a provider with
+    none of them is left to whatever it does without a home, which is what a missing login is.
+    """
+    if provider == "claude":
+        candidates = [Path.home() / ".claude" / ".credentials.json"]
+    elif provider == "codex":
+        codex_home = Path.home() / ".codex"
+        config = codex_home / "config.toml"
+        candidates = [config, codex_home / "auth.json"]
+        catalog = codex_catalog_path(config)
+        if catalog is not None:
+            candidates.append(catalog)
+    else:
+        candidates = []
+    seen: dict[Path, None] = {}
+    for candidate in candidates:
+        if candidate.is_file():
+            seen.setdefault(candidate.resolve(), None)
+    return list(seen)
+
+
+def codex_catalog_path(config: Path) -> Path | None:
+    """``model_catalog_json`` from a codex config, if it names a readable file.
+
+    Parse failures are not this function's business to report: an unreadable config is codex's own
+    error to raise, with its own message, rather than a planning workflow's guess at one.
+    """
+    if not config.is_file():
+        return None
+    try:
+        parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    declared = parsed.get("model_catalog_json")
+    if not isinstance(declared, str) or not declared.strip():
+        return None
+    return Path(declared).expanduser()
 
 
 def isolated_agent_command(
@@ -372,30 +475,13 @@ def isolated_agent_command(
     private_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
     provider = Path(command[0]).name
-    credential_sources = {
-        "claude": [Path.home() / ".claude" / ".credentials.json"],
-        "codex": [Path.home() / ".codex" / "auth.json"],
-    }[provider]
     credential_mounts: list[tuple[Path, Path]] = []
-    for source in credential_sources:
-        if source.is_file():
-            destination = private_home / source.parent.name / source.name
-            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            destination.touch(mode=0o600, exist_ok=True)
-            credential_mounts.append((source, destination))
-    if provider == "codex":
-        codex_config = private_home / ".codex" / "config.toml"
-        codex_config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        codex_config.write_text(
-            'default_permissions = "grounded_build"\n'
-            '[permissions.grounded_build.filesystem]\n'
-            '"~/.codex" = "deny"\n'
-            '[permissions.grounded_build.filesystem.":workspace_roots"]\n'
-            '"." = "read"\n'
-            '[tools]\nweb_search = false\n',
-            encoding="utf-8",
-        )
-    else:
+    for source in provider_trust_store(provider):
+        destination = sandbox_destination(source, private_home)
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination.touch(mode=0o600, exist_ok=True)
+        credential_mounts.append((source, destination))
+    if provider != "codex":
         disallowed_index = command.index("--disallowedTools") + 1
         private_root = f"//{str(private_home).lstrip('/')}"
         private_denies = ",".join(
@@ -623,18 +709,14 @@ def command_init(args: argparse.Namespace) -> None:
         (root / relative).mkdir(parents=True, exist_ok=True, mode=0o700)
     request_snapshot = root / "input" / "request.md"
     shutil.copyfile(request, request_snapshot)
-    worktrees: dict[str, str] = {}
-    try:
-        for slot in ("A", "B"):
-            worktree = root / "worktrees" / slot
-            result = run(["git", "-C", str(project), "worktree", "add", "--detach", str(worktree), baseline], timeout=120)
-            if result.returncode != 0:
-                raise WorkflowError(result.stderr.strip() or "could not create planning worktree")
-            worktrees[slot] = str(worktree)
-    except Exception:
-        for path in worktrees.values():
-            run(["git", "-C", str(project), "worktree", "remove", "--force", path], timeout=120)
-        raise
+    # One checkout, shared by both slots and by the final reviewers. See reviewer_worktree.
+    worktree = root / "worktrees" / "baseline"
+    result = run(
+        ["git", "-C", str(project), "worktree", "add", "--detach", str(worktree), baseline],
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise WorkflowError(result.stderr.strip() or "could not create planning worktree")
     state: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "software_version": VERSION,
@@ -646,7 +728,7 @@ def command_init(args: argparse.Namespace) -> None:
         "planners": topology,
         "provider_diversity": len(set(topology.values())) > 1,
         "final_reviewer": args.final_reviewer,
-        "worktrees": worktrees,
+        "worktree": str(worktree),
         "status": "INITIALIZED",
         "drafts": {},
         "cross_reviews": {},
@@ -1021,7 +1103,7 @@ def command_cleanup(args: argparse.Namespace) -> None:
     state = load_state(project, args.run_id)
     if state["status"] not in TERMINAL_STATUSES:
         raise WorkflowError("cleanup is allowed only after READY or ABANDONED")
-    existing = [path for path in state["worktrees"].values() if Path(path).exists()]
+    existing = [str(path) for path in planning_worktrees(state) if path.exists()]
     if not args.apply:
         emit({"status": "CLEANUP_PREVIEW", "run_id": state["run_id"], "worktrees": existing})
     removed: list[str] = []

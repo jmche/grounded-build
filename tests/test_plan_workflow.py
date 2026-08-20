@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -131,7 +132,19 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertFalse(initialized["provider_diversity"])
         self.run_through_cross_review(initialized)
         state = self.get_state(initialized)
-        self.assertNotEqual(state["worktrees"]["A"], state["worktrees"]["B"])
+        # Isolation is not a property of the directory. The two instances share ONE checkout,
+        # detached at the frozen baseline and mounted read-only, and are separated by everything
+        # else: their own process, sandbox, private home, and context. This used to assert two
+        # distinct paths -- pinning the mechanism, and with it a second registration to lose when
+        # an attempt is killed.
+        self.assertEqual(Path(state["worktree"]).name, "baseline")
+        registered = subprocess.check_output(
+            ["git", "-C", str(self.project), "worktree", "list", "--porcelain"], text=True)
+        self.assertEqual(registered.count(str(Path(state["worktree"]))), 1)
+        for slot in ("A", "B"):
+            invocation = next((Path(initialized["run_directory"]) / f"draft-{slot}").parent.glob(
+                f"invocations/draft-{slot}/attempt_1_*"))
+            self.assertNotEqual(invocation / "home", Path(state["worktree"]))
         draft_a_context = next((Path(initialized["run_directory"]) / "invocations" / "draft-A").glob("attempt_1_*/context"))
         self.assertEqual([item.name for item in draft_a_context.iterdir() if item.name != "schema.json"], ["request.md"])
         self.submit_candidate(initialized)
@@ -193,15 +206,19 @@ class PlanWorkflowTest(unittest.TestCase):
 
         # A fresh fixture is unnecessary: abandoning is not required to initialize another run.
         codex_run = self.initialize("codex", "codex")
-        self.call(
+        preview = self.call(
             "draft", "--project", str(self.project), "--run-id", codex_run["run_id"],
             "--slot", "A", "--dry-run",
         )
-        configs = list(Path(codex_run["run_directory"]).glob("invocations/draft-A/attempt_1_*/home/.codex/config.toml"))
-        self.assertEqual(len(configs), 1)
-        config = configs[0].read_text(encoding="utf-8")
-        self.assertIn('"~/.codex" = "deny"', config)
-        self.assertIn("web_search = false", config)
+        # The same policy, carried on the command line. It was written into a config file inside
+        # the private home, which replaced whatever the user's own config said -- including, for a
+        # codex pointed at a self-hosted gateway, the provider block holding its base URL and
+        # token. `-c` layers over the file rather than erasing it, so the deny survives a
+        # configuration this workflow does not have to understand.
+        line = " ".join(preview["command"])
+        self.assertIn('"~/.codex"="deny"', line)
+        self.assertIn("tools.web_search=false", line)
+        self.assertIn('default_permissions="grounded_build"', line)
 
     def test_pass_with_blocking_finding_is_rejected(self) -> None:
         self.request.write_text(self.request.read_text() + "\nFAKE_PASS_BLOCKING=F\n")
@@ -244,7 +261,7 @@ class PlanWorkflowTest(unittest.TestCase):
         draft = json.loads(Path(self.get_state(initialized)["drafts"]["A"]["path"]).read_text(encoding="utf-8"))
         self.assertIn("canary_visible=False", draft["summary"])
         self.assertIn("git_ok=True", draft["summary"])
-        (Path(state["worktrees"]["B"]) / "drift.txt").write_text("drift", encoding="utf-8")
+        (Path(state["worktree"]) / "drift.txt").write_text("drift", encoding="utf-8")
         result = self.call("draft", "--project", str(self.project), "--run-id", initialized["run_id"], "--slot", "B", expect=2)
         self.assertIn("planning worktree is dirty", result["error"])
 
@@ -264,6 +281,130 @@ class PlanWorkflowTest(unittest.TestCase):
             "--reviewer", "F",
         )
         self.assertEqual(result["status"], "NEEDS_USER_DECISION")
+
+
+class CodexTrustStoreTest(unittest.TestCase):
+    """What the sandbox must carry for a CLI to still be the CLI the user configured.
+
+    The incident: a codex authenticating through a self-hosted gateway. Its provider block, base
+    URL, and bearer token all live in ``config.toml``; it keeps no ``auth.json`` at all. The
+    workflow named ``auth.json`` as the whole credential store, found nothing, and then WROTE its
+    own ``config.toml`` over the private home's -- so codex started with no provider, fell back to
+    the vendor default endpoint, and returned 401 five times. That surfaced as a failed planning
+    draft. Nothing had failed except the sandbox's idea of what a credential is.
+    """
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp(prefix="gb-home-"))
+        self.previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        spec = importlib.util.spec_from_file_location("gb_plan_workflow", SCRIPT)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.codex_home = self.home / ".codex"
+        self.codex_home.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        if self.previous_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self.previous_home
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def write_config(self, body: str) -> Path:
+        config = self.codex_home / "config.toml"
+        config.write_text(body, encoding="utf-8")
+        return config
+
+    def test_a_gateway_config_is_the_credential_store(self) -> None:
+        config = self.write_config(
+            'model = "ap/deepseek-v4-pro"\n'
+            'model_provider = "omniroute"\n'
+            'model_catalog_json = "~/.codex/models.json"\n'
+            "[model_providers.omniroute]\n"
+            'base_url = "http://gateway.internal:20128/v1"\n'
+            'experimental_bearer_token = "sk-not-a-real-token"\n'
+        )
+        catalog = self.codex_home / "models.json"
+        catalog.write_text("{}", encoding="utf-8")
+
+        store = self.module.provider_trust_store("codex")
+
+        self.assertIn(config.resolve(), store)
+        self.assertIn(catalog.resolve(), store,
+                      "model_catalog_json names a real file; codex will not start without it")
+
+    def test_an_auth_json_installation_still_works(self) -> None:
+        auth = self.codex_home / "auth.json"
+        auth.write_text("{}", encoding="utf-8")
+        self.assertIn(auth.resolve(), self.module.provider_trust_store("codex"))
+
+    def test_a_file_that_does_not_exist_is_not_mounted(self) -> None:
+        self.write_config('model = "x"\nmodel_catalog_json = "~/.codex/absent.json"\n')
+        store = self.module.provider_trust_store("codex")
+        self.assertEqual([path.name for path in store], ["config.toml"])
+
+    def test_a_config_codex_cannot_parse_is_left_for_codex_to_complain_about(self) -> None:
+        self.write_config("this is not = = toml\n")
+        store = self.module.provider_trust_store("codex")
+        self.assertEqual([path.name for path in store], ["config.toml"],
+                         "a parse failure must not cost the run its config")
+
+    def test_a_home_file_keeps_its_place_relative_to_home(self) -> None:
+        """``~`` inside the sandbox is the private home, so mirrored paths keep resolving.
+
+        A config that says ``model_catalog_json = "~/.codex/models.json"`` is read INSIDE the
+        sandbox, where ``~`` is the private home. Binding the catalog anywhere else would leave
+        that line pointing at nothing.
+        """
+        private = Path("/sandbox/home")
+        mirrored = self.module.sandbox_destination(self.codex_home / "models.json", private)
+        self.assertEqual(mirrored, private / ".codex" / "models.json")
+
+        outside = Path("/etc/somewhere/models.json")
+        self.assertEqual(self.module.sandbox_destination(outside, private), outside)
+
+    def test_a_run_initialized_before_the_collapse_still_resolves(self) -> None:
+        """A run in flight when this changed keeps its per-slot map, and must keep working.
+
+        The collapse to one checkout happens at ``init``. A run already past it has two registered
+        worktrees and a ``worktrees`` map in its state; reading that state must not become an error
+        just because new runs write a different key. Cleanup has to see BOTH of its trees, and see
+        each of them once.
+        """
+        legacy = {
+            "planners": {"A": "claude", "B": "codex"},
+            "worktrees": {"A": "/runs/x/worktrees/A", "B": "/runs/x/worktrees/B"},
+        }
+        self.assertEqual(self.module.reviewer_worktree(legacy, "B", "codex"),
+                         Path("/runs/x/worktrees/B"))
+        self.assertEqual(self.module.reviewer_worktree(legacy, "F", "codex"),
+                         Path("/runs/x/worktrees/B"))
+        self.assertEqual(self.module.planning_worktrees(legacy),
+                         [Path("/runs/x/worktrees/A"), Path("/runs/x/worktrees/B")])
+
+        current = {"planners": {"A": "claude", "B": "codex"},
+                   "worktree": "/runs/y/worktrees/baseline"}
+        self.assertEqual(self.module.planning_worktrees(current),
+                         [Path("/runs/y/worktrees/baseline")],
+                         "one tree, listed once -- cleanup removes it once")
+        for slot in ("A", "B", "F"):
+            self.assertEqual(self.module.reviewer_worktree(current, slot, "codex"),
+                             Path("/runs/y/worktrees/baseline"))
+
+    def test_the_policy_rides_on_the_command_and_not_in_a_file(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch_path = Path(scratch)
+            command = self.module.agent_command(
+                "codex", scratch_path, scratch_path, {"type": "object"},
+                scratch_path / "raw.json", "prompt",
+            )
+        line = " ".join(command)
+        self.assertIn('default_permissions="grounded_build"', line)
+        self.assertIn('"~/.codex"="deny"', line)
+        self.assertIn("tools.web_search=false", line)
+        self.assertNotIn("--dangerously", line)
+        self.assertIn("read-only", line)
 
 
 if __name__ == "__main__":
