@@ -392,6 +392,34 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(state["usage"]["cross-B"], 4, "un-parking must not buy an attempt")
         self.assertEqual(state.get("budget_resets", []), [])
 
+    def test_submitting_the_documented_filenames_works(self) -> None:
+        """SKILL.md tells the host to write these two names into this directory. Then submit them.
+
+        `submit-synthesis` copied the submission to `<round>/implementation_plan.md` and
+        `<round>/batches.md` unconditionally, so obeying the instruction produced SameFileError:
+        the one workflow the documentation describes was the one that could not run. Found by
+        following the documentation.
+        """
+        initialized = self.initialize("claude", "claude")
+        self.run_through_cross_review(initialized)
+        output = self.call("synthesis-context", "--project", str(self.project),
+                           "--run-id", initialized["run_id"])
+        directory = Path(output["output_directory"])
+        plan = directory / "implementation_plan.md"
+        batches = directory / "batches.md"
+        plan.write_text("# Implementation plan\n\n## Scope\nImplement the request.\n", encoding="utf-8")
+        batches.write_text("# Batches\n\n- B01: scope; exit when the named test returns zero.\n",
+                           encoding="utf-8")
+
+        result = self.call(
+            "submit-synthesis", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--plan", str(plan), "--batch-manifest", str(batches),
+        )
+        self.assertEqual(result["status"], "FINAL_REVIEW_REQUIRED")
+        self.assertEqual(Path(result["candidate"]["plan"]), plan,
+                         "the frozen copy is the file the host wrote; no second copy appears")
+        self.assertTrue(plan.is_file() and batches.is_file())
+
     def test_a_preview_is_not_filed_as_an_attempt(self) -> None:
         """The record must not contain entries for invocations that never ran.
 

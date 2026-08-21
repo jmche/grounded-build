@@ -1225,8 +1225,12 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     plan_copy = destination / "implementation_plan.md"
     batches_copy = destination / "batches.md"
-    shutil.copyfile(plan, plan_copy)
-    shutil.copyfile(batches, batches_copy)
+    # The host is TOLD to write these two names into this directory (SKILL.md, "Host synthesis"),
+    # and then submitting them raised SameFileError -- following the documentation was the one
+    # thing that could not work. Submitting the frozen copy in place is a no-op, not an error.
+    for source, copy in ((plan, plan_copy), (batches, batches_copy)):
+        if source.resolve() != copy.resolve():
+            shutil.copyfile(source, copy)
     record_artifact(state, f"candidate-{number}-plan", plan_copy)
     record_artifact(state, f"candidate-{number}-batches", batches_copy)
     state["synthesis_submissions"] = number
