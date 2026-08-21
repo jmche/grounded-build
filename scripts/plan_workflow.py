@@ -1095,8 +1095,12 @@ def validate_ready_invariants(state: dict[str, Any]) -> None:
     if set(state.get("final_reviews", {})) != set(required):
         raise WorkflowError("READY invariant failed: required final reviews are incomplete")
     target = f"candidate-round-{candidate.get('round')}"
-    for slot, provider in required.items():
+    for slot, default_provider in required.items():
+        assignment = f"final-{candidate.get('round')}-{slot}"
+        provider = assignment_provider(state, assignment, default_provider)
         record = state["final_reviews"][slot]
+        if record.get("provider") != provider:
+            raise WorkflowError("READY invariant failed: final reviewer provider mismatch")
         payload = json.loads(Path(record["path"]).read_text(encoding="utf-8"))
         validate_review(payload, state, provider, slot, target)
         if payload["verdict"] != "PASS":
@@ -1117,16 +1121,23 @@ def model_diversity(topology: dict[str, str], runtime: dict[str, dict[str, Any]]
 
 def next_action(state: dict[str, Any]) -> dict[str, Any]:
     """Return one deterministic host action for the current planning state."""
+    def incomplete_slot(stage: str, candidates: Any, completed: dict[str, Any]) -> str:
+        remaining = [slot for slot in candidates if slot not in completed]
+        if not remaining:
+            raise WorkflowError(
+                f"workflow state is inconsistent: {state['status']} has no incomplete {stage} slot")
+        return remaining[0]
+
     base = [sys.executable, str(Path(__file__).resolve())]
     common = ["--project", state["project"], "--run-id", state["run_id"]]
     status = state["status"]
     if status in {"INITIALIZED", "DRAFTING"}:
-        slot = next(slot for slot in ("A", "B") if slot not in state["drafts"])
+        slot = incomplete_slot("draft", ("A", "B"), state["drafts"])
         command = [*base, "draft", *common, "--slot", slot]
         return {"kind": "RUN_AGENT", "stage": "draft", "slot": slot, "command": command,
                 "preview_command": [*command, "--dry-run"]}
     if status in {"DRAFTS_READY", "CROSS_REVIEWING"}:
-        slot = next(slot for slot in ("A", "B") if slot not in state["cross_reviews"])
+        slot = incomplete_slot("cross-review", ("A", "B"), state["cross_reviews"])
         command = [*base, "cross-review", *common, "--slot", slot]
         return {"kind": "RUN_AGENT", "stage": "cross-review", "slot": slot, "command": command,
                 "preview_command": [*command, "--dry-run"]}
@@ -1136,7 +1147,7 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
                 "requires": ["implementation_plan.md", "batches.md"]}
     if status in {"FINAL_REVIEW_REQUIRED", "FINAL_REVIEWING"}:
         required = required_final_reviewers(state)
-        slot = next(slot for slot in required if slot not in state["final_reviews"])
+        slot = incomplete_slot("final-review", required, state["final_reviews"])
         command = [*base, "final-review", *common, "--reviewer", slot]
         return {"kind": "RUN_AGENT", "stage": "final-review", "slot": slot,
                 "command": command, "preview_command": [*command, "--dry-run"]}
@@ -1617,8 +1628,8 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         preview["reassignment"] = {"assignment": assignment, "from": current, "to": replacement}
         preview["independence_cost"] = (
             f"{assignment} will be served by {replacement}, which also serves other assignments in "
-            f"this run. Its output is no longer independent of theirs in the provider sense; "
-            f"process, sandbox, home and context isolation are unchanged."
+            f"this run. Provider and model diversity claims are downgraded; process, sandbox, "
+            f"home and context isolation are unchanged."
         )
     if not args.apply:
         emit(preview)
@@ -1651,6 +1662,10 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         state["provider_diversity"] = len(set(
             list(state["planners"].values()) + list(state["assignment_providers"].values())
         )) > 1 and not state["independence_notes"]
+        # Diversity is an independence claim about the planned two-slot topology, not a historical
+        # inventory of every model that attempted a call. Once a slot is reassigned, that stronger
+        # claim is no longer intact even if the original model delivered earlier artifacts.
+        state["model_diversity"] = False
         state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
     elif decision_type == "INVOCATION_BUDGET_EXHAUSTED":
         # Back to where the assignment was, with the count untouched. See the allowed-choices note.
@@ -1698,6 +1713,8 @@ def command_export(args: argparse.Namespace) -> None:
         "plan_sha256": state["final"]["plan_sha256"],
         "batch_manifest_sha256": state["final"]["batch_manifest_sha256"],
         "report": state["final"]["report"],
+        "provider_diversity": state["provider_diversity"],
+        "model_diversity": state.get("model_diversity", False),
         "agent_runtime": state.get("agent_runtime") or {},
         "handoff": "Use scripts/workflow.py init only after explicit user approval.",
     })

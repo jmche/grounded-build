@@ -3,4 +3,4 @@ interface:
   short_description: "Evidence-backed planning and reviewed implementation"
   default_prompt: "Use $grounded-build to produce an independently reviewed, repository-grounded implementation plan and stop before implementation."
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

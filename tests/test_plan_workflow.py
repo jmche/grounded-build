@@ -295,6 +295,8 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(state["assignment_providers"], {"draft-B": "claude"})
         self.assertFalse(state["provider_diversity"],
                          "a run whose second slot was taken over is not provider-diverse")
+        self.assertFalse(state["model_diversity"],
+                         "a reassigned run must not retain the stronger model-diversity claim")
         self.assertEqual(state["usage"]["draft-B"], 0, "the replacement starts with its own count")
 
         # The always-empty marker is scoped to draft-B, which claude now serves via `-p`.
@@ -307,11 +309,41 @@ class PlanWorkflowTest(unittest.TestCase):
                   "--reviewer", "F")
         exported = self.call("export", "--project", str(self.project), "--run-id", run_id)
         self.assertEqual(exported["status"], "READY")
+        self.assertFalse(exported["provider_diversity"])
+        self.assertFalse(exported["model_diversity"])
 
         report = (Path(initialized["run_directory"]) / "final_report.md").read_text(encoding="utf-8")
         self.assertIn("Provider diversity: `false`", report)
+        self.assertIn("Model diversity: `false`", report)
         self.assertIn("draft-B", report)
         self.assertIn("codex -> claude", report)
+
+    def test_a_reassigned_final_reviewer_can_still_be_exported(self) -> None:
+        """READY validation must use the provider that actually produced the final review."""
+        self.request.write_text(self.request.read_text() + "\nFAKE_EMPTY_ALWAYS=final-1-B\n")
+        initialized = self.initialize("mixed", "both")
+        run_id = initialized["run_id"]
+        self.run_through_cross_review(initialized)
+        self.submit_candidate(initialized)
+        self.call("final-review", "--project", str(self.project), "--run-id", run_id,
+                  "--reviewer", "A")
+        for _ in range(3):
+            failure = self.call("final-review", "--project", str(self.project), "--run-id", run_id,
+                                "--reviewer", "B", expect=2)
+            self.assertIn("without a final message", failure["error"])
+        exhausted = self.call("final-review", "--project", str(self.project), "--run-id", run_id,
+                              "--reviewer", "B", expect=2)
+        self.assertIn("budget exhausted", exhausted["error"])
+        self.call("adjudicate", "--project", str(self.project), "--run-id", run_id,
+                  "--choice", "REASSIGN_ASSIGNMENT", "--to-provider", "claude",
+                  "--decision", "codex never delivered", "--actor", "tester", "--apply")
+        self.call("final-review", "--project", str(self.project), "--run-id", run_id,
+                  "--reviewer", "B")
+
+        exported = self.call("export", "--project", str(self.project), "--run-id", run_id)
+        self.assertEqual(exported["status"], "READY")
+        self.assertFalse(exported["provider_diversity"])
+        self.assertFalse(exported["model_diversity"])
 
     def test_the_reviewer_gets_the_plan_as_prose_not_as_one_escaped_string(self) -> None:
         """The defect that read as a provider difference and was a representation choice.
@@ -962,6 +994,20 @@ class HostProtocolTest(unittest.TestCase):
         weak = self.module.synthesis_diagnostics("# Plan\n", "B01: core\n")
         self.assertEqual(weak["errors"], [])
         self.assertGreaterEqual(len(weak["warnings"]), 3)
+
+    def test_inconsistent_progress_state_has_an_operator_facing_error(self) -> None:
+        for status, completed_key in (
+            ("DRAFTING", "drafts"),
+            ("CROSS_REVIEWING", "cross_reviews"),
+            ("FINAL_REVIEWING", "final_reviews"),
+        ):
+            state = self.state(status)
+            state[completed_key] = ({"F": {}} if completed_key == "final_reviews"
+                                    else {"A": {}, "B": {}})
+            with self.subTest(status=status):
+                with self.assertRaises(self.module.WorkflowError) as caught:
+                    self.module.next_action(state)
+                self.assertIn("inconsistent", str(caught.exception))
 
 
 if __name__ == "__main__":

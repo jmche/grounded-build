@@ -1,6 +1,6 @@
 ---
 name: grounded-build
-description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use when the user explicitly requests grounded-build, independent/two-agent planning, Claude/Codex cross-checking, or an evidence-backed plan audit. For implementing an unrelated existing plan, prefer implement-plan-with-review.
+description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
   version: 0.2.0
   compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude or Codex CLI adapter

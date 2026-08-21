@@ -39,7 +39,10 @@ The `next` command returns exactly one of:
 
 The final plan and manifest must state total included/excluded scope; numbered items, dependencies, components, and semantics; existing budget meanings; ordered `Bxx` mapping; finite exit observations and verification commands; compatibility, migration, rollback, recovery, risk, evidence limitations, and dispositions of disputed proposals.
 
-`check-synthesis` catches structural errors and warns about missing explicit labels before a paid final review. Its warnings do not prove semantic quality; final reviewers still inspect repository evidence.
+`check-synthesis` catches structural errors and warns before a paid final review. Every `Bxx:`
+block should use the exact labels `Exit observation:` and `Verification:` so the deterministic
+check can recognize them. Its warnings do not prove semantic quality; final reviewers still
+inspect repository evidence.
 
 ## Typed decisions
 
@@ -49,7 +52,10 @@ Read `pending_decision` from status. Show its evidence and allowed choices to th
 - Synthesis budget exhausted: at most one explicit extra synthesis, or abandon.
 - Invocation budget exhausted: one extra invocation, reassign the assignment, resume after genuinely changed input, or abandon.
 
-Reassignment preserves audit history and process isolation but may reduce provider/model diversity. It never converts an infrastructure failure into a plan-quality verdict.
+Reassignment preserves audit history and process isolation but breaks the original two-slot
+diversity claim. After any reassignment, both `provider_diversity` and `model_diversity` are
+reported as false; the decision record names the adapter change and the isolation that remains.
+Reassignment never converts an infrastructure failure into a plan-quality verdict.
 
 ## Recovery
 
