@@ -114,6 +114,29 @@ class WorkflowError(RuntimeError):
     pass
 
 
+class NoFinalAnswer(WorkflowError):
+    """The agent never delivered a verdict — as distinct from delivering a bad one.
+
+    An empty output file is not invalid JSON. It is the absence of an answer, and the two have
+    different causes and different remedies: a malformed object means the reviewer reached a
+    judgement and mis-shaped it, while an empty one means the turn ended with the reviewer still
+    reading. Reporting both as "returned invalid JSON" states something true about the bytes and
+    something false about what happened, and sends the operator looking for a parsing problem that
+    is not there. Three cross-review attempts were spent before the log line that actually said so
+    -- codex's own "no last agent message" -- was read out of a 735 KB stderr.
+
+    Carried as its own class so a retry can name the delivery failure without inspecting strings.
+    """
+
+
+def no_answer_detail(result: subprocess.CompletedProcess[str]) -> str:
+    """Quote the CLI's own account of the missing answer, when it gave one."""
+    for marker in ("no last agent message", "stream disconnected", "context window"):
+        if marker in (result.stderr or ""):
+            return f" (the CLI reported: {marker!r})"
+    return ""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -527,10 +550,17 @@ def agent_environment() -> dict[str, str]:
 
 def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw: Path) -> dict[str, Any]:
     source = raw.read_text(encoding="utf-8") if provider == "codex" and raw.is_file() else result.stdout
+    if not source.strip():
+        raise NoFinalAnswer(f"{provider} ended its turn without a final message"
+                            f"{no_answer_detail(result)}")
     try:
         wrapper = json.loads(source)
     except json.JSONDecodeError as exc:
-        raise WorkflowError(f"{provider} returned invalid JSON: {exc}") from exc
+        raise NoFinalAnswer(
+            f"{provider} delivered prose where the schema object was required "
+            f"({len(source)} characters, first parse error: {exc}). The judgement may have been "
+            f"reached; it was not emitted in the required shape."
+        ) from exc
     if provider == "codex":
         payload = wrapper
     else:
@@ -543,6 +573,44 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
     if not isinstance(payload, dict):
         raise WorkflowError(f"{provider} did not return a structured object")
     return payload
+
+
+#: Appended to every assignment that must return a schema object. Says how to deliver a verdict,
+#: never which verdict to reach.
+#:
+#: A reviewer given a repository and no stopping rule will read it. Three cross-review attempts
+#: ended 22, 25 and 15 minutes in -- all inside the 30-minute ceiling, so nothing cut them off --
+#: two of them mid-search with no final message at all, and one with its own deliberation about
+#: severity submitted where the object belonged. The drafting assignment never failed this way,
+#: because "write your draft" ends when the draft is written; "review this draft" does not end on
+#: its own. The turn is the budget, and the instruction that says so was missing.
+DELIVERY_CONTRACT = (
+    "\n\nDELIVERY. You have ONE turn. The schema object must be your FINAL message — not a file you "
+    "write, not a summary, not your reasoning about what to conclude. Stop investigating while you "
+    "still have room to emit it: a verdict you reached and did not send counts as no verdict, and "
+    "the run pays for the attempt either way. If you have read enough to judge some claims and not "
+    "others, say so IN the object rather than continuing to read."
+)
+
+
+def delivery_corrective(state: dict[str, Any], assignment: str) -> str:
+    """What to tell a retry that the first attempt could not have known.
+
+    A retry with byte-identical inputs is not a retry, it is the same request again, and it fails
+    the same way -- three times here, at real cost. What changes is strictly the DELIVERY notice:
+    the reviewer is told that its previous attempt's answer never arrived and how. Nothing here
+    names a verdict, a severity, or a finding; steering the conclusion to make an attempt land
+    would be buying a PASS, which is the one thing this workflow exists to prevent.
+    """
+    fault = (state.get("delivery_faults") or {}).get(assignment)
+    if not fault:
+        return ""
+    return (
+        "RETRY NOTICE. Your previous attempt on this assignment produced no usable verdict: "
+        f"{fault}. Whatever you concluded then is unaffected and unconstrained now — reach the "
+        "judgement the evidence supports. What failed was its delivery. Budget this turn so the "
+        "schema object is emitted.\n\n"
+    )
 
 
 def invoke(
@@ -573,6 +641,7 @@ def invoke(
     raw = root / "raw.json"
     worktree = reviewer_worktree(state, slot, provider)
     validate_planning_worktree(state, worktree)
+    prompt = delivery_corrective(state, assignment) + prompt
     command = agent_command(provider, worktree, context, schema, raw, prompt.format(context=context))
     command = isolated_agent_command(command, state, root, worktree, context)
     (root / "prompt.md").write_text(prompt.format(context=context), encoding="utf-8")
@@ -591,7 +660,13 @@ def invoke(
     save_state(state)
     if result.returncode != 0:
         raise WorkflowError(f"{provider} invocation failed ({result.returncode}): {result.stderr[-1000:]}")
-    payload = extract_payload(provider, result, raw)
+    try:
+        payload = extract_payload(provider, result, raw)
+    except NoFinalAnswer as exc:
+        state.setdefault("delivery_faults", {})[assignment] = str(exc)
+        save_state(state)
+        raise
+    state.get("delivery_faults", {}).pop(assignment, None)
     validate_planning_worktree(state, worktree)
     result_path = root / "result.json"
     atomic_json(result_path, payload)
@@ -770,6 +845,7 @@ def command_draft(args: argparse.Namespace) -> None:
         "dependencies, budget-sensitive retry limits, and decidable acceptance observations. Do not edit "
         "the repository. Return only JSON matching the supplied schema. Set provider={provider}, slot={slot}, "
         "and baseline_sha={sha}."
+        + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, sha=state["baseline_sha"], context="{context}")
     payload = invoke(
         state, f"draft-{slot}", provider, slot, {"request.md": Path(state["request_snapshot"])},
@@ -808,6 +884,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
         "unbounded budgets, non-decidable acceptance conditions, unsafe scope, and incompatibilities. P0/P1 "
         "mean the draft cannot safely guide implementation; P2 is advisory. Do not edit files. Return only "
         "schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, baseline_sha={sha}."
+        + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"], context="{context}")
     context_files = {
         "request.md": Path(state["request_snapshot"]),
@@ -938,6 +1015,7 @@ def command_final_review(args: argparse.Namespace) -> None:
         "the choice is supported by evidence; do not demand excluded work without identifying a request conflict. "
         "Do not edit files. Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, "
         "baseline_sha={sha}."
+        + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"], context="{context}")
     context_files = {
         "request.md": Path(state["request_snapshot"]),

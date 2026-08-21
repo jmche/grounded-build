@@ -54,6 +54,11 @@ else:
     payload = {"provider": provider, "reviewer_slot": slot, "target": target, "baseline_sha": sha, "verdict": verdict, "summary": "final checked", "findings": findings}
 if "-o" in sys.argv:
     output = sys.argv[sys.argv.index("-o") + 1]
+    # Deliver nothing on the first attempt when the request asks for it: the shape codex hit
+    # three times running, where the turn ends with no final message at all.
+    if "FAKE_EMPTY_FIRST" in request_text and "attempt_1_" in output:
+        open(output, "w").close()
+        sys.exit(0)
     with open(output, "w", encoding="utf-8") as handle:
         json.dump(payload, handle)
 else:
@@ -220,6 +225,39 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("tools.web_search=false", line)
         self.assertIn('default_permissions="grounded_build"', line)
 
+    def test_a_retry_after_an_undelivered_answer_says_so_in_its_prompt(self) -> None:
+        """The corrective has to reach the agent, not merely exist as a function.
+
+        `delivery_corrective` can be right and never called, which is the shape of every guard this
+        project has had to re-fix: correct code on a path nothing takes. This drives a real
+        invocation whose first attempt ends with an empty output file -- codex's actual failure --
+        and reads the SECOND attempt's prompt off disk.
+        """
+        self.request.write_text(self.request.read_text() + "\nFAKE_EMPTY_FIRST=1\n")
+        initialized = self.initialize("codex", "codex")
+        run_id = initialized["run_id"]
+
+        failure = self.call("draft", "--project", str(self.project), "--run-id", run_id,
+                            "--slot", "A", expect=2)
+        self.assertIn("without a final message", failure["error"])
+        self.assertNotIn("invalid JSON", failure["error"])
+
+        self.call("draft", "--project", str(self.project), "--run-id", run_id, "--slot", "A")
+
+        invocations = Path(initialized["run_directory"]) / "invocations" / "draft-A"
+        first = next(invocations.glob("attempt_1_*/prompt.md")).read_text(encoding="utf-8")
+        second = next(invocations.glob("attempt_2_*/prompt.md")).read_text(encoding="utf-8")
+        self.assertNotIn("RETRY NOTICE", first)
+        self.assertIn("RETRY NOTICE", second)
+        self.assertIn("without a final message", second)
+        for forbidden in ("PASS", "FAIL", "approve"):
+            self.assertNotIn(forbidden, second.split("RETRY NOTICE")[1].split("\n\n")[0])
+
+        state = self.get_state(initialized)
+        self.assertNotIn("draft-A", state.get("delivery_faults") or {},
+                         "a delivered answer clears the fault; otherwise every later attempt "
+                         "carries a notice about a failure that is no longer true")
+
     def test_pass_with_blocking_finding_is_rejected(self) -> None:
         self.request.write_text(self.request.read_text() + "\nFAKE_PASS_BLOCKING=F\n")
         initialized = self.initialize("claude", "claude")
@@ -281,6 +319,100 @@ class PlanWorkflowTest(unittest.TestCase):
             "--reviewer", "F",
         )
         self.assertEqual(result["status"], "NEEDS_USER_DECISION")
+
+
+class DeliveryFailureTest(unittest.TestCase):
+    """An answer that never arrived, told apart from one that arrived malformed.
+
+    Three cross-review attempts against one draft: 22 minutes ending mid-search with an empty
+    output file, 25 minutes ending with the reviewer's own deliberation about severity submitted
+    where the schema object belonged, 15 minutes ending mid-search again. All three were inside the
+    30-minute ceiling, so nothing external cut them off, and all three were reported to the
+    operator as "returned invalid JSON" -- which is true of zero bytes only in the sense that zero
+    bytes parse badly, and false about everything that matters.
+    """
+
+    def setUp(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_plan_workflow_delivery", SCRIPT)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.temp = Path(tempfile.mkdtemp(prefix="gb-delivery-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def completed(self, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=["codex"], returncode=0, stdout=stdout, stderr=stderr)
+
+    def test_an_empty_output_is_reported_as_no_answer_not_as_bad_json(self) -> None:
+        raw = self.temp / "raw.json"
+        raw.write_text("", encoding="utf-8")
+        result = self.completed(stderr="...\nWarning: no last agent message; wrote empty content\n")
+
+        with self.assertRaises(self.module.NoFinalAnswer) as caught:
+            self.module.extract_payload("codex", result, raw)
+
+        message = str(caught.exception)
+        self.assertIn("without a final message", message)
+        self.assertIn("no last agent message", message,
+                      "the CLI said exactly what happened; the operator should not have to grep for it")
+        self.assertNotIn("invalid JSON", message)
+
+    def test_prose_where_the_object_belonged_says_so(self) -> None:
+        raw = self.temp / "raw.json"
+        raw.write_text("Let me finalize. I'll write a concise summary and findings list.\n",
+                       encoding="utf-8")
+        with self.assertRaises(self.module.NoFinalAnswer) as caught:
+            self.module.extract_payload("codex", self.completed(), raw)
+        message = str(caught.exception)
+        self.assertIn("prose where the schema object was required", message)
+        self.assertNotIn("without a final message", message,
+                         "this one DID answer -- in the wrong shape. Different cause, different fix.")
+
+    def test_a_valid_object_still_parses(self) -> None:
+        raw = self.temp / "raw.json"
+        raw.write_text('{"verdict": "PASS"}', encoding="utf-8")
+        self.assertEqual(self.module.extract_payload("codex", self.completed(), raw),
+                         {"verdict": "PASS"})
+
+    def test_the_first_attempt_carries_no_retry_notice(self) -> None:
+        self.assertEqual(self.module.delivery_corrective({}, "cross-B"), "")
+        self.assertEqual(
+            self.module.delivery_corrective({"delivery_faults": {"cross-A": "x"}}, "cross-B"), "",
+            "another assignment's failure is not this one's business")
+
+    def test_a_retry_is_told_what_did_not_arrive(self) -> None:
+        state = {"delivery_faults": {"cross-B": "codex ended its turn without a final message"}}
+        notice = self.module.delivery_corrective(state, "cross-B")
+        self.assertIn("no usable verdict", notice)
+        self.assertIn("ended its turn without a final message", notice)
+
+    def test_the_retry_notice_cannot_steer_the_verdict(self) -> None:
+        """The line between telling a reviewer HOW to deliver and WHAT to conclude.
+
+        A retry that nudges toward a verdict buys the PASS this workflow exists to withhold. This
+        asserts the notice names no verdict, no severity, and no finding, and says outright that
+        the previous conclusion is unconstrained.
+        """
+        state = {"delivery_faults": {"cross-B": "codex delivered prose"}}
+        notice = self.module.delivery_corrective(state, "cross-B")
+        for forbidden in ("PASS", "FAIL", "P0", "P1", "P2", "approve", "accept", "agree",
+                          "shorter", "fewer findings"):
+            self.assertNotIn(forbidden, notice, f"a retry notice must not mention {forbidden!r}")
+        self.assertIn("unaffected and unconstrained", notice)
+
+    def test_the_delivery_contract_binds_the_turn_without_binding_the_judgement(self) -> None:
+        contract = self.module.DELIVERY_CONTRACT
+        self.assertIn("ONE turn", contract)
+        self.assertIn("FINAL message", contract)
+        for forbidden in ("PASS", "FAIL", "approve", "accept"):
+            self.assertNotIn(forbidden, contract)
+
+    def test_every_assignment_that_returns_a_schema_carries_the_contract(self) -> None:
+        """Drafting has not failed this way, which is not a reason to leave it unsaid."""
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(source.count("+ DELIVERY_CONTRACT"), 3,
+                         "draft, cross-review and final-review each return a schema object")
 
 
 class CodexTrustStoreTest(unittest.TestCase):
