@@ -129,12 +129,99 @@ class NoFinalAnswer(WorkflowError):
     """
 
 
+def describe_unparseable(provider: str, source: str, exc: json.JSONDecodeError) -> str:
+    """Say which of the two things happened: the object was cut off, or it was never an object.
+
+    Both arrive as a JSONDecodeError and they are not the same failure. An answer that begins
+    ``{"provider": ...`` and dies inside a string near the end is a COMPLETE judgement truncated in
+    transit -- the reviewer did everything asked and the output ran out of room, so the remedy is
+    a smaller object, not a different reviewer. An answer that was never JSON is a reviewer that
+    submitted its deliberation instead of its verdict, and no amount of room fixes that.
+
+    Calling the truncated case "prose" -- which this function was written to stop doing -- sent the
+    operator looking for the second problem while holding the first, one commit after the same
+    mistake was fixed one level up.
+    """
+    text = source.strip()
+    # Truncation is structural, not positional: what a cut-off object lacks is its closing
+    # bracket. A fraction-of-the-way-in threshold would be a number picked to fit one sample.
+    # "Extra data" is the tell for the other shape -- prose that happens to open with a brace,
+    # which is what one real attempt produced ("unregistered:{}, status_drift:{}...").
+    opener = text[:1]
+    closer = {"{": "}", "[": "]"}.get(opener)
+    truncated = bool(closer) and not text.endswith(closer) and not exc.msg.startswith("Extra data")
+    if truncated:
+        return (
+            f"{provider} emitted the schema object and it was cut off: {len(source)} characters, "
+            f"no closing {closer!r}, parse failed at character {exc.pos} ({exc.msg}). "
+            f"An incomplete verdict is not a verdict, but the reviewer did deliver; the object was "
+            f"too large for the output it had."
+        )
+    return (
+        f"{provider} delivered something that is not the schema object ({len(source)} characters, "
+        f"first parse error at character {exc.pos}: {exc.msg}). The judgement may have been "
+        f"reached; it was not emitted in the required shape."
+    )
+
+
 def no_answer_detail(result: subprocess.CompletedProcess[str]) -> str:
     """Quote the CLI's own account of the missing answer, when it gave one."""
     for marker in ("no last agent message", "stream disconnected", "context window"):
         if marker in (result.stderr or ""):
             return f" (the CLI reported: {marker!r})"
     return ""
+
+
+PROBE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"provider": {"type": "string"}, "ready": {"type": "boolean"}},
+    "required": ["provider", "ready"],
+}
+
+
+def probe_provider(provider: str, project: Path, timeout: int = 180) -> dict[str, Any]:
+    """Can this CLI authenticate and return one small schema object right now?
+
+    Cheap, and deliberately narrow. It answers the question that cost the most to answer the
+    expensive way: a codex whose credentials never reached the sandbox spent 22 minutes and five
+    401s before saying so, and the operator read it as a failed planning draft. One trivial call
+    says it in seconds, before a topology is frozen around a provider that cannot deliver.
+
+    What it does NOT establish is reliability on a real assignment. A provider that answers this
+    can still spend a whole turn reading a repository and never emit its verdict -- which is what
+    happened three times after the credential fix landed. Capability is necessary and not
+    sufficient, and this reports capability only.
+
+    It runs through the SAME bubblewrap composition as a real invocation, which is the only way it
+    can see the failure it exists to catch: the credentials that went missing went missing because
+    of the sandbox, so a probe outside the sandbox would have passed while every real call
+    returned 401 -- worse than no probe, because it would have vouched for the thing that was
+    broken.
+    """
+    with tempfile.TemporaryDirectory(prefix="grounded-build-probe-") as scratch:
+        root = Path(scratch)
+        context = root / "context"
+        context.mkdir(mode=0o700)
+        raw = root / "raw.json"
+        prompt = (
+            f"Reply with the schema object only: provider={provider}, ready=true. "
+            "Do not inspect anything. This is a capability check."
+        )
+        command = agent_command(provider, project, context, PROBE_SCHEMA, raw, prompt)
+        command = isolated_agent_command(command, {}, root, project, context)
+        result = run(command, cwd=project, timeout=timeout, env=agent_environment())
+        if result.returncode != 0:
+            return {"provider": provider, "ok": False,
+                    "reason": f"invocation failed ({result.returncode})",
+                    "detail": (result.stderr or "").strip()[-400:]}
+        try:
+            payload = extract_payload(provider, result, raw)
+        except NoFinalAnswer as exc:
+            return {"provider": provider, "ok": False, "reason": "no schema object",
+                    "detail": str(exc)}
+        return {"provider": provider, "ok": isinstance(payload, dict) and payload.get("ready") is True,
+                "reason": "delivered a schema object"}
 
 
 def utc_now() -> str:
@@ -361,6 +448,41 @@ def required_final_reviewers(state: dict[str, Any]) -> dict[str, str]:
     return {"F": selected}
 
 
+def independence_section(state: dict[str, Any]) -> str:
+    """Reassignments, spelled out in the report — or a line saying there were none.
+
+    A run that swapped a provider and did not say so hands the reader a "provider diversity" field
+    describing the topology that was frozen rather than the one that ran. Printing "none" when
+    there were none is the half that makes the presence of the section meaningful.
+    """
+    notes = state.get("independence_notes") or []
+    if not notes:
+        return "- Reassignments: `none`\n"
+    lines = ["- Reassignments (provider independence reduced):\n"]
+    for note in notes:
+        lines.append(
+            f"  - `{note['assignment']}`: {note['from']} -> {note['to']} ({note['decided_at']}). "
+            f"{note['reason']}\n"
+        )
+    return "".join(lines)
+
+
+def assignment_provider(state: dict[str, Any], assignment: str, default: str) -> str:
+    """Which CLI serves this assignment, after any recorded reassignment.
+
+    Topology is frozen at init, and that is right: a run that quietly swaps providers mid-flight
+    is a run whose independence claim means nothing. But a frozen topology with no escape turns
+    one unusable provider into a dead run -- the alternative being to abandon and re-draft
+    everything, which costs the work that DID succeed.
+
+    So reassignment exists and is loud: an explicit user decision, recorded in the decisions
+    directory, listed in ``independence_notes``, and surfaced by ``export``. The skill's rule is
+    not "never share a provider" -- it is "never DESCRIBE two instances of one provider as
+    model-diverse". This keeps the description true while letting the run finish.
+    """
+    return (state.get("assignment_providers") or {}).get(assignment, default)
+
+
 def planning_worktrees(state: dict[str, Any]) -> list[Path]:
     """Every checkout this run registered with git, newest layout first, without duplicates."""
     if state.get("worktree"):
@@ -556,11 +678,7 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
     try:
         wrapper = json.loads(source)
     except json.JSONDecodeError as exc:
-        raise NoFinalAnswer(
-            f"{provider} delivered prose where the schema object was required "
-            f"({len(source)} characters, first parse error: {exc}). The judgement may have been "
-            f"reached; it was not emitted in the required shape."
-        ) from exc
+        raise NoFinalAnswer(describe_unparseable(provider, source, exc)) from exc
     if provider == "codex":
         payload = wrapper
     else:
@@ -589,7 +707,11 @@ DELIVERY_CONTRACT = (
     "write, not a summary, not your reasoning about what to conclude. Stop investigating while you "
     "still have room to emit it: a verdict you reached and did not send counts as no verdict, and "
     "the run pays for the attempt either way. If you have read enough to judge some claims and not "
-    "others, say so IN the object rather than continuing to read."
+    "others, say so IN the object rather than continuing to read.\n\n"
+    "The object must also be COMPLETE. One cut off mid-string is discarded whole, so a long "
+    "`evidence` string can cost you every finding after it. Keep each field to the shortest text "
+    "that still identifies the thing — a path and a line number rather than a quoted passage. "
+    "Do NOT drop findings to save room: fewer words per finding, never fewer findings."
 )
 
 
@@ -621,17 +743,35 @@ def invoke(
     granted = state.get("extra_invocation_grants", {}).get(assignment, 0)
     if not dry_run and used >= MAX_INVOCATIONS_PER_ASSIGNMENT + granted:
         resume_status = state["status"]
+        # "Out of tries" and "this provider does not deliver a verdict for this assignment" both
+        # end here, and only one of them is fixed by granting another try. Say which, so the
+        # decision in front of the user is the one they actually face.
+        fault = (state.get("delivery_faults") or {}).get(assignment)
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
             "type": "INVOCATION_BUDGET_EXHAUSTED", "assignment": assignment,
             "resume_status": resume_status, "created_at": utc_now(),
+            "provider": provider,
+            "last_delivery_fault": fault,
+            "diagnosis": (
+                f"{provider} exhausted its attempts on {assignment} without ever delivering a "
+                f"verdict ({fault}). Another attempt repeats the same conditions; REASSIGN_ASSIGNMENT "
+                f"moves this one assignment to the other provider and records the loss of "
+                f"independence."
+                if fault else
+                f"{provider} used every attempt on {assignment}."
+            ),
         }
         save_state(state)
-        raise WorkflowError(f"invocation budget exhausted for {assignment}; user decision required")
-    root = (
-        Path(state["run_directory"]) / "invocations" / assignment /
-        f"attempt_{used + 1}_{secrets.token_hex(6)}"
-    )
+        raise WorkflowError(
+            f"invocation budget exhausted for {assignment}; user decision required"
+            + (f" ({fault})" if fault else ""))
+    # A preview is not an attempt and must not be filed as one. Naming both `attempt_N_*` put
+    # entries in the audit record for invocations that never ran -- two `attempt_4_*` directories
+    # for one cross-review, distinguishable only by whether a stderr.log happened to be there --
+    # in a workflow whose entire product is a record of what happened.
+    prefix = f"preview_{secrets.token_hex(6)}" if dry_run else f"attempt_{used + 1}_{secrets.token_hex(6)}"
+    root = Path(state["run_directory"]) / "invocations" / assignment / prefix
     context = root / "context"
     context.mkdir(parents=True, exist_ok=False, mode=0o700)
     for name, source in context_files.items():
@@ -681,7 +821,8 @@ def validate_draft(payload: dict[str, Any], state: dict[str, Any], slot: str) ->
     required = set(DRAFT_SCHEMA["required"])
     if set(payload) != required:
         raise WorkflowError("draft output fields do not match the contract")
-    if payload["provider"] != state["planners"][slot] or payload["slot"] != slot:
+    if payload["provider"] != assignment_provider(state, f"draft-{slot}", state["planners"][slot]) \
+            or payload["slot"] != slot:
         raise WorkflowError("draft identity mismatch")
     if payload["baseline_sha"] != state["baseline_sha"]:
         raise WorkflowError("draft baseline SHA mismatch")
@@ -755,14 +896,21 @@ def validate_ready_invariants(state: dict[str, Any]) -> None:
 def command_preflight(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     topology = resolve_topology(args.backend)
-    emit({
+    payload = {
         "status": "PREFLIGHT_OK",
         "project": str(project),
         "baseline_sha": git(project, "rev-parse", "HEAD"),
         "clean": not bool(git(project, "status", "--porcelain")),
         "planners": topology,
         "provider_diversity": len(set(topology.values())) > 1,
-    })
+    }
+    if args.probe:
+        probes = {name: probe_provider(name, project) for name in sorted(set(topology.values()))}
+        payload["probes"] = probes
+        if not all(item["ok"] for item in probes.values()):
+            payload["status"] = "PREFLIGHT_PROVIDER_UNUSABLE"
+            emit(payload, code=2)
+    emit(payload)
 
 
 def command_init(args: argparse.Namespace) -> None:
@@ -836,7 +984,7 @@ def command_draft(args: argparse.Namespace) -> None:
         raise WorkflowError(f"draft is not allowed from {state['status']}")
     if slot in state["drafts"] and not args.dry_run:
         raise WorkflowError(f"slot {slot} already produced a draft")
-    provider = state["planners"][slot]
+    provider = assignment_provider(state, f"draft-{slot}", state["planners"][slot])
     prompt = (
         "You are independent planning instance {slot}. Read {context}/request.md and inspect the "
         "repository at the assigned baseline. You cannot see the other planner's work. Verify factual "
@@ -875,7 +1023,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
     if slot in state["cross_reviews"] and not args.dry_run:
         raise WorkflowError(f"slot {slot} already completed cross-review")
     target_slot = "B" if slot == "A" else "A"
-    provider = state["planners"][slot]
+    provider = assignment_provider(state, f"cross-{slot}", state["planners"][slot])
     target = f"draft-{target_slot}"
     prompt = (
         "You are independent reviewer slot {slot}. Read {context}/request.md and the other planner's "
@@ -1005,7 +1153,8 @@ def command_final_review(args: argparse.Namespace) -> None:
         raise WorkflowError(f"reviewer must be one of: {','.join(reviewers)}")
     if slot in state["final_reviews"] and not args.dry_run:
         raise WorkflowError(f"final reviewer {slot} already completed this round")
-    provider = reviewers[slot]
+    provider = assignment_provider(
+        state, f"final-{state['candidate']['round']}-{slot}", reviewers[slot])
     target = f"candidate-round-{state['candidate']['round']}"
     prompt = (
         "You are a fresh final planning reviewer ({slot}). Read {context}/request.md, "
@@ -1063,7 +1212,8 @@ def command_final_review(args: argparse.Namespace) -> None:
                 f"- Baseline: `{state['baseline_sha']}`\n"
                 f"- Planners: `{json.dumps(state['planners'], sort_keys=True)}`\n"
                 f"- Provider diversity: `{str(state['provider_diversity']).lower()}`\n"
-                f"- Final reviewer selection: `{state['final_reviewer']}`\n"
+                + independence_section(state)
+                + f"- Final reviewer selection: `{state['final_reviewer']}`\n"
                 f"- Synthesis submissions: `{state['synthesis_submissions']}`\n"
                 f"- Plan SHA-256: `{state['final']['plan_sha256']}`\n"
                 f"- Batch manifest SHA-256: `{state['final']['batch_manifest_sha256']}`\n\n"
@@ -1099,7 +1249,7 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         "FINAL_PLAN_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
         "SYNTHESIS_BUDGET_EXHAUSTED": {"GRANT_ONE_SYNTHESIS", "ABANDON"},
         "FINAL_REVIEW_BUDGET_EXHAUSTED": {"GRANT_ONE_SYNTHESIS", "ABANDON"},
-        "INVOCATION_BUDGET_EXHAUSTED": {"GRANT_ONE_INVOCATION", "ABANDON"},
+        "INVOCATION_BUDGET_EXHAUSTED": {"GRANT_ONE_INVOCATION", "REASSIGN_ASSIGNMENT", "ABANDON"},
     }.get(decision_type, {"ABANDON"})
     if args.choice not in allowed:
         raise WorkflowError(f"choice {args.choice} is not allowed for {decision_type}: {','.join(sorted(allowed))}")
@@ -1112,6 +1262,28 @@ def command_adjudicate(args: argparse.Namespace) -> None:
             raise WorkflowError("invocation decision is missing its assignment")
         if state.setdefault("extra_invocation_grants", {}).get(assignment, 0) >= 1:
             raise WorkflowError("the one explicit extra invocation has already been granted")
+    if args.choice == "REASSIGN_ASSIGNMENT":
+        assignment = pending.get("assignment")
+        if not assignment:
+            raise WorkflowError("reassignment decision is missing its assignment")
+        current = pending.get("provider")
+        alternatives = [name for name in SUPPORTED_PROVIDERS
+                        if name != current and shutil.which(name)]
+        if not alternatives:
+            raise WorkflowError(
+                f"no other provider is installed to take over {assignment} from {current}")
+        replacement = args.to_provider or alternatives[0]
+        if replacement == current:
+            raise WorkflowError("reassigning an assignment to the provider that already holds it "
+                                "changes nothing")
+        if not shutil.which(replacement):
+            raise WorkflowError(f"provider is not installed: {replacement}")
+        preview["reassignment"] = {"assignment": assignment, "from": current, "to": replacement}
+        preview["independence_cost"] = (
+            f"{assignment} will be served by {replacement}, which also serves other assignments in "
+            f"this run. Its output is no longer independent of theirs in the provider sense; "
+            f"process, sandbox, home and context isolation are unchanged."
+        )
     if not args.apply:
         emit(preview)
     path = Path(state["run_directory"]) / "decisions" / f"decision_{len(list((Path(state['run_directory']) / 'decisions').glob('*.json'))) + 1:03d}.json"
@@ -1128,6 +1300,22 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         grants = state.setdefault("extra_invocation_grants", {})
         grants[assignment] = 1
         state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
+    elif args.choice == "REASSIGN_ASSIGNMENT":
+        move = preview["reassignment"]
+        state.setdefault("assignment_providers", {})[move["assignment"]] = move["to"]
+        # A fresh provider gets a fresh count. The exhausted attempts measured the one that is
+        # being replaced, and charging them to its replacement would decide in advance that the
+        # replacement fails too.
+        state.setdefault("usage", {})[move["assignment"]] = 0
+        state.setdefault("extra_invocation_grants", {}).pop(move["assignment"], None)
+        (state.get("delivery_faults") or {}).pop(move["assignment"], None)
+        state.setdefault("independence_notes", []).append({
+            **move, "reason": preview["independence_cost"], "decided_at": utc_now(),
+        })
+        state["provider_diversity"] = len(set(
+            list(state["planners"].values()) + list(state["assignment_providers"].values())
+        )) > 1 and not state["independence_notes"]
+        state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
     elif decision_type == "PLANNING_BOUNDARY" and set(state["cross_reviews"]) != {"A", "B"}:
         state["status"] = "CROSS_REVIEWING"
     else:
@@ -1142,6 +1330,8 @@ def command_status(args: argparse.Namespace) -> None:
     emit({
         "status": state["status"], "run_id": state["run_id"], "baseline_sha": state["baseline_sha"],
         "planners": state["planners"], "provider_diversity": state["provider_diversity"],
+        "assignment_providers": state.get("assignment_providers") or {},
+        "independence_notes": state.get("independence_notes") or [],
         "final_reviewer": state["final_reviewer"], "drafts": state["drafts"],
         "cross_reviews": state["cross_reviews"], "synthesis_submissions": state["synthesis_submissions"],
         "final_reviews": state["final_reviews"], "pending_decision": state["pending_decision"],
@@ -1203,6 +1393,10 @@ def build_parser() -> argparse.ArgumentParser:
     preflight = commands.add_parser("preflight")
     preflight.add_argument("--project", required=True)
     preflight.add_argument("--backend", choices=["auto", "mixed", *SUPPORTED_PROVIDERS], default="auto")
+    preflight.add_argument(
+        "--probe", action="store_true",
+        help="spend one trivial sandboxed call per provider to check it can authenticate and "
+             "return a schema object; exits 2 if any cannot")
     preflight.set_defaults(func=command_preflight)
 
     init = commands.add_parser("init")
@@ -1247,10 +1441,15 @@ def build_parser() -> argparse.ArgumentParser:
     adjudicate.add_argument("--decision", required=True)
     adjudicate.add_argument(
         "--choice",
-        choices=["RESOLVE_AND_CONTINUE", "GRANT_ONE_SYNTHESIS", "GRANT_ONE_INVOCATION", "ABANDON"],
+        choices=["RESOLVE_AND_CONTINUE", "GRANT_ONE_SYNTHESIS", "GRANT_ONE_INVOCATION",
+                 "REASSIGN_ASSIGNMENT", "ABANDON"],
         required=True,
     )
     adjudicate.add_argument("--actor", required=True)
+    adjudicate.add_argument(
+        "--to-provider", choices=list(SUPPORTED_PROVIDERS),
+        help="REASSIGN_ASSIGNMENT only: which CLI takes the assignment over "
+             "(default: the other installed provider)")
     adjudicate.add_argument("--apply", action="store_true")
     adjudicate.set_defaults(func=command_adjudicate)
 

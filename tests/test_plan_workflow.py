@@ -56,7 +56,8 @@ if "-o" in sys.argv:
     output = sys.argv[sys.argv.index("-o") + 1]
     # Deliver nothing on the first attempt when the request asks for it: the shape codex hit
     # three times running, where the turn ends with no final message at all.
-    if "FAKE_EMPTY_FIRST" in request_text and "attempt_1_" in output:
+    always = re.search(r"FAKE_EMPTY_ALWAYS=(\S+)", request_text)
+    if (always and f"/{always.group(1)}/" in output) or ("FAKE_EMPTY_FIRST" in request_text and "attempt_1_" in output):
         open(output, "w").close()
         sys.exit(0)
     with open(output, "w", encoding="utf-8") as handle:
@@ -258,6 +259,83 @@ class PlanWorkflowTest(unittest.TestCase):
                          "a delivered answer clears the fault; otherwise every later attempt "
                          "carries a notice about a failure that is no longer true")
 
+    def test_a_reassigned_run_stops_claiming_provider_diversity(self) -> None:
+        """The whole point of allowing the swap is that the record still tells the truth after it.
+
+        Drives the real path: mixed topology, codex exhausts cross-B without delivering, the user
+        reassigns to claude, the run finishes. The report must then say the run was NOT
+        provider-diverse and name the swap -- otherwise a reader sees `provider_diversity: true`
+        describing a topology that was frozen rather than one that ran.
+        """
+        self.request.write_text(self.request.read_text() + "\nFAKE_EMPTY_ALWAYS=draft-B\n")
+        initialized = self.initialize("mixed", "claude")
+        run_id = initialized["run_id"]
+        self.assertTrue(initialized["provider_diversity"])
+
+        self.call("draft", "--project", str(self.project), "--run-id", run_id, "--slot", "A")
+        for _ in range(3):  # codex slot: every attempt delivers an empty file
+            failure = self.call("draft", "--project", str(self.project), "--run-id", run_id,
+                                "--slot", "B", expect=2)
+            self.assertIn("without a final message", failure["error"])
+        exhausted = self.call("draft", "--project", str(self.project), "--run-id", run_id,
+                              "--slot", "B", expect=2)
+        self.assertIn("budget exhausted", exhausted["error"])
+
+        state = self.get_state(initialized)
+        pending = state["pending_decision"]
+        self.assertEqual(pending["provider"], "codex")
+        self.assertIn("without ever delivering a verdict", pending["diagnosis"])
+        self.assertIn("REASSIGN_ASSIGNMENT", pending["diagnosis"])
+
+        self.call("adjudicate", "--project", str(self.project), "--run-id", run_id,
+                  "--choice", "REASSIGN_ASSIGNMENT", "--to-provider", "claude",
+                  "--decision", "codex never delivered", "--actor", "tester", "--apply")
+
+        state = self.get_state(initialized)
+        self.assertEqual(state["assignment_providers"], {"draft-B": "claude"})
+        self.assertFalse(state["provider_diversity"],
+                         "a run whose second slot was taken over is not provider-diverse")
+        self.assertEqual(state["usage"]["draft-B"], 0, "the replacement starts with its own count")
+
+        # The always-empty marker is scoped to draft-B, which claude now serves via `-p`.
+        self.call("draft", "--project", str(self.project), "--run-id", run_id, "--slot", "B")
+        for slot in ("A", "B"):
+            self.call("cross-review", "--project", str(self.project), "--run-id", run_id,
+                      "--slot", slot)
+        self.submit_candidate(initialized)
+        self.call("final-review", "--project", str(self.project), "--run-id", run_id,
+                  "--reviewer", "F")
+        exported = self.call("export", "--project", str(self.project), "--run-id", run_id)
+        self.assertEqual(exported["status"], "READY")
+
+        report = (Path(initialized["run_directory"]) / "final_report.md").read_text(encoding="utf-8")
+        self.assertIn("Provider diversity: `false`", report)
+        self.assertIn("draft-B", report)
+        self.assertIn("codex -> claude", report)
+
+    def test_a_preview_is_not_filed_as_an_attempt(self) -> None:
+        """The record must not contain entries for invocations that never ran.
+
+        Dry-run built a full `attempt_N_*` directory -- context copied, prompt written -- and left
+        it there. One cross-review ended up with two `attempt_4_*` directories, one real and one a
+        preview, separable only by whether a stderr.log happened to be inside. For a workflow whose
+        entire product is an auditable record of what happened, that is the record lying.
+        """
+        initialized = self.initialize("codex", "codex")
+        run_id = initialized["run_id"]
+        self.call("draft", "--project", str(self.project), "--run-id", run_id, "--slot", "A",
+                  "--dry-run")
+        invocations = Path(initialized["run_directory"]) / "invocations" / "draft-A"
+        self.assertEqual([p.name.split("_")[0] for p in invocations.iterdir()], ["preview"])
+
+        self.call("draft", "--project", str(self.project), "--run-id", run_id, "--slot", "A")
+        kinds = sorted(p.name.split("_")[0] for p in invocations.iterdir())
+        self.assertEqual(kinds, ["attempt", "preview"])
+        attempts = [p for p in invocations.iterdir() if p.name.startswith("attempt_")]
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].name.split("_")[1], "1",
+                         "a preview must not consume an attempt number either")
+
     def test_pass_with_blocking_finding_is_rejected(self) -> None:
         self.request.write_text(self.request.read_text() + "\nFAKE_PASS_BLOCKING=F\n")
         initialized = self.initialize("claude", "claude")
@@ -321,6 +399,46 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(result["status"], "NEEDS_USER_DECISION")
 
 
+class ReassignmentTest(unittest.TestCase):
+    """A provider that cannot do one job must not cost the run the jobs that were already done.
+
+    Topology is frozen at init so an independence claim means something. With no escape, that
+    freeze turns one unusable provider into a dead run: codex failed cross-review four times while
+    the other planner's draft, the other cross-review, and the frozen request all sat there valid.
+    The alternative on offer was to abandon and re-draft everything.
+
+    Reassignment is the escape, and it is only acceptable while it is loud. These tests pin the
+    loudness, not the convenience.
+    """
+
+    def setUp(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_plan_workflow_reassign", SCRIPT)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    def test_an_assignment_uses_its_planner_until_it_is_reassigned(self) -> None:
+        state = {"planners": {"A": "claude", "B": "codex"}}
+        self.assertEqual(self.module.assignment_provider(state, "cross-B", "codex"), "codex")
+        state["assignment_providers"] = {"cross-B": "claude"}
+        self.assertEqual(self.module.assignment_provider(state, "cross-B", "codex"), "claude")
+        self.assertEqual(self.module.assignment_provider(state, "draft-B", "codex"), "codex",
+                         "reassigning one assignment must not move the others")
+
+    def test_a_run_with_no_reassignment_says_so(self) -> None:
+        self.assertEqual(self.module.independence_section({}), "- Reassignments: `none`\n")
+
+    def test_the_report_states_what_was_reassigned_and_what_it_cost(self) -> None:
+        section = self.module.independence_section({"independence_notes": [{
+            "assignment": "cross-B", "from": "codex", "to": "claude",
+            "decided_at": "2026-08-21T13:00:00+00:00",
+            "reason": "cross-B will be served by claude, which also serves other assignments.",
+        }]})
+        self.assertIn("cross-B", section)
+        self.assertIn("codex -> claude", section)
+        self.assertIn("independence reduced", section)
+        self.assertIn("also serves other assignments", section)
+
+
 class DeliveryFailureTest(unittest.TestCase):
     """An answer that never arrived, told apart from one that arrived malformed.
 
@@ -365,9 +483,37 @@ class DeliveryFailureTest(unittest.TestCase):
         with self.assertRaises(self.module.NoFinalAnswer) as caught:
             self.module.extract_payload("codex", self.completed(), raw)
         message = str(caught.exception)
-        self.assertIn("prose where the schema object was required", message)
+        self.assertIn("not the schema object", message)
+        self.assertNotIn("cut off", message)
         self.assertNotIn("without a final message", message,
                          "this one DID answer -- in the wrong shape. Different cause, different fix.")
+
+    def test_an_object_cut_off_in_transit_is_not_called_prose(self) -> None:
+        """The real fourth attempt: a correct schema object truncated inside a finding's evidence.
+
+        It begins `{"provider": "codex", ... "verdict": "PASS"` and dies at character 4541 of 4587,
+        inside a string. The reviewer did everything asked of it. Reporting that as "prose" points
+        the operator at a reviewer that would not comply, when what they have is an object too big
+        for the output it was given -- a different problem with a different remedy.
+        """
+        raw = self.temp / "raw.json"
+        raw.write_text(
+            '{ "provider": "codex",\n "reviewer_slot": "B",\n "verdict": "PASS",\n'
+            ' "summary": "verified draft-A against the checkout",\n'
+            ' "findings": [{"id": "B1", "evidence": "plan_markdown section 6: P1.5.b/c deferred',
+            encoding="utf-8")
+        with self.assertRaises(self.module.NoFinalAnswer) as caught:
+            self.module.extract_payload("codex", self.completed(), raw)
+        message = str(caught.exception)
+        self.assertIn("cut off", message)
+        self.assertIn("too large for the output", message)
+        self.assertNotIn("not the schema object", message)
+
+    def test_the_contract_asks_for_shorter_findings_not_fewer(self) -> None:
+        """Trading completeness for size would buy a clean parse with a suppressed defect."""
+        contract = self.module.DELIVERY_CONTRACT
+        self.assertIn("COMPLETE", contract)
+        self.assertIn("fewer words per finding, never fewer findings", contract)
 
     def test_a_valid_object_still_parses(self) -> None:
         raw = self.temp / "raw.json"
