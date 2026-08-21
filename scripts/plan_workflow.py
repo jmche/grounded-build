@@ -45,6 +45,15 @@ CODEX_POLICY_OVERRIDES = (
     "-c", 'permissions.grounded_build.filesystem='
           '{"~/.codex"="deny",":workspace_roots"={"."="read"}}',
     "-c", "tools.web_search=false",
+    # A reviewer has to be able to read what it is reviewing. The model catalog ships
+    # `truncation_policy: {mode: "tokens", limit: 10000}` per model, and a review of a plan
+    # comfortably exceeds that: one cross-review reported its target "truncated at 13331 tokens"
+    # and spent four turns failing to reassemble it. `tool_output_token_limit` is the documented
+    # key for that budget ("Token budget for storing individual tool/function outputs in history")
+    # and is absent from `codex --help`, so it was found in the published config reference rather
+    # than locally. Measured: the same 93,322-byte file that truncated at the default reads back
+    # complete -- chars_seen 93322, tail the real `]\n}\n` -- in 29,663 tokens.
+    "-c", "tool_output_token_limit=200000",
 )
 
 

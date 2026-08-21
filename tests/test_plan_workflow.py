@@ -849,6 +849,19 @@ class CodexTrustStoreTest(unittest.TestCase):
         self.assertNotIn("--dangerously", line)
         self.assertIn("read-only", line)
 
+    def test_the_reviewer_can_read_what_it_reviews(self) -> None:
+        """The per-model catalog truncates tool output at 10,000 tokens; a plan exceeds that.
+
+        One cross-review said so itself -- "truncated at 13331 tokens" -- and burned four turns
+        failing to reassemble its target. `tool_output_token_limit` is the documented budget for
+        that and does not appear in `codex --help`. Measured through this exact command: the same
+        93,322-byte file reads back whole, tail `]\\n}\\n`, in 29,663 tokens.
+        """
+        line = " ".join(self.module.CODEX_POLICY_OVERRIDES)
+        self.assertIn("tool_output_token_limit=", line)
+        limit = int(line.split("tool_output_token_limit=")[1].split()[0])
+        self.assertGreater(limit, 10_000, "the catalog default is what broke the review")
+
 
 if __name__ == "__main__":
     unittest.main()
