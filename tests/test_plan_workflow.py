@@ -345,6 +345,40 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("repository_facts", claims)
         self.assertIn("summary", claims, "the metadata the reviewer still needs comes with it")
 
+    def test_an_adjudication_in_the_context_does_not_reset_a_spent_budget(self) -> None:
+        """The anti-loophole half: decisions accumulate in the context on every adjudication.
+
+        A budget keyed on everything in the context would lift itself the moment it was reached,
+        because reaching it is what produces the decision file that lands there next.
+        """
+        self.request.write_text(self.request.read_text() + "\nFAKE_EMPTY_ALWAYS=cross-B\n")
+        initialized = self.initialize("codex", "codex")
+        run_id = initialized["run_id"]
+        for slot in ("A", "B"):
+            self.call("draft", "--project", str(self.project), "--run-id", run_id, "--slot", slot)
+        self.call("cross-review", "--project", str(self.project), "--run-id", run_id, "--slot", "A")
+
+        for _ in range(3):
+            self.call("cross-review", "--project", str(self.project), "--run-id", run_id,
+                      "--slot", "B", expect=2)
+        self.call("cross-review", "--project", str(self.project), "--run-id", run_id,
+                  "--slot", "B", expect=2)
+        self.call("adjudicate", "--project", str(self.project), "--run-id", run_id,
+                  "--choice", "GRANT_ONE_INVOCATION", "--decision", "one more",
+                  "--actor", "tester", "--apply")
+        self.call("cross-review", "--project", str(self.project), "--run-id", run_id,
+                  "--slot", "B", expect=2)
+
+        exhausted = self.call("cross-review", "--project", str(self.project), "--run-id", run_id,
+                              "--slot", "B", expect=2)
+        self.assertIn("budget exhausted", exhausted["error"])
+        state = self.get_state(initialized)
+        self.assertEqual(state["usage"]["cross-B"], 4)
+        self.assertEqual(state.get("budget_resets", []), [],
+                         "a decision file landing in the context is not a change of material")
+        self.assertEqual(len(state["charged_context_digests"]["cross-B"]), 1,
+                         "four attempts, one input")
+
     def test_a_preview_is_not_filed_as_an_attempt(self) -> None:
         """The record must not contain entries for invocations that never ran.
 
@@ -469,6 +503,64 @@ class ReassignmentTest(unittest.TestCase):
         self.assertIn("codex -> claude", section)
         self.assertIn("independence reduced", section)
         self.assertIn("also serves other assignments", section)
+
+
+class InputScopedBudgetTest(unittest.TestCase):
+    """The budget counts attempts at an input, not attempts forever.
+
+    Four cross-review attempts measured a draft handed over as one 43,026-character line. When the
+    preparation defect was fixed the assignment was being asked a different question, and charging
+    the old attempts to it left two exits: reassign -- which would have produced a confident review
+    of a half-read document -- or abandon the run. Neither is what the evidence supported.
+    """
+
+    def setUp(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_plan_workflow_budget", SCRIPT)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.temp = Path(tempfile.mkdtemp(prefix="gb-budget-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def file(self, name: str, body: str) -> Path:
+        path = self.temp / name
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_a_first_attempt_never_resets(self) -> None:
+        self.assertFalse(self.module.budget_reset_due(0, [], "abc"))
+        self.assertFalse(self.module.budget_reset_due(0, ["old"], "abc"))
+
+    def test_repeating_a_charged_input_never_resets(self) -> None:
+        self.assertFalse(self.module.budget_reset_due(4, ["abc"], "abc"),
+                         "asking the same question again must not buy more attempts")
+        self.assertFalse(self.module.budget_reset_due(4, ["abc", "def"], "def"))
+
+    def test_new_material_resets(self) -> None:
+        self.assertTrue(self.module.budget_reset_due(4, ["abc"], "xyz"))
+
+    def test_the_digest_follows_content_and_names(self) -> None:
+        one = {"request.md": self.file("request.md", "objective")}
+        base = self.module.context_digest(one)
+        self.assertEqual(base, self.module.context_digest(one), "stable")
+
+        self.file("request.md", "objective, revised")
+        self.assertNotEqual(base, self.module.context_digest(one), "content counts")
+
+        renamed = {"target_plan.md": self.file("target_plan.md", "objective")}
+        original = {"target_draft.json": self.file("target_draft.json", "objective")}
+        self.assertNotEqual(self.module.context_digest(renamed),
+                            self.module.context_digest(original),
+                            "the same bytes under a different name is a different question -- "
+                            "which is exactly what the representation fix changed")
+
+    def test_decisions_are_excluded_from_the_digest(self) -> None:
+        """Otherwise the cap lifts itself: reaching it is what creates the next decision file."""
+        without = {"request.md": self.file("request.md", "objective")}
+        with_decision = dict(without, decision_001=self.file("decision_001.json", '{"choice": "x"}'))
+        self.assertEqual(self.module.context_digest(without),
+                         self.module.context_digest(with_decision))
 
 
 class DeliveryFailureTest(unittest.TestCase):

@@ -496,6 +496,33 @@ def independence_section(state: dict[str, Any]) -> str:
     return "".join(lines)
 
 
+def context_digest(context_files: dict[str, Path]) -> str:
+    """What this assignment is being asked ABOUT, as one hash.
+
+    Decisions are excluded on purpose. They accumulate in the context as the run adjudicates, so a
+    digest that counted them would change on every adjudication and reset the very budget the
+    adjudication was needed for -- a cap that lifts itself whenever it is reached is not a cap.
+    What is hashed is the material: the request, the draft or plan under review, and their names.
+    """
+    parts = []
+    for name in sorted(context_files):
+        if name.startswith("decision_"):
+            continue
+        parts.append(f"{name}:{sha256_file(context_files[name])}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def budget_reset_due(used: int, charged: list[str], digest: str) -> bool:
+    """Has this assignment been charged for attempts at material it is no longer being asked about?
+
+    True only when attempts were charged, at least one digest was recorded, and the incoming one
+    matches none of them. A first attempt does not reset (nothing to release), and a repeat of any
+    previously charged input does not reset -- which is what keeps this from being a way to buy
+    unlimited attempts by asking the same question again.
+    """
+    return bool(used) and bool(charged) and digest not in charged
+
+
 def assignment_provider(state: dict[str, Any], assignment: str, default: str) -> str:
     """Which CLI serves this assignment, after any recorded reassignment.
 
@@ -770,6 +797,25 @@ def invoke(
 ) -> dict[str, Any]:
     used = state["usage"].get(assignment, 0)
     granted = state.get("extra_invocation_grants", {}).get(assignment, 0)
+    # The budget counts attempts AT AN INPUT, not attempts forever. Every charged attempt records
+    # what it was asked about; when that changes -- because a defect in how the material was
+    # prepared got fixed, which is the case this exists for -- the attempts that measured the old
+    # material stop being evidence about the new one, and the count starts again. Repeating an
+    # identical request cannot reach this: the digest would be unchanged.
+    digest = context_digest(context_files)
+    charged = state.setdefault("charged_context_digests", {}).setdefault(assignment, [])
+    if not dry_run and budget_reset_due(used, charged, digest):
+        state["usage"][assignment] = 0
+        state.setdefault("extra_invocation_grants", {}).pop(assignment, None)
+        (state.get("delivery_faults") or {}).pop(assignment, None)
+        state.setdefault("budget_resets", []).append({
+            "assignment": assignment, "attempts_released": used,
+            "previous_digests": list(charged), "new_digest": digest, "at": utc_now(),
+        })
+        charged.clear()
+        used = 0
+        granted = 0
+        save_state(state)
     if not dry_run and used >= MAX_INVOCATIONS_PER_ASSIGNMENT + granted:
         resume_status = state["status"]
         # "Out of tries" and "this provider does not deliver a verdict for this assignment" both
@@ -817,6 +863,8 @@ def invoke(
     if dry_run:
         return {"dry_run": True, "command": command[:-1] + ["<PROMPT>"], "context": str(context)}
     state["usage"][assignment] = used + 1
+    if digest not in charged:
+        charged.append(digest)
     save_state(state)
     result = run(command, cwd=worktree, timeout=timeout, env=agent_environment())
     stdout_path = root / "stdout.log"
