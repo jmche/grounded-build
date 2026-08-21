@@ -779,6 +779,34 @@ class CodexTrustStoreTest(unittest.TestCase):
         outside = Path("/etc/somewhere/models.json")
         self.assertEqual(self.module.sandbox_destination(outside, private), outside)
 
+    def test_both_planners_can_execute_and_neither_can_write(self) -> None:
+        """The request asks in three places for measurements to be RUN. Both sides must be able to.
+
+        Bash was disallowed for claude while codex ran with `-s read-only`, which includes a shell.
+        Same request, one planner able to execute and the other not: the claude drafts said "this
+        session had no shell" and left the P1.a measurement, the P5.2 reproduction and the registry
+        census unresolved, while codex ran `gate_code_discovery.py` and `extract_urd_delivery_-
+        languages` and settled them. That was this file's configuration, not a difference between
+        the CLIs, and it halved the evidence one half of the cross-check could bring.
+
+        Read-only is enforced by the `--ro-bind` mount, not by withholding the tool -- measured:
+        `touch` inside the worktree returns "Read-only file system".
+        """
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            claude = self.module.agent_command(
+                "claude", root, root, {"type": "object"}, root / "raw.json", "prompt")
+            codex = self.module.agent_command(
+                "codex", root, root, {"type": "object"}, root / "raw.json", "prompt")
+
+        allowed = claude[claude.index("--allowedTools") + 1]
+        disallowed = claude[claude.index("--disallowedTools") + 1]
+        self.assertIn("Bash", allowed, "the planner that cannot execute cannot verify")
+        self.assertNotIn("Bash", disallowed.split(","))
+        for mutating in ("Edit", "Write", "NotebookEdit"):
+            self.assertIn(mutating, disallowed.split(","))
+        self.assertIn("read-only", codex, "codex's half of the parity")
+
     def test_a_run_initialized_before_the_collapse_still_resolves(self) -> None:
         """A run in flight when this changed keeps its per-slot map, and must keep working.
 

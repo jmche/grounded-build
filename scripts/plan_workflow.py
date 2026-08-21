@@ -589,12 +589,22 @@ def agent_command(
             "-C", str(worktree), "--add-dir", str(context), "--output-schema", str(schema_path),
             "-o", str(raw), prompt,
         ]
-    allowed = ",".join(["Read", "Grep", "Glob"])
+    # Bash is ALLOWED, and read-only is enforced where it can actually be enforced: the worktree
+    # is mounted --ro-bind, so a write fails at the filesystem rather than at a tool's discretion.
+    #
+    # It used to be disallowed here while codex ran with `-s read-only`, which includes a shell. So
+    # one planner could execute and the other could not, on the same request -- a request that asks
+    # in three places for measurements to be RUN rather than reasoned about. The claude drafts duly
+    # said "this session had no shell" and left those items unresolved, while codex executed
+    # `gate_code_discovery.py` and `extract_urd_delivery_languages` and settled them. That asymmetry
+    # was this file's doing, not a difference between the two CLIs, and it silently halved the
+    # evidence one side of the cross-check could bring.
+    allowed = ",".join(["Read", "Grep", "Glob", "Bash"])
     return [
         "claude", "-p", "--output-format", "json", "--json-schema",
         json.dumps(schema, separators=(",", ":")), "--permission-mode", "dontAsk",
         "--allowedTools", allowed,
-        "--disallowedTools", "Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch",
+        "--disallowedTools", "Edit,Write,NotebookEdit,WebFetch,WebSearch",
         "--add-dir", str(context), "--no-session-persistence", prompt,
     ]
 
