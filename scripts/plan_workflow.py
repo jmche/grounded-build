@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SCHEMA_VERSION = 1
 SUPPORTED_PROVIDERS = ("claude", "codex")
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
@@ -189,7 +189,10 @@ PROBE_SCHEMA: dict[str, Any] = {
 }
 
 
-def probe_provider(provider: str, project: Path, timeout: int = 180) -> dict[str, Any]:
+def probe_provider(
+    provider: str, project: Path, timeout: int = 180,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Can this CLI authenticate and return one small schema object right now?
 
     Cheap, and deliberately narrow. It answers the question that cost the most to answer the
@@ -217,8 +220,9 @@ def probe_provider(provider: str, project: Path, timeout: int = 180) -> dict[str
             f"Reply with the schema object only: provider={provider}, ready=true. "
             "Do not inspect anything. This is a capability check."
         )
-        command = agent_command(provider, project, context, PROBE_SCHEMA, raw, prompt)
-        command = isolated_agent_command(command, {}, root, project, context)
+        command = agent_command(provider, project, context, PROBE_SCHEMA, raw, prompt, runtime)
+        command = isolated_agent_command(
+            command, {"agent_runtime": {provider: runtime or {}}}, root, project, context)
         result = run(command, cwd=project, timeout=timeout, env=agent_environment())
         if result.returncode != 0:
             return {"provider": provider, "ok": False,
@@ -431,6 +435,97 @@ def available(provider: str) -> bool:
     return shutil.which(provider) is not None
 
 
+def executable_version(provider: str) -> str | None:
+    """Return a short CLI version without making a model/API call."""
+    if not available(provider):
+        return None
+    executable = shutil.which(provider)
+    if not executable:
+        return None
+    result = run([executable, "--version"], timeout=30, env=agent_environment())
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or result.stderr).strip().splitlines()
+    return value[0][:200] if value else None
+
+
+def codex_runtime_identity(
+    model: str | None = None, model_provider: str | None = None, profile: str | None = None,
+) -> dict[str, Any]:
+    """Describe Codex without persisting credentials or endpoint URLs.
+
+    Codex is a CLI adapter, not a model family. GPT-backed installations and Codex configured for
+    an OpenAI-compatible DeepSeek gateway use the same adapter, so the non-secret selection is
+    frozen separately from the executable name.
+    """
+    configured: dict[str, Any] = {}
+    codex_home = Path.home() / ".codex"
+    configs = [codex_home / "config.toml"]
+    if profile:
+        configs.append(codex_home / f"{profile}.config.toml")
+    for config in configs:
+        if not config.is_file():
+            continue
+        try:
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            continue
+        for key in ("model", "model_provider"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                configured[key] = value.strip()
+    selected_model = model or configured.get("model")
+    selected_provider = model_provider or configured.get("model_provider")
+    lowered = " ".join(str(value).lower() for value in (selected_model, selected_provider) if value)
+    family = "deepseek" if "deepseek" in lowered else "gpt" if any(
+        marker in lowered for marker in ("gpt", "openai", "o1", "o3", "o4")
+    ) else "unknown"
+    return {
+        "adapter": "codex",
+        "cli_version": executable_version("codex"),
+        "model": selected_model,
+        "model_provider": selected_provider,
+        "profile": profile,
+        "model_family": family,
+        "identity_source": "explicit_override" if any((model, model_provider, profile)) else "codex_config",
+    }
+
+
+def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str, Any]]:
+    """Build the non-secret adapter identity frozen into a new run."""
+    model = getattr(args, "codex_model", None) if args else None
+    model_provider = getattr(args, "codex_model_provider", None) if args else None
+    profile = getattr(args, "codex_profile", None) if args else None
+    if profile and not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
+        raise WorkflowError("--codex-profile must be a simple profile name")
+    return {
+        "codex": codex_runtime_identity(model, model_provider, profile),
+        "claude": {
+            "adapter": "claude", "cli_version": executable_version("claude"),
+            "model": None, "model_provider": "anthropic", "profile": None,
+            "model_family": "claude", "identity_source": "cli_default",
+        },
+    }
+
+
+def adapter_capabilities(provider: str) -> dict[str, Any]:
+    """Check the non-network CLI surface this workflow depends on."""
+    executable = shutil.which(provider)
+    if not executable:
+        return {"ok": False, "missing": ["executable"]}
+    help_args = [executable, "exec", "--help"] if provider == "codex" else [executable, "--help"]
+    result = run(help_args, timeout=30)
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    required = (
+        ["--output-schema", "--output-last-message", "--ephemeral", "--sandbox", "--config"]
+        if provider == "codex" else
+        ["--json-schema", "--output-format", "--permission-mode", "--no-session-persistence"]
+    )
+    missing = [flag for flag in required if flag not in text]
+    return {"ok": result.returncode == 0 and not missing, "missing": missing,
+            "help_exit": result.returncode}
+
+
 def resolve_topology(backend: str) -> dict[str, str]:
     present = {name for name in SUPPORTED_PROVIDERS if available(name)}
     if backend == "auto":
@@ -588,12 +683,22 @@ def validate_planning_worktree(state: dict[str, Any], worktree: Path) -> None:
 
 def agent_command(
     provider: str, worktree: Path, context: Path, schema: dict[str, Any], raw: Path, prompt: str,
+    runtime: dict[str, Any] | None = None,
 ) -> list[str]:
     if provider == "codex":
         schema_path = context / "schema.json"
         atomic_json(schema_path, schema)
+        runtime = runtime or {}
+        selection: list[str] = []
+        if runtime.get("profile"):
+            selection.extend(["-p", str(runtime["profile"])])
+        if runtime.get("model"):
+            selection.extend(["-m", str(runtime["model"])])
+        if runtime.get("model_provider"):
+            selection.extend(["-c", f'model_provider={json.dumps(runtime["model_provider"])}'])
         return [
             "codex", "-a", "never", "exec", "--ephemeral", "-s", "read-only",
+            *selection,
             *CODEX_POLICY_OVERRIDES,
             "-C", str(worktree), "--add-dir", str(context), "--output-schema", str(schema_path),
             "-o", str(raw), prompt,
@@ -631,7 +736,7 @@ def sandbox_destination(source: Path, private_home: Path) -> Path:
         return source
 
 
-def provider_trust_store(provider: str) -> list[Path]:
+def provider_trust_store(provider: str, codex_profile: str | None = None) -> list[Path]:
     """The files a CLI needs in order to be itself: credentials AND the configuration around them.
 
     The workflow used to name one file per provider and treat it as the whole credential store.
@@ -650,6 +755,12 @@ def provider_trust_store(provider: str) -> list[Path]:
         codex_home = Path.home() / ".codex"
         config = codex_home / "config.toml"
         candidates = [config, codex_home / "auth.json"]
+        if codex_profile:
+            profile_config = codex_home / f"{codex_profile}.config.toml"
+            candidates.append(profile_config)
+            profile_catalog = codex_catalog_path(profile_config)
+            if profile_catalog is not None:
+                candidates.append(profile_catalog)
         catalog = codex_catalog_path(config)
         if catalog is not None:
             candidates.append(catalog)
@@ -696,7 +807,8 @@ def isolated_agent_command(
     private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
     provider = Path(command[0]).name
     credential_mounts: list[tuple[Path, Path]] = []
-    for source in provider_trust_store(provider):
+    profile = ((state.get("agent_runtime") or {}).get("codex") or {}).get("profile")
+    for source in provider_trust_store(provider, profile):
         destination = sandbox_destination(source, private_home)
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         destination.touch(mode=0o600, exist_ok=True)
@@ -876,7 +988,9 @@ def invoke(
     worktree = reviewer_worktree(state, slot, provider)
     validate_planning_worktree(state, worktree)
     prompt = delivery_corrective(state, assignment) + prompt
-    command = agent_command(provider, worktree, context, schema, raw, prompt.format(context=context))
+    runtime = (state.get("agent_runtime") or {}).get(provider) or {}
+    command = agent_command(
+        provider, worktree, context, schema, raw, prompt.format(context=context), runtime)
     command = isolated_agent_command(command, state, root, worktree, context)
     (root / "prompt.md").write_text(prompt.format(context=context), encoding="utf-8")
     if dry_run:
@@ -989,9 +1103,82 @@ def validate_ready_invariants(state: dict[str, Any]) -> None:
             raise WorkflowError(f"READY invariant failed: final reviewer {slot} did not PASS")
 
 
+def model_diversity(topology: dict[str, str], runtime: dict[str, dict[str, Any]]) -> bool:
+    identities = {
+        (
+            runtime.get(adapter, {}).get("model_provider"),
+            runtime.get(adapter, {}).get("model_family"),
+            runtime.get(adapter, {}).get("model"),
+        )
+        for adapter in topology.values()
+    }
+    return len(identities) > 1
+
+
+def next_action(state: dict[str, Any]) -> dict[str, Any]:
+    """Return one deterministic host action for the current planning state."""
+    base = [sys.executable, str(Path(__file__).resolve())]
+    common = ["--project", state["project"], "--run-id", state["run_id"]]
+    status = state["status"]
+    if status in {"INITIALIZED", "DRAFTING"}:
+        slot = next(slot for slot in ("A", "B") if slot not in state["drafts"])
+        command = [*base, "draft", *common, "--slot", slot]
+        return {"kind": "RUN_AGENT", "stage": "draft", "slot": slot, "command": command,
+                "preview_command": [*command, "--dry-run"]}
+    if status in {"DRAFTS_READY", "CROSS_REVIEWING"}:
+        slot = next(slot for slot in ("A", "B") if slot not in state["cross_reviews"])
+        command = [*base, "cross-review", *common, "--slot", slot]
+        return {"kind": "RUN_AGENT", "stage": "cross-review", "slot": slot, "command": command,
+                "preview_command": [*command, "--dry-run"]}
+    if status == "SYNTHESIS_REQUIRED":
+        return {"kind": "HOST_SYNTHESIS", "stage": "synthesis",
+                "command": [*base, "synthesis-context", *common],
+                "requires": ["implementation_plan.md", "batches.md"]}
+    if status in {"FINAL_REVIEW_REQUIRED", "FINAL_REVIEWING"}:
+        required = required_final_reviewers(state)
+        slot = next(slot for slot in required if slot not in state["final_reviews"])
+        command = [*base, "final-review", *common, "--reviewer", slot]
+        return {"kind": "RUN_AGENT", "stage": "final-review", "slot": slot,
+                "command": command, "preview_command": [*command, "--dry-run"]}
+    if status == "NEEDS_USER_DECISION":
+        return {"kind": "ASK_USER", "stage": "adjudication",
+                "pending_decision": state.get("pending_decision")}
+    if status == "READY":
+        return {"kind": "STOP_FOR_IMPLEMENTATION_APPROVAL", "stage": "ready",
+                "command": [*base, "export", *common]}
+    if status == "ABANDONED":
+        return {"kind": "TERMINAL", "stage": "abandoned"}
+    return {"kind": "INSPECT_STATUS", "stage": status.lower()}
+
+
+def synthesis_diagnostics(plan_text: str, batches_text: str) -> dict[str, list[str]]:
+    """Check the host-authored handoff before paid final review."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not plan_text.strip():
+        errors.append("implementation plan is empty")
+    matches = list(re.finditer(r"(?m)^\s*(?:[-*]\s*|#+\s*)?(B\d{2,})\s*:", batches_text))
+    ids = [match.group(1) for match in matches]
+    if not ids:
+        errors.append("batch manifest must declare at least one Bxx batch identifier")
+    if len(ids) != len(set(ids)):
+        errors.append("batch manifest repeats a batch identifier")
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(batches_text)
+        block = batches_text[match.start():end]
+        if not re.search(r"(?im)^\s*(?:[-*]\s*)?(?:exit observation|exit|stopping condition)\s*:", block):
+            warnings.append(f"{match.group(1)} has no explicitly labelled finite exit observation")
+        if not re.search(r"(?im)^\s*(?:[-*]\s*)?(?:verification|verify|commands?)\s*:", block):
+            warnings.append(f"{match.group(1)} has no explicitly labelled verification command")
+    if not re.search(r"(?i)\bexcluded\b|排除|不包括", plan_text + "\n" + batches_text):
+        warnings.append("total excluded scope is not explicit")
+    return {"errors": errors, "warnings": warnings}
+
+
 def command_preflight(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     topology = resolve_topology(args.backend)
+    runtime = agent_runtime(args)
     payload = {
         "status": "PREFLIGHT_OK",
         "project": str(project),
@@ -999,9 +1186,29 @@ def command_preflight(args: argparse.Namespace) -> None:
         "clean": not bool(git(project, "status", "--porcelain")),
         "planners": topology,
         "provider_diversity": len(set(topology.values())) > 1,
+        "model_diversity": model_diversity(topology, runtime),
+        "agent_runtime": {name: runtime[name] for name in sorted(set(topology.values()))},
+        "capabilities": {
+            "bubblewrap": shutil.which("bwrap") is not None,
+            "git": executable_version("git"),
+            "python": sys.version.split()[0],
+            "adapters": {
+                name: adapter_capabilities(name) for name in sorted(set(topology.values()))
+            },
+        },
     }
+    static_ok = (
+        payload["clean"] and payload["capabilities"]["bubblewrap"]
+        and all(item["ok"] for item in payload["capabilities"]["adapters"].values())
+    )
+    if not static_ok:
+        payload["status"] = "PREFLIGHT_STATIC_REQUIREMENT_FAILED"
+        emit(payload, code=2)
     if args.probe:
-        probes = {name: probe_provider(name, project) for name in sorted(set(topology.values()))}
+        probes = {
+            name: probe_provider(name, project, runtime=runtime[name])
+            for name in sorted(set(topology.values()))
+        }
         payload["probes"] = probes
         if not all(item["ok"] for item in probes.values()):
             payload["status"] = "PREFLIGHT_PROVIDER_UNUSABLE"
@@ -1017,6 +1224,7 @@ def command_init(args: argparse.Namespace) -> None:
     if git(project, "status", "--porcelain"):
         raise WorkflowError("project must be clean so both planners inspect the same Git snapshot")
     topology = resolve_topology(args.backend)
+    runtime = agent_runtime(args)
     if args.final_reviewer != "both" and not available(args.final_reviewer):
         raise WorkflowError(f"final reviewer is unavailable: {args.final_reviewer}")
     baseline = git(project, "rev-parse", "HEAD")
@@ -1046,6 +1254,8 @@ def command_init(args: argparse.Namespace) -> None:
         "request_snapshot": str(request_snapshot),
         "planners": topology,
         "provider_diversity": len(set(topology.values())) > 1,
+        "model_diversity": model_diversity(topology, runtime),
+        "agent_runtime": runtime,
         "final_reviewer": args.final_reviewer,
         "worktree": str(worktree),
         "status": "INITIALIZED",
@@ -1069,6 +1279,8 @@ def command_init(args: argparse.Namespace) -> None:
         "status": state["status"], "run_id": run_id, "run_directory": str(root),
         "planners": topology, "final_reviewer": args.final_reviewer,
         "provider_diversity": state["provider_diversity"],
+        "model_diversity": state["model_diversity"], "agent_runtime": runtime,
+        "next_action": next_action(state),
     })
 
 
@@ -1213,13 +1425,9 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
         raise WorkflowError("both synthesized plan and batch manifest must exist")
     plan_text = plan.read_text(encoding="utf-8")
     batches_text = batches.read_text(encoding="utf-8")
-    if not plan_text.strip():
-        raise WorkflowError("synthesized plan is empty")
-    batch_ids = re.findall(r"(?m)^\s*(?:[-*]\s*|#+\s*)?(B\d{2,})\s*:", batches_text)
-    if not batch_ids:
-        raise WorkflowError("batch manifest must declare at least one Bxx batch identifier")
-    if len(batch_ids) != len(set(batch_ids)):
-        raise WorkflowError("batch manifest repeats a batch identifier")
+    diagnostics = synthesis_diagnostics(plan_text, batches_text)
+    if diagnostics["errors"]:
+        raise WorkflowError("; ".join(diagnostics["errors"]))
     number = state["synthesis_submissions"] + 1
     destination = Path(state["run_directory"]) / "synthesis" / f"round_{number}"
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1237,12 +1445,25 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
     state["candidate"] = {
         "round": number, "plan": str(plan_copy), "batch_manifest": str(batches_copy),
         "plan_sha256": sha256_file(plan_copy), "batch_manifest_sha256": sha256_file(batches_copy),
+        "diagnostics": diagnostics,
     }
     state["final_reviews"] = {}
     state["pending_decision"] = None
     state["status"] = "FINAL_REVIEW_REQUIRED"
     save_state(state)
-    emit({"status": state["status"], "run_id": state["run_id"], "candidate": state["candidate"]})
+    emit({"status": state["status"], "run_id": state["run_id"], "candidate": state["candidate"],
+          "next_action": next_action(state)})
+
+
+def command_check_synthesis(args: argparse.Namespace) -> None:
+    plan = Path(args.plan).expanduser().resolve()
+    batches = Path(args.batch_manifest).expanduser().resolve()
+    if not plan.is_file() or not batches.is_file():
+        raise WorkflowError("both synthesized plan and batch manifest must exist")
+    diagnostics = synthesis_diagnostics(
+        plan.read_text(encoding="utf-8"), batches.read_text(encoding="utf-8"))
+    emit({"status": "SYNTHESIS_VALID" if not diagnostics["errors"] else "SYNTHESIS_INVALID",
+          **diagnostics}, code=0 if not diagnostics["errors"] else 2)
 
 
 def command_final_review(args: argparse.Namespace) -> None:
@@ -1315,6 +1536,8 @@ def command_final_review(args: argparse.Namespace) -> None:
                 f"- Baseline: `{state['baseline_sha']}`\n"
                 f"- Planners: `{json.dumps(state['planners'], sort_keys=True)}`\n"
                 f"- Provider diversity: `{str(state['provider_diversity']).lower()}`\n"
+                f"- Model diversity: `{str(state.get('model_diversity', False)).lower()}`\n"
+                f"- Agent runtime: `{json.dumps(state.get('agent_runtime', {}), sort_keys=True)}`\n"
                 + independence_section(state)
                 + f"- Final reviewer selection: `{state['final_reviewer']}`\n"
                 f"- Synthesis submissions: `{state['synthesis_submissions']}`\n"
@@ -1446,13 +1669,23 @@ def command_status(args: argparse.Namespace) -> None:
     emit({
         "status": state["status"], "run_id": state["run_id"], "baseline_sha": state["baseline_sha"],
         "planners": state["planners"], "provider_diversity": state["provider_diversity"],
+        "model_diversity": state.get("model_diversity", False),
+        "agent_runtime": state.get("agent_runtime") or {},
         "assignment_providers": state.get("assignment_providers") or {},
         "independence_notes": state.get("independence_notes") or [],
         "final_reviewer": state["final_reviewer"], "drafts": state["drafts"],
         "cross_reviews": state["cross_reviews"], "synthesis_submissions": state["synthesis_submissions"],
         "final_reviews": state["final_reviews"], "pending_decision": state["pending_decision"],
         "final": state.get("final"), "run_directory": state["run_directory"], "usage": state["usage"],
+        "next_action": next_action(state),
     })
+
+
+def command_next(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id)
+    emit({"status": state["status"], "run_id": state["run_id"],
+          "next_action": next_action(state)})
 
 
 def command_export(args: argparse.Namespace) -> None:
@@ -1465,6 +1698,7 @@ def command_export(args: argparse.Namespace) -> None:
         "plan_sha256": state["final"]["plan_sha256"],
         "batch_manifest_sha256": state["final"]["batch_manifest_sha256"],
         "report": state["final"]["report"],
+        "agent_runtime": state.get("agent_runtime") or {},
         "handoff": "Use scripts/workflow.py init only after explicit user approval.",
     })
 
@@ -1506,6 +1740,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    def add_codex_selection(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--codex-model", help="freeze and pass an explicit Codex model name")
+        command.add_argument(
+            "--codex-model-provider",
+            help="freeze and pass a configured Codex model_provider (for example a DeepSeek gateway)")
+        command.add_argument(
+            "--codex-profile",
+            help="freeze and pass a CODEX_HOME profile name; its profile config is mounted read-only")
+
     preflight = commands.add_parser("preflight")
     preflight.add_argument("--project", required=True)
     preflight.add_argument("--backend", choices=["auto", "mixed", *SUPPORTED_PROVIDERS], default="auto")
@@ -1513,6 +1756,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe", action="store_true",
         help="spend one trivial sandboxed call per provider to check it can authenticate and "
              "return a schema object; exits 2 if any cannot")
+    add_codex_selection(preflight)
     preflight.set_defaults(func=command_preflight)
 
     init = commands.add_parser("init")
@@ -1520,6 +1764,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--request", required=True)
     init.add_argument("--backend", choices=["auto", "mixed", *SUPPORTED_PROVIDERS], default="auto")
     init.add_argument("--final-reviewer", choices=["both", *SUPPORTED_PROVIDERS], required=True)
+    add_codex_selection(init)
     init.set_defaults(func=command_init)
 
     for name, function in (("draft", command_draft), ("cross-review", command_cross_review)):
@@ -1542,6 +1787,12 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--plan", required=True)
     submit.add_argument("--batch-manifest", required=True)
     submit.set_defaults(func=command_submit_synthesis)
+
+    check_synthesis = commands.add_parser(
+        "check-synthesis", help="validate host-authored plan and batch documents before submission")
+    check_synthesis.add_argument("--plan", required=True)
+    check_synthesis.add_argument("--batch-manifest", required=True)
+    check_synthesis.set_defaults(func=command_check_synthesis)
 
     final_review = commands.add_parser("final-review")
     final_review.add_argument("--project", required=True)
@@ -1569,7 +1820,7 @@ def build_parser() -> argparse.ArgumentParser:
     adjudicate.add_argument("--apply", action="store_true")
     adjudicate.set_defaults(func=command_adjudicate)
 
-    for name, function in (("status", command_status), ("export", command_export)):
+    for name, function in (("status", command_status), ("next", command_next), ("export", command_export)):
         command = commands.add_parser(name)
         command.add_argument("--project", required=True)
         command.add_argument("--run-id", required=True)

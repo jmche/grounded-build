@@ -1385,5 +1385,19 @@ class SharedVerificationWorktreeTests(unittest.TestCase):
             "the evidence beside the scratch must not be in the removal set")
 
 
+class ReviewerRuntimeTest(unittest.TestCase):
+    def test_deepseek_codex_selection_is_passed_without_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            command = WORKFLOW_MODULE.reviewer_command(
+                "codex", root, root, root / "schema.json", root / "raw.json", "prompt",
+                runtime={"model": "deepseek-reasoner", "model_provider": "deepseek-gateway",
+                         "profile": "deepseek"})
+        self.assertEqual(command[command.index("-m") + 1], "deepseek-reasoner")
+        self.assertEqual(command[command.index("-p") + 1], "deepseek")
+        self.assertIn('model_provider="deepseek-gateway"', command)
+        self.assertNotIn("token", " ".join(command).lower())
+
+
 if __name__ == "__main__":
     unittest.main()

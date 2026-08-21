@@ -890,6 +890,79 @@ class CodexTrustStoreTest(unittest.TestCase):
         limit = int(line.split("tool_output_token_limit=")[1].split()[0])
         self.assertGreater(limit, 10_000, "the catalog default is what broke the review")
 
+    def test_deepseek_identity_is_a_model_not_a_cli_adapter(self) -> None:
+        self.write_config(
+            'model = "deepseek-reasoner"\nmodel_provider = "deepseek-gateway"\n'
+            '[model_providers.deepseek-gateway]\nbase_url = "https://secret.invalid/v1"\n'
+            'experimental_bearer_token = "never-record-this"\n')
+        identity = self.module.codex_runtime_identity()
+        self.assertEqual(identity["adapter"], "codex")
+        self.assertEqual(identity["model_family"], "deepseek")
+        self.assertEqual(identity["model_provider"], "deepseek-gateway")
+        serialized = json.dumps(identity)
+        self.assertNotIn("secret.invalid", serialized)
+        self.assertNotIn("never-record-this", serialized)
+
+    def test_explicit_codex_selection_reaches_the_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            command = self.module.agent_command(
+                "codex", root, root, {"type": "object"}, root / "raw.json", "prompt",
+                {"model": "deepseek-reasoner", "model_provider": "deepseek-gateway",
+                 "profile": "deepseek"})
+        self.assertEqual(command[command.index("-m") + 1], "deepseek-reasoner")
+        self.assertEqual(command[command.index("-p") + 1], "deepseek")
+        self.assertIn('model_provider="deepseek-gateway"', command)
+
+    def test_profile_configuration_is_part_of_the_read_only_trust_store(self) -> None:
+        profile = self.codex_home / "deepseek.config.toml"
+        profile.write_text(
+            'model = "deepseek-reasoner"\nmodel_provider = "deepseek-gateway"\n'
+            'model_catalog_json = "~/.codex/deepseek-models.json"\n', encoding="utf-8")
+        catalog = self.codex_home / "deepseek-models.json"
+        catalog.write_text("{}", encoding="utf-8")
+        self.assertIn(profile.resolve(), self.module.provider_trust_store("codex", "deepseek"))
+        self.assertIn(catalog.resolve(), self.module.provider_trust_store("codex", "deepseek"))
+        identity = self.module.codex_runtime_identity(profile="deepseek")
+        self.assertEqual(identity["model_family"], "deepseek")
+        self.assertEqual(identity["model"], "deepseek-reasoner")
+
+
+class HostProtocolTest(unittest.TestCase):
+    def setUp(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_host_protocol", SCRIPT)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    def state(self, status: str) -> dict:
+        return {
+            "status": status, "project": "/repo", "run_id": "run-1",
+            "drafts": {}, "cross_reviews": {}, "final_reviews": {},
+            "planners": {"A": "codex", "B": "codex"}, "final_reviewer": "codex",
+            "candidate": {"round": 1}, "pending_decision": None,
+        }
+
+    def test_next_action_removes_slot_guessing(self) -> None:
+        state = self.state("INITIALIZED")
+        first = self.module.next_action(state)
+        self.assertEqual((first["stage"], first["slot"]), ("draft", "A"))
+        state["status"] = "DRAFTING"
+        state["drafts"]["A"] = {}
+        self.assertEqual(self.module.next_action(state)["slot"], "B")
+
+    def test_ready_stops_for_separate_implementation_authority(self) -> None:
+        action = self.module.next_action(self.state("READY"))
+        self.assertEqual(action["kind"], "STOP_FOR_IMPLEMENTATION_APPROVAL")
+
+    def test_synthesis_diagnostics_bind_each_batch_to_observations(self) -> None:
+        good = self.module.synthesis_diagnostics(
+            "# Plan\n\nExcluded: none.\n",
+            "B01: core\nExit observation: tests pass\nVerification: pytest -q\n")
+        self.assertEqual(good, {"errors": [], "warnings": []})
+        weak = self.module.synthesis_diagnostics("# Plan\n", "B01: core\n")
+        self.assertEqual(weak["errors"], [])
+        self.assertGreaterEqual(len(weak["warnings"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

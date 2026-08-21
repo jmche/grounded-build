@@ -72,6 +72,30 @@
         "Frozen artifacts are validated before work resumes.",
         "The reported mode, phase, and run path are included in the response."
       ]
+    },
+    {
+      "id": 7,
+      "prompt": "Use grounded-build through Codex configured with model deepseek-reasoner and model_provider deepseek-gateway. Plan only. Do not call this GPT just because the CLI is Codex.",
+      "expected_output": "The host preflights and initializes with explicit Codex model selection, reports adapter codex and model family deepseek separately, follows returned next_action values, and stops at implementation approval.",
+      "files": [],
+      "assertions": [
+        "The CLI adapter is recorded as codex while the model family is recorded as deepseek.",
+        "No credential, bearer token, or endpoint URL is copied into workflow state.",
+        "Every model call uses the frozen model, model_provider, and profile selection.",
+        "The host uses next_action instead of guessing slots or phases."
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "You are a weaker tool-using host model resuming this grounded-build planning run. Continue safely without reconstructing the workflow from memory.",
+      "expected_output": "The host calls plan_workflow.py next, performs only its one returned action, repeats after completion, and stops for typed user decisions or implementation approval.",
+      "files": [],
+      "assertions": [
+        "No completed planner or reviewer slot is invoked twice.",
+        "Paid invocations are previewed through the returned preview_command.",
+        "NEEDS_USER_DECISION is surfaced rather than bypassed.",
+        "READY exports artifacts and does not start implementation."
+      ]
     }
   ]
 }

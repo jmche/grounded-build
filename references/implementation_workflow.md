@@ -11,6 +11,10 @@ Collect or infer:
 - `plan`: an existing local plan file, resolved to an absolute path.
 - `batch_manifest`: a host-authored file that explicitly declares this run's included and excluded total scope and maps every batch ID to plan work. This is execution authority, not reviewer output.
 - `reviewer`: exactly `claude` or `codex`; it may match the host/implementer.
+- `reviewer_runtime`: the non-secret model identity frozen at initialization. For Codex, optional
+  `--codex-model`, `--codex-model-provider`, and `--codex-profile` select GPT, an
+  OpenAI-compatible DeepSeek gateway, or another configured model without treating the CLI name
+  as the model family.
 - `fix_policy`: `ask` by default, `auto` only when explicitly requested, or `never` for review without repair.
 - `target_branch`: the current branch unless the user explicitly names another branch.
 
@@ -138,6 +142,15 @@ python3 <skill-root>/scripts/workflow.py init \
   --batches <comma-separated-batch-ids> \
   --target-branch <branch>
 ```
+
+When selecting a non-default Codex runtime, append the same selection verified during preflight:
+
+```bash
+--codex-model <model> --codex-model-provider <configured-provider> --codex-profile <profile>
+```
+
+These values are frozen in `reviewer_runtime`; credentials, bearer tokens, and endpoint URLs are
+never copied into workflow state.
 
 Initialization snapshots both the plan and batch manifest, records their digests, verifies that the manifest names every declared batch ID, creates a unique implementation branch and reviewer worktree, and leaves the original project's branch, HEAD, index, and files unchanged. The new run starts at `AWAITING_CONTRACT_REVIEW`.
 

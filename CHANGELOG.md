@@ -2,6 +2,18 @@
 
 All notable changes use semantic versioning.
 
+## [0.2.0] - 2026-08-22
+
+- Added a deterministic `next` action protocol so GPT, DeepSeek, Claude, and other host models do
+  not have to reconstruct the planning state machine from prose.
+- Separated CLI adapter identity from model identity and froze non-secret Codex model,
+  `model_provider`, profile, family, and CLI version in planning and implementation runs.
+- Added explicit GPT/DeepSeek-compatible Codex selection to preflight, initialization, and reviewer
+  changes while preserving the user's configured gateway and credential trust boundary.
+- Added synthesis diagnostics before paid final review and split planning recovery details into a
+  progressively disclosed reference.
+- Added UI metadata and brought skill frontmatter back into the supported validator schema.
+
 ## [0.1.0] - 2026-08-20
 
 Initial developer preview.

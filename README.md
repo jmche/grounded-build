@@ -5,9 +5,9 @@ Grounded Build is a local coding-agent skill with two independent modes:
 1. **Plan:** two isolated Claude/Codex instances inspect the same Git snapshot, draft independently, cross-review factual claims, and review a host-synthesized implementation plan.
 2. **Implement:** execute an approved plan batch by batch in isolated Git worktrees with fixed-SHA review, bounded repair, evidence tracking, and explicit final integration.
 
-The first public version is `v0.1.0` (Developer Preview). Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude` or `codex` CLIs are required.
+Version `v0.2.0` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude` or `codex` CLI adapters are required.
 
-The v0.1.0 sandbox was exercised with Claude Code 2.1.235 and Codex CLI 0.147.0. Older provider versions that do not honor the configured read-deny/tool policy are unsupported.
+The v0.2.0 sandbox is exercised with Claude Code 2.1.238 and Codex CLI 0.149.0. Codex is treated as an adapter: its configured model may be GPT, DeepSeek through an OpenAI-compatible gateway, or another model. The run freezes and reports the non-secret model identity separately from the adapter.
 
 ## Install
 
@@ -51,6 +51,10 @@ This skill does not replace or migrate the existing `implement-plan-with-review`
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m py_compile scripts/plan_workflow.py scripts/workflow.py
+python3 scripts/release_check.py \
+  --quick-validator ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py
 ```
 
 The planning workflow uses fake local agent adapters in tests; no paid model calls are made by the unit suite.
+
+Run `plan_workflow.py next` after every planning action. It returns the single legal next action and argv arrays, which makes orchestration independent of the host model's ability to remember the state machine.

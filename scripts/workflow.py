@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -296,6 +297,59 @@ def run(
         detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic output"
         raise WorkflowError(f"command failed ({result.returncode}): {' '.join(args)}\n{detail}")
     return result
+
+
+def executable_version(name: str) -> str | None:
+    if not shutil.which(name):
+        return None
+    result = run([name, "--version"], check=False, timeout=30)
+    value = (result.stdout or result.stderr).strip().splitlines()
+    return value[0][:200] if result.returncode == 0 and value else None
+
+
+def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
+    """Freeze the selected reviewer model separately from its CLI adapter."""
+    if reviewer == "claude":
+        return {"adapter": "claude", "cli_version": executable_version("claude"),
+                "model": None, "model_provider": "anthropic", "profile": None,
+                "model_family": "claude", "identity_source": "cli_default"}
+    profile = getattr(args, "codex_profile", None)
+    if profile and not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
+        raise WorkflowError("--codex-profile must be a simple profile name")
+    explicit_model = getattr(args, "codex_model", None)
+    explicit_provider = getattr(args, "codex_model_provider", None)
+    model = None
+    provider = None
+    codex_home = Path.home() / ".codex"
+    configs = [codex_home / "config.toml"]
+    if profile:
+        configs.append(codex_home / f"{profile}.config.toml")
+    for config in configs:
+        if not config.is_file():
+            continue
+        try:
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            continue
+        configured_model = parsed.get("model") if isinstance(parsed.get("model"), str) else None
+        configured_provider = (
+            parsed.get("model_provider") if isinstance(parsed.get("model_provider"), str) else None)
+        if configured_model:
+            model = configured_model
+        if configured_provider:
+            provider = configured_provider
+    model = explicit_model or model
+    provider = explicit_provider or provider
+    lowered = " ".join(str(value).lower() for value in (model, provider) if value)
+    family = "deepseek" if "deepseek" in lowered else "gpt" if any(
+        marker in lowered for marker in ("gpt", "openai", "o1", "o3", "o4")
+    ) else "unknown"
+    return {"adapter": "codex", "cli_version": executable_version("codex"),
+            "model": model, "model_provider": provider, "profile": profile,
+            "model_family": family,
+            "identity_source": "explicit_override" if any((getattr(args, "codex_model", None),
+                                                              getattr(args, "codex_model_provider", None),
+                                                              profile)) else "codex_config"}
 
 
 def git(path: Path, *args: str, check: bool = True) -> str:
@@ -952,6 +1006,7 @@ def command_init(args: argparse.Namespace) -> None:
     batch_manifest = Path(args.batch_manifest).expanduser().resolve()
     if not shutil.which(args.reviewer):
         raise WorkflowError(f"reviewer CLI is not available on PATH: {args.reviewer}")
+    runtime = reviewer_runtime(args, args.reviewer)
     ensure_no_git_operation(project)
     ensure_clean(project, "original project")
     target = args.target_branch or git(project, "branch", "--show-current")
@@ -1025,6 +1080,7 @@ def command_init(args: argparse.Namespace) -> None:
         "batch_manifest_digest": sha256_file(batch_manifest),
         "batch_manifest_snapshot_digest": sha256_file(manifest_snapshot),
         "reviewer": args.reviewer,
+        "reviewer_runtime": runtime,
         "reviewer_history": [{
             "reviewer": args.reviewer, "selected_at": utc_now(), "source": "RUN_INITIALIZED",
             "actor": args.implementer,
@@ -1102,6 +1158,7 @@ def command_init(args: argparse.Namespace) -> None:
             "batch_manifest_digest": state["batch_manifest_digest"],
             "batches": batches,
             "next_batch": batches[0],
+            "reviewer_runtime": runtime,
         }
     )
 
@@ -1250,10 +1307,20 @@ def reviewer_command(
     raw_path: Path,
     prompt: str,
     schema: dict[str, Any] = REVIEW_SCHEMA,
+    runtime: dict[str, Any] | None = None,
 ) -> list[str]:
     if reviewer == "codex":
+        runtime = runtime or {}
+        selection: list[str] = []
+        if runtime.get("profile"):
+            selection.extend(["-p", str(runtime["profile"])])
+        if runtime.get("model"):
+            selection.extend(["-m", str(runtime["model"])])
+        if runtime.get("model_provider"):
+            selection.extend(["-c", f'model_provider={json.dumps(runtime["model_provider"])}'])
         return [
             "codex", "-a", "never", "exec", "--ephemeral", "-s", "read-only",
+            *selection,
             "-C", str(reviewer_path), "--add-dir", str(context_dir),
             "--output-schema", str(schema_path), "-o", str(raw_path), prompt,
         ]
@@ -1445,7 +1512,9 @@ def command_contract_review(args: argparse.Namespace) -> None:
             "type": "string", "enum": list(state["batches"]),
         }
     atomic_json(schema_path, contract_schema)
-    command = reviewer_command(state["reviewer"], reviewer_path, context, schema_path, raw_path, prompt, contract_schema)
+    command = reviewer_command(
+        state["reviewer"], reviewer_path, context, schema_path, raw_path, prompt,
+        contract_schema, state.get("reviewer_runtime"))
     if args.dry_run:
         emit({"status": "CONTRACT_REVIEW_DRY_RUN", "run_id": state["run_id"], "command": command[:-1] + ["<PROMPT>"], "prompt_path": str(prompt_path)})
     try:
@@ -2705,7 +2774,7 @@ def command_review(args: argparse.Namespace) -> None:
     prompt_path.chmod(0o600)
     command = reviewer_command(
         state["reviewer"], reviewer_path, context_dir,
-        schema_path, raw_path, prompt,
+        schema_path, raw_path, prompt, runtime=state.get("reviewer_runtime"),
     )
     if args.dry_run:
         emit(
@@ -3130,6 +3199,7 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "implementation_worktree": state["implementation_worktree"],
         "implementation_sha": implementation_head,
         "reviewer": state["reviewer"], "reviewer_worktree": state["reviewer_worktree"],
+        "reviewer_runtime": state.get("reviewer_runtime") or {},
         "reviewer_history": state.get("reviewer_history", []),
         "implementer": state.get("implementer", "legacy-unknown"),
         "fix_policy": state["fix_policy"], "batches": state["batches"],
@@ -3461,8 +3531,10 @@ def command_change_reviewer(args: argparse.Namespace) -> None:
         raise WorkflowError(f"reviewer change is not meaningful from workflow status {state.get('status')}")
     if not shutil.which(args.reviewer):
         raise WorkflowError(f"reviewer CLI is not available on PATH: {args.reviewer}")
+    runtime = reviewer_runtime(args, args.reviewer)
     previous = state["reviewer"]
-    if previous == args.reviewer:
+    previous_runtime = state.get("reviewer_runtime") or {}
+    if previous == args.reviewer and previous_runtime == runtime:
         emit({
             "status": "REVIEWER_ALREADY_SELECTED", "run_id": state["run_id"],
             "reviewer": previous, "implementer": state.get("implementer"),
@@ -3472,11 +3544,14 @@ def command_change_reviewer(args: argparse.Namespace) -> None:
         raise WorkflowError("reviewer change requires nonempty --reason and --actor")
     change = {
         "id": f"decision-{len(state.get('decisions', [])) + 1:03d}",
-        "type": "REVIEWER_CHANGED", "from_reviewer": previous,
+        "type": "REVIEWER_RUNTIME_CHANGED" if previous == args.reviewer else "REVIEWER_CHANGED",
+        "from_reviewer": previous,
         "to_reviewer": args.reviewer, "reason": args.reason.strip(),
         "actor": args.actor.strip(), "created_at": utc_now(),
         "quality_rounds_reset": False, "invocation_budgets_reset": False,
         "finding_ledger_reset": False,
+        "reviewer_runtime": runtime,
+        "from_reviewer_runtime": previous_runtime,
     }
     preview = {
         "status": "REVIEWER_CHANGE_PREVIEW", "run_id": state["run_id"],
@@ -3485,6 +3560,7 @@ def command_change_reviewer(args: argparse.Namespace) -> None:
     if not args.apply:
         emit(preview)
     state["reviewer"] = args.reviewer
+    state["reviewer_runtime"] = runtime
     history = state.setdefault("reviewer_history", [{
         "reviewer": previous, "selected_at": state.get("created_at"),
         "source": "LEGACY_STATE",
@@ -3501,6 +3577,7 @@ def command_change_reviewer(args: argparse.Namespace) -> None:
         **preview, "status": "REVIEWER_CHANGED", "reviewer": args.reviewer,
         "implementer": state.get("implementer"),
         "same_as_implementer": args.reviewer == state.get("implementer"),
+        "reviewer_runtime": runtime,
     })
 
 
@@ -3655,6 +3732,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
+    def add_codex_selection(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--codex-model", help="explicit Codex reviewer model")
+        command.add_argument(
+            "--codex-model-provider",
+            help="configured Codex model_provider, including an OpenAI-compatible DeepSeek gateway")
+        command.add_argument("--codex-profile", help="CODEX_HOME profile name")
+
     preflight = commands.add_parser("preflight", help="inspect local target and upstream refs")
     add_project_argument(preflight)
     preflight.add_argument("--target-branch")
@@ -3676,6 +3760,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--fix-policy", choices=("ask", "auto", "never"), default="ask")
     init.add_argument("--batches", required=True)
     init.add_argument("--target-branch")
+    add_codex_selection(init)
     init.set_defaults(func=command_init)
 
     review = commands.add_parser("review", help="review the current committed batch SHA")
@@ -3739,6 +3824,7 @@ def build_parser() -> argparse.ArgumentParser:
     change_reviewer.add_argument("--reason", required=True)
     change_reviewer.add_argument("--actor", required=True)
     change_reviewer.add_argument("--apply", action="store_true")
+    add_codex_selection(change_reviewer)
     change_reviewer.set_defaults(func=command_change_reviewer)
 
     status = commands.add_parser("status", help="show active or historical run state")
