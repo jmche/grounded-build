@@ -448,6 +448,35 @@ def required_final_reviewers(state: dict[str, Any]) -> dict[str, str]:
     return {"F": selected}
 
 
+def split_draft_for_review(state: dict[str, Any], slot: str) -> dict[str, Path]:
+    """Hand the reviewer the plan as prose and the claims as data, instead of one JSON blob.
+
+    The reviewer used to receive `<slot>.json`, whose `plan_markdown` field is the entire plan as a
+    single escaped string. Two things follow, and both were measured on one run: the JSON is 93,322
+    bytes where the same plan as markdown is 42,636 -- escaping more than doubles it -- and no file
+    reader can page through a document that is one line. The reviewer of the large draft said so in
+    its own transcript ("the target_draft.json was truncated at B1's text ... first 344 lines, then
+    truncated at 13331 tokens") and spent four whole turns trying to reassemble it. The reviewer of
+    the small draft, 28,874 bytes, passed on its first attempt.
+
+    That asymmetry read as a difference between the two CLIs. It was a difference between the two
+    drafts, and the workflow created it by choosing the larger, unreadable representation of a file
+    it had already written in the better one.
+
+    Splitting also keeps the failure honest if it recurs: a reviewer that truncates a markdown plan
+    can still read the rest of it, where a truncated JSON string yields nothing after the cut.
+    """
+    record = state["drafts"][slot]
+    payload = json.loads(Path(record["path"]).read_text(encoding="utf-8"))
+    claims = {key: value for key, value in payload.items() if key != "plan_markdown"}
+    claims_path = Path(state["run_directory"]) / "drafts" / f"{slot}.claims.json"
+    atomic_json(claims_path, claims)
+    return {
+        "target_plan.md": Path(record["markdown"]),
+        "target_claims.json": claims_path,
+    }
+
+
 def independence_section(state: dict[str, Any]) -> str:
     """Reassignments, spelled out in the report — or a line saying there were none.
 
@@ -1026,8 +1055,11 @@ def command_cross_review(args: argparse.Namespace) -> None:
     provider = assignment_provider(state, f"cross-{slot}", state["planners"][slot])
     target = f"draft-{target_slot}"
     prompt = (
-        "You are independent reviewer slot {slot}. Read {context}/request.md and the other planner's "
-        "{context}/target_draft.json, then inspect the repository at baseline {sha}. Do not assume agreement "
+        "You are independent reviewer slot {slot}. Read {context}/request.md, the other planner's "
+        "plan at {context}/target_plan.md, and its claims at {context}/target_claims.json (the same "
+        "draft, split so the plan is readable prose rather than one escaped JSON string). Read the "
+        "plan IN FULL, in parts if your reader truncates it, before judging it. Then inspect the "
+        "repository at baseline {sha}. Do not assume agreement "
         "means truth: verify claims against repository evidence. Find factual errors, missing dependencies, "
         "unbounded budgets, non-decidable acceptance conditions, unsafe scope, and incompatibilities. P0/P1 "
         "mean the draft cannot safely guide implementation; P2 is advisory. Do not edit files. Return only "
@@ -1036,7 +1068,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
     ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"], context="{context}")
     context_files = {
         "request.md": Path(state["request_snapshot"]),
-        "target_draft.json": Path(state["drafts"][target_slot]["path"]),
+        **split_draft_for_review(state, target_slot),
     }
     for index, decision in enumerate(sorted((Path(state["run_directory"]) / "decisions").glob("*.json")), 1):
         context_files[f"decision_{index:03d}.json"] = decision

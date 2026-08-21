@@ -313,6 +313,38 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("draft-B", report)
         self.assertIn("codex -> claude", report)
 
+    def test_the_reviewer_gets_the_plan_as_prose_not_as_one_escaped_string(self) -> None:
+        """The defect that read as a provider difference and was a representation choice.
+
+        cross-A received a 28,874-byte draft and passed on its first attempt. cross-B received a
+        93,322-byte one and failed four times, saying in its own transcript that the file was
+        truncated at 13,331 tokens and it never saw the rest. The same plan as markdown is 42,636
+        bytes -- escaping into a single JSON string more than doubled it and made it unpageable.
+        """
+        initialized = self.initialize("claude", "claude")
+        run_id = initialized["run_id"]
+        for slot in ("A", "B"):
+            self.call("draft", "--project", str(self.project), "--run-id", run_id, "--slot", slot)
+        self.call("cross-review", "--project", str(self.project), "--run-id", run_id, "--slot", "A")
+
+        context = next((Path(initialized["run_directory"]) / "invocations" / "cross-A")
+                       .glob("attempt_1_*/context"))
+        names = sorted(p.name for p in context.iterdir())
+        self.assertIn("target_plan.md", names)
+        self.assertIn("target_claims.json", names)
+        self.assertNotIn("target_draft.json", names,
+                         "the blob is what the reviewer could not read")
+
+        plan = (context / "target_plan.md").read_text(encoding="utf-8")
+        self.assertIn("## Scope", plan, "the plan arrives as markdown a reader can page through")
+        self.assertGreater(len(plan.splitlines()), 1)
+
+        claims = json.loads((context / "target_claims.json").read_text(encoding="utf-8"))
+        self.assertNotIn("plan_markdown", claims,
+                         "the plan is not carried twice; the .md is the plan")
+        self.assertIn("repository_facts", claims)
+        self.assertIn("summary", claims, "the metadata the reviewer still needs comes with it")
+
     def test_a_preview_is_not_filed_as_an_attempt(self) -> None:
         """The record must not contain entries for invocations that never ran.
 
