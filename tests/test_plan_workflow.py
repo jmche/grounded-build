@@ -379,6 +379,19 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(len(state["charged_context_digests"]["cross-B"]), 1,
                          "four attempts, one input")
 
+        # Un-parking is free and buys nothing. The material is unchanged, so the very next
+        # invocation charges nothing and parks again -- the user can clear the block, only the
+        # evidence can lift the count.
+        self.call("adjudicate", "--project", str(self.project), "--run-id", run_id,
+                  "--choice", "RESOLVE_AND_CONTINUE", "--decision", "unpark", "--actor", "tester",
+                  "--apply")
+        again = self.call("cross-review", "--project", str(self.project), "--run-id", run_id,
+                          "--slot", "B", expect=2)
+        self.assertIn("budget exhausted", again["error"])
+        state = self.get_state(initialized)
+        self.assertEqual(state["usage"]["cross-B"], 4, "un-parking must not buy an attempt")
+        self.assertEqual(state.get("budget_resets", []), [])
+
     def test_a_preview_is_not_filed_as_an_attempt(self) -> None:
         """The record must not contain entries for invocations that never ran.
 

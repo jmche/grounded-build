@@ -1329,7 +1329,17 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         "FINAL_PLAN_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
         "SYNTHESIS_BUDGET_EXHAUSTED": {"GRANT_ONE_SYNTHESIS", "ABANDON"},
         "FINAL_REVIEW_BUDGET_EXHAUSTED": {"GRANT_ONE_SYNTHESIS", "ABANDON"},
-        "INVOCATION_BUDGET_EXHAUSTED": {"GRANT_ONE_INVOCATION", "REASSIGN_ASSIGNMENT", "ABANDON"},
+        # RESOLVE_AND_CONTINUE un-parks the run and grants nothing. It exists because a spent
+        # budget can stop being the right answer without anyone granting anything: when the
+        # material the attempts measured has been repaired, the assignment should simply be
+        # allowed to ask again. Leaving the run parked made that unreachable -- the reset check
+        # lives inside the invocation, and the status guard refused before it ran.
+        #
+        # Un-parking is free; an attempt still is not. The next invocation re-derives the context
+        # digest, and if the material did NOT change it charges nothing and parks again
+        # immediately. The user can clear the block; only the evidence can lift the count.
+        "INVOCATION_BUDGET_EXHAUSTED": {
+            "GRANT_ONE_INVOCATION", "REASSIGN_ASSIGNMENT", "RESOLVE_AND_CONTINUE", "ABANDON"},
     }.get(decision_type, {"ABANDON"})
     if args.choice not in allowed:
         raise WorkflowError(f"choice {args.choice} is not allowed for {decision_type}: {','.join(sorted(allowed))}")
@@ -1395,6 +1405,9 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         state["provider_diversity"] = len(set(
             list(state["planners"].values()) + list(state["assignment_providers"].values())
         )) > 1 and not state["independence_notes"]
+        state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
+    elif decision_type == "INVOCATION_BUDGET_EXHAUSTED":
+        # Back to where the assignment was, with the count untouched. See the allowed-choices note.
         state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
     elif decision_type == "PLANNING_BOUNDARY" and set(state["cross_reviews"]) != {"A", "B"}:
         state["status"] = "CROSS_REVIEWING"
