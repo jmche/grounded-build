@@ -1403,7 +1403,7 @@ def synthesis_diagnostics(plan_text: str, batches_text: str) -> dict[str, list[s
             warnings.append(f"{match.group(1)} has no explicitly labelled finite exit observation")
         if not re.search(r"(?im)^\s*(?:[-*]\s*)?(?:verification|verify|commands?)\s*:", block):
             warnings.append(f"{match.group(1)} has no explicitly labelled verification command")
-    if not re.search(r"(?i)\bexcluded\b|排除|不包括", plan_text + "\n" + batches_text):
+    if not re.search(r"(?i)\bexcluded\b", plan_text + "\n" + batches_text):
         warnings.append("total excluded scope is not explicit")
     return {"errors": errors, "warnings": warnings}
 
