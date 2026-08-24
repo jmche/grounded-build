@@ -4,6 +4,11 @@ All notable changes use semantic versioning.
 
 ## [0.3.0] - 2026-08-24
 
+- Added the MIT license and a least-privilege GitHub Actions release gate.
+- Corrected the security model to document shell access, opt-in native web research, and the limits
+  of process-level network isolation.
+- Extended release validation to reject missing public-release files, version drift, unfinished
+  security placeholders, and Chinese characters in distributed text sources.
 - Made two independent evidence investigations a hard prerequisite for drafting.
 - Added standard and explicit deep planning modes. Deep mode adds two `draft_03` plans and an extra
   convergence review, while all loops remain bounded.

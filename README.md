@@ -63,3 +63,12 @@ python3 scripts/release_check.py \
 The planning workflow uses fake local agent adapters in tests; no paid model calls are made by the unit suite.
 
 Run `plan_workflow.py next` after every planning action. It returns the single legal next action and argv arrays, which makes orchestration independent of the host model's ability to remember the state machine.
+
+## Security
+
+Read [SECURITY.md](SECURITY.md) for the trust model, enforced filesystem boundaries, network-policy
+limitations, and private vulnerability-reporting guidance.
+
+## License
+
+Grounded Build is released under the [MIT License](LICENSE).
