@@ -2,6 +2,16 @@
 
 All notable changes use semantic versioning.
 
+## [0.4.0] - 2026-08-24
+
+- Made every same-round A/B stage genuinely parallel with an atomic merge barrier and observable running invocation records.
+- Froze engine files, model/runtime selection, context digests, and redacted actual argv per invocation; runs now reject silent engine drift.
+- Split provider infrastructure failures from quality attempts and added typed user decisions for authentication, overload, rate-limit, adapter, timeout, and tool-host failures.
+- Added deterministic validation diagnostics to retries, exact scope-id instructions, draft-time `new_evidence`, dynamic ledger-key enums, and evidence-backed semantic finding aliases.
+- Strengthened synthesis checks for batch-set mismatch, missing/unknown dependencies, cycles, undisposed stable findings, and unbounded repeatable work.
+- Added honest terminal audit exports for abandoned runs, live status fields, aggregate resource/cost reporting, and immediate private scratch cleanup.
+- Defaulted planning agents and isolated implementation reviewers to Opus and `gpt-5.6-sol`, while preserving explicit user overrides and leaving the implementation host unchanged.
+
 ## [0.3.0] - 2026-08-24
 
 - Added the MIT license and a least-privilege GitHub Actions release gate.

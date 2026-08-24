@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import importlib.util
 import os
@@ -1386,6 +1387,26 @@ class SharedVerificationWorktreeTests(unittest.TestCase):
 
 
 class ReviewerRuntimeTest(unittest.TestCase):
+    def test_advanced_reviewer_models_are_defaults_and_user_can_defer(self) -> None:
+        default_args = argparse.Namespace(
+            claude_model=None, codex_model=None, codex_model_provider=None, codex_profile=None)
+        self.assertEqual(
+            WORKFLOW_MODULE.reviewer_runtime(default_args, "claude")["model"], "opus")
+        self.assertEqual(
+            WORKFLOW_MODULE.reviewer_runtime(default_args, "codex")["model"], "gpt-5.6-sol")
+        deferred = argparse.Namespace(
+            claude_model="cli-default", codex_model="cli-default",
+            codex_model_provider=None, codex_profile=None)
+        self.assertIsNone(WORKFLOW_MODULE.reviewer_runtime(deferred, "claude")["model"])
+
+    def test_claude_reviewer_model_reaches_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            command = WORKFLOW_MODULE.reviewer_command(
+                "claude", root, root, root / "schema.json", root / "raw.json", "prompt",
+                runtime={"model": "opus"})
+        self.assertEqual(command[command.index("--model") + 1], "opus")
+
     def test_deepseek_codex_selection_is_passed_without_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)

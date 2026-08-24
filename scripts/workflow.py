@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -45,6 +46,8 @@ MAX_VERIFICATION_TEMP_FILES = 200_000
 MAX_VERIFICATION_PROCESSES = 64
 MAX_VERIFICATION_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
 SUPPORTED_REVIEWERS = ("claude", "codex")
+DEFAULT_CLAUDE_REVIEWER_MODEL = "opus"
+DEFAULT_CODEX_REVIEWER_MODEL = "gpt-5.6-sol"
 TERMINAL_STATUSES = {"FINALIZED", "SUPERSEDED", "ABANDONED"}
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_TEMPLATE = SKILL_ROOT / "references" / "reviewer_prompt.md"
@@ -299,6 +302,7 @@ def run(
     return result
 
 
+@functools.lru_cache(maxsize=None)
 def executable_version(name: str) -> str | None:
     if not shutil.which(name):
         return None
@@ -310,14 +314,25 @@ def executable_version(name: str) -> str | None:
 def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
     """Freeze the selected reviewer model separately from its CLI adapter."""
     if reviewer == "claude":
+        requested = getattr(args, "claude_model", None)
+        model = DEFAULT_CLAUDE_REVIEWER_MODEL if requested is None else requested
+        if model == "cli-default":
+            model = None
         return {"adapter": "claude", "cli_version": executable_version("claude"),
-                "model": None, "model_provider": "anthropic", "profile": None,
-                "model_family": "claude", "identity_source": "cli_default"}
+                "model": model, "model_provider": "anthropic", "profile": None,
+                "model_family": "claude", "identity_source": (
+                    "cli_default" if model is None else
+                    "explicit_override" if requested is not None else "grounded_build_default")}
     profile = getattr(args, "codex_profile", None)
     if profile and not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
         raise WorkflowError("--codex-profile must be a simple profile name")
     explicit_model = getattr(args, "codex_model", None)
     explicit_provider = getattr(args, "codex_model_provider", None)
+    for option, value in (("--codex-model", explicit_model),
+                          ("--codex-model-provider", explicit_provider)):
+        if value and value != "cli-default" and (
+                len(value) > 200 or not re.fullmatch(r"[A-Za-z0-9_./:+-]+", value)):
+            raise WorkflowError(f"{option} must be a simple non-secret selector")
     model = None
     provider = None
     codex_home = Path.home() / ".codex"
@@ -338,7 +353,10 @@ def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
             model = configured_model
         if configured_provider:
             provider = configured_provider
-    model = explicit_model or model
+    if not any((explicit_model, explicit_provider, profile)):
+        model = DEFAULT_CODEX_REVIEWER_MODEL
+    elif explicit_model:
+        model = None if explicit_model == "cli-default" else explicit_model
     provider = explicit_provider or provider
     lowered = " ".join(str(value).lower() for value in (model, provider) if value)
     family = "deepseek" if "deepseek" in lowered else "gpt" if any(
@@ -349,7 +367,7 @@ def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
             "model_family": family,
             "identity_source": "explicit_override" if any((getattr(args, "codex_model", None),
                                                               getattr(args, "codex_model_provider", None),
-                                                              profile)) else "codex_config"}
+                                                              profile)) else "grounded_build_default"}
 
 
 def git(path: Path, *args: str, check: bool = True) -> str:
@@ -1331,7 +1349,9 @@ def reviewer_command(
         ]
     )
     return [
-        "claude", "-p", "--output-format", "json", "--json-schema",
+        "claude", "-p", *(["--model", str((runtime or {}).get("model"))]
+                            if (runtime or {}).get("model") else []),
+        "--output-format", "json", "--json-schema",
         json.dumps(schema, separators=(",", ":")), "--permission-mode", "dontAsk",
         "--allowedTools", allowed, "--disallowedTools", "Edit,Write,NotebookEdit",
         "--add-dir", str(context_dir), "--no-session-persistence", prompt,
@@ -3733,11 +3753,19 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     def add_codex_selection(command: argparse.ArgumentParser) -> None:
-        command.add_argument("--codex-model", help="explicit Codex reviewer model")
+        command.add_argument(
+            "--codex-model",
+            help=f"override reviewer default {DEFAULT_CODEX_REVIEWER_MODEL!r}; use 'cli-default' to defer")
         command.add_argument(
             "--codex-model-provider",
             help="configured Codex model_provider, including an OpenAI-compatible DeepSeek gateway")
         command.add_argument("--codex-profile", help="CODEX_HOME profile name")
+
+    def add_reviewer_selection(command: argparse.ArgumentParser) -> None:
+        add_codex_selection(command)
+        command.add_argument(
+            "--claude-model",
+            help=f"override reviewer default {DEFAULT_CLAUDE_REVIEWER_MODEL!r}; use 'cli-default' to defer")
 
     preflight = commands.add_parser("preflight", help="inspect local target and upstream refs")
     add_project_argument(preflight)
@@ -3760,7 +3788,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--fix-policy", choices=("ask", "auto", "never"), default="ask")
     init.add_argument("--batches", required=True)
     init.add_argument("--target-branch")
-    add_codex_selection(init)
+    add_reviewer_selection(init)
     init.set_defaults(func=command_init)
 
     review = commands.add_parser("review", help="review the current committed batch SHA")
@@ -3824,7 +3852,7 @@ def build_parser() -> argparse.ArgumentParser:
     change_reviewer.add_argument("--reason", required=True)
     change_reviewer.add_argument("--actor", required=True)
     change_reviewer.add_argument("--apply", action="store_true")
-    add_codex_selection(change_reviewer)
+    add_reviewer_selection(change_reviewer)
     change_reviewer.set_defaults(func=command_change_reviewer)
 
     status = commands.add_parser("status", help="show active or historical run state")

@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.3.0
+  version: 0.4.0
   compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude or Codex CLI adapter
 ---
 
@@ -22,13 +22,13 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
 - Work from the absolute Git repository root and freeze its exact SHA.
 - Planning requires a clean checkout. Never stash, reset, clean, or commit user work to satisfy this.
 - Preserve the original branch, index, checkout, and files until explicitly approved final integration.
-- A CLI adapter is not a model identity. Record `agent_runtime`, `provider_diversity`, and `model_diversity` exactly as reported. Codex may run GPT, DeepSeek, or another configured model.
+- A CLI adapter is not a model identity. Record `agent_runtime`, `provider_diversity`, and `model_diversity` exactly as reported. Every run freezes the workflow engine, model selection, and invocation argv; reject silent engine drift.
 - Agreement is not evidence. Bind claims to files, symbols, tests, commands, or authoritative sources.
 - Freeze scope before investigation. Divergence may widen evidence, causal analysis, failure-path coverage,
   alternatives, and verification, but never the user-authorized objective.
 - Order work by scope gate, user priority, severity, urgency, blockers/dependencies, causal leverage,
   evidence strength, then effort. Do not promote or demote a finding without new evidence.
-- Infrastructure failure, malformed output, timeout, or quota exhaustion is not a quality FAIL.
+- Authentication, overload, rate limit, timeout, adapter startup, or tool-host failure is infrastructure, not a quality FAIL and not a consumed quality attempt.
 - Stop at every typed user decision and at implementation approval. Never infer authority from plan approval.
 
 ## Plan workflow
@@ -44,15 +44,16 @@ python3 <skill-root>/scripts/plan_workflow.py preflight \
 
 Use `--probe` when provider authentication/configuration is uncertain; it makes one small paid, sandboxed schema call per selected adapter.
 
-Codex uses the user's default configuration unless explicitly selected:
+Planning defaults to Claude Opus and Codex `gpt-5.6-sol`. Explicit user selection always wins:
 
 ```bash
 --codex-model <model> \
 --codex-model-provider <configured-provider> \
 --codex-profile <profile>
+--claude-model <model>
 ```
 
-These options support both normal GPT-backed Codex and Codex configured for an OpenAI-compatible DeepSeek gateway. Pass the same selection to `init`; the run freezes only non-secret identity fields. Never paste credentials or endpoint tokens into arguments.
+Use `cli-default` as either model value to defer to that CLI. A Codex provider/profile override without a model preserves the configured model. Pass the same selection to `init`; the run freezes only non-secret identity fields. Never paste credentials or endpoint tokens into arguments.
 
 ### 2. Freeze request and initialize
 
@@ -82,6 +83,8 @@ python3 <skill-root>/scripts/plan_workflow.py init \
 ```
 
 Record `run_id`, `agent_runtime`, and the returned `next_action`.
+If a later skill update causes an engine-drift rejection, never bypass it by editing state. Preview and obtain
+approval for `migrate-engine --reason <reason> --actor <actor> --apply`; this preserves the old and new identities.
 
 ### 3. Follow the deterministic next action
 
@@ -90,7 +93,8 @@ python3 <skill-root>/scripts/plan_workflow.py next \
   --project <project> --run-id <run-id>
 ```
 
-- For `RUN_AGENT`, execute `preview_command`, inspect it, then execute `command`.
+- For `RUN_AGENT_BATCH`, inspect every `preview_commands` entry, then launch every listed `commands` entry concurrently and wait at the stated barrier. Never wait for A before starting B in the same round.
+- For `RUN_AGENT`, execute `preview_command`, inspect it, then execute `command` (used for single-reviewer stages).
 - For `HOST_SYNTHESIS`, run its command and read every returned artifact. Write `implementation_plan.md` and `batches.md` in the returned output directory. Resolve disagreement by evidence and preserve unresolved product choices.
 - For `ASK_USER`, present the evidence and allowed typed decision; preview the corresponding adjudication before `--apply`.
 - For `STOP_FOR_IMPLEMENTATION_APPROVAL`, export and stop.
@@ -102,7 +106,9 @@ priority lane, evidence status, problem, evidence ids, root-cause status and cau
 recommended solution, alternatives/tradeoffs, and verification. Keep unresolved claims visible. A bounded
 convergence run guarantees an honest terminal state or typed user decision—not consensus or correctness.
 The workflow computes stable `F-*` fingerprints from scope, problem, and causal chain; later rounds must
-dispose those ledger keys and must submit genuinely new findings in full solution form.
+dispose those ledger keys and must submit genuinely new findings in full solution form. Draft-time repository
+discoveries go into structured `new_evidence`; unrecorded observations cannot be cited. Integrators may propose
+evidence-backed aliases for semantically duplicate `F-*` observations, but uncertain equivalence remains separate.
 
 Before submitting synthesis, run:
 
@@ -129,11 +135,13 @@ python3 <skill-root>/scripts/plan_workflow.py export --project <project> --run-i
 
 Report baseline SHA, adapter/model identities, both diversity fields, limitations, disagreements, review verdicts, digests, and artifact paths. Do not implement until the user explicitly approves. Cleanup is preview-first and permitted only for terminal planning runs.
 
+At either `READY` or `ABANDONED`, use `audit-export` to retrieve the terminal audit report. An abandoned report preserves the last candidate, review evidence, resource totals, and reason, and explicitly states that no plan was approved.
+
 ## Implement workflow
 
 Implementation state lives separately under `~/.grounded-build/implementation/`. For a Plan handoff, initialize with the exported plan and batch manifest. For a user-provided plan without a manifest, derive a finite, observable batch manifest and obtain confirmation before freezing it.
 
-Codex reviewer selection accepts the same `--codex-model`, `--codex-model-provider`, and `--codex-profile` options at `init` and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.
+The implementation host remains the current host model. Its isolated reviewer defaults to Opus for Claude or `gpt-5.6-sol` for Codex; `--claude-model`, `--codex-model`, `--codex-model-provider`, and `--codex-profile` may override that selection at `init` and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.
 
 Follow [references/implementation_workflow.md](references/implementation_workflow.md) exactly. Never treat the current host conversation as its own independent reviewer.
 

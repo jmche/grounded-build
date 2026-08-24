@@ -32,7 +32,7 @@
       "expected_output": "The host uses two isolated Claude instances, honestly records that provider diversity is false, performs mutual cross-review and dual final review, and produces a plan without claiming cross-model validation.",
       "files": [],
       "assertions": [
-        "Planner A and Planner B have separate processes, worktrees, and initial contexts.",
+        "Planner A and Planner B have separate processes, private homes, and initial contexts while sharing one frozen read-only baseline worktree.",
         "provider_diversity is false while process isolation is preserved.",
         "Both final reviewer slots must pass the same candidate.",
         "Same-provider agreement is not represented as independent factual proof."
@@ -105,7 +105,7 @@
       "files": [],
       "assertions": [
         "No completed planner or reviewer slot is invoked twice.",
-        "Paid invocations are previewed through the returned preview_command.",
+        "Paid invocations are previewed through the returned preview command arrays; same-round batches launch concurrently.",
         "NEEDS_USER_DECISION is surfaced rather than bypassed.",
         "READY exports artifacts and does not start implementation."
       ]

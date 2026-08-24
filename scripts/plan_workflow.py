@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import functools
 import hashlib
@@ -16,18 +17,22 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex")
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
 MAX_SYNTHESIS_SUBMISSIONS = 2
+MAX_INFRASTRUCTURE_ATTEMPTS = 3
+DEFAULT_CLAUDE_MODEL = "opus"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 TERMINAL_STATUSES = {"READY", "ABANDONED"}
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 
@@ -60,6 +65,21 @@ CODEX_POLICY_OVERRIDES = (
 EVIDENCE_STATUSES = ["VERIFIED", "STRONGLY_INFERRED", "WEAKLY_INFERRED", "UNRESOLVED", "REFUTED"]
 PRIORITY_LANES = ["STOP_THE_LINE", "MUST_RESOLVE", "INVESTIGATE_IF_BUDGET", "RECORD_ONLY"]
 
+EVIDENCE_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "id": {"type": "string"}, "scope_id": {"type": "string"},
+        "claim": {"type": "string"},
+        "status": {"type": "string", "enum": EVIDENCE_STATUSES},
+        "source_type": {"type": "string", "enum": [
+            "REPOSITORY", "COMMAND", "OFFICIAL_DOCS", "OFFICIAL_GITHUB"]},
+        "locator": {"type": "string"}, "retrieved_at": {"type": "string"},
+        "version_or_commit": {"type": "string"}, "content_sha256": {"type": "string"},
+    },
+    "required": ["id", "scope_id", "claim", "status", "source_type", "locator",
+                 "retrieved_at", "version_or_commit", "content_sha256"],
+}
+
 FINDING_SCHEMA: dict[str, Any] = {
     "type": "object", "additionalProperties": False,
     "properties": {
@@ -91,20 +111,7 @@ INVESTIGATION_SCHEMA: dict[str, Any] = {
         "baseline_sha": {"type": "string"},
         "scope_digest": {"type": "string"},
         "summary": {"type": "string"},
-        "evidence": {"type": "array", "items": {
-            "type": "object", "additionalProperties": False,
-            "properties": {
-                "id": {"type": "string"}, "scope_id": {"type": "string"},
-                "claim": {"type": "string"},
-                "status": {"type": "string", "enum": EVIDENCE_STATUSES},
-                "source_type": {"type": "string", "enum": [
-                    "REPOSITORY", "COMMAND", "OFFICIAL_DOCS", "OFFICIAL_GITHUB"]},
-                "locator": {"type": "string"}, "retrieved_at": {"type": "string"},
-                "version_or_commit": {"type": "string"}, "content_sha256": {"type": "string"},
-            },
-            "required": ["id", "scope_id", "claim", "status", "source_type", "locator",
-                         "retrieved_at", "version_or_commit", "content_sha256"],
-        }},
+        "evidence": {"type": "array", "items": EVIDENCE_ITEM_SCHEMA},
         "findings": {"type": "array", "items": FINDING_SCHEMA},
         "unresolved_questions": {"type": "array", "items": {"type": "string"}},
     },
@@ -123,6 +130,7 @@ DRAFT_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string"},
         "scope_digest": {"type": "string"},
         "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "new_evidence": {"type": "array", "items": EVIDENCE_ITEM_SCHEMA},
         "repository_facts": {
             "type": "array",
             "items": {
@@ -141,7 +149,7 @@ DRAFT_SCHEMA: dict[str, Any] = {
         "unresolved_questions": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
-        "provider", "slot", "baseline_sha", "scope_digest", "evidence_ids", "summary", "repository_facts",
+        "provider", "slot", "baseline_sha", "scope_digest", "evidence_ids", "new_evidence", "summary", "repository_facts",
         "plan_markdown", "unresolved_questions",
     ],
 }
@@ -160,6 +168,16 @@ INTEGRATION_SCHEMA: dict[str, Any] = {
         "accepted_finding_ids": {"type": "array", "items": {"type": "string"}},
         "rejected_finding_ids": {"type": "array", "items": {"type": "string"}},
         "new_findings": {"type": "array", "items": FINDING_SCHEMA},
+        "finding_aliases": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "canonical_finding_id": {"type": "string"},
+                "alias_finding_ids": {"type": "array", "items": {"type": "string"}},
+                "rationale": {"type": "string"},
+                "evidence_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["canonical_finding_id", "alias_finding_ids", "rationale", "evidence_ids"],
+        }},
         "verdict": {"type": "string", "enum": ["PASS", "FAIL", "NEEDS_USER_DECISION"]},
         "findings": {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
@@ -175,7 +193,7 @@ INTEGRATION_SCHEMA: dict[str, Any] = {
     },
     "required": ["provider", "slot", "reviewer_slot", "target", "round", "baseline_sha", "scope_digest", "summary",
                  "plan_markdown", "accepted_finding_ids", "rejected_finding_ids",
-                 "new_findings", "verdict", "findings", "unresolved_questions"],
+                 "new_findings", "finding_aliases", "verdict", "findings", "unresolved_questions"],
 }
 
 
@@ -211,6 +229,17 @@ REVIEW_SCHEMA: dict[str, Any] = {
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class ProviderInfrastructureError(WorkflowError):
+    """A provider/adapter failure that says nothing about assignment quality."""
+
+    def __init__(self, provider: str, kind: str, detail: str, *, retryable: bool) -> None:
+        super().__init__(f"{provider} infrastructure failure [{kind}]: {detail}")
+        self.provider = provider
+        self.kind = kind
+        self.detail = detail
+        self.retryable = retryable
 
 
 class NoFinalAnswer(WorkflowError):
@@ -471,7 +500,9 @@ def validate_or_recover_anchor(state: dict[str, Any]) -> None:
             os.fsync(handle.fileno())
 
 
-def load_state(project: Path, run_id: str) -> dict[str, Any]:
+def load_state(
+    project: Path, run_id: str, *, allow_engine_drift: bool = False,
+) -> dict[str, Any]:
     path = state_path(project, run_id)
     if not path.is_file():
         raise WorkflowError(f"unknown planning run: {run_id}")
@@ -484,6 +515,13 @@ def load_state(project: Path, run_id: str) -> dict[str, Any]:
         raise WorkflowError(f"unsupported planning schema: {state.get('schema_version')}")
     if Path(state.get("project", "")).resolve() != project:
         raise WorkflowError("planning run belongs to a different project")
+    frozen_engine = state.get("engine_contract")
+    if frozen_engine:
+        current = engine_contract()
+        if frozen_engine != current and not allow_engine_drift:
+            raise WorkflowError(
+                "planning engine drift detected; resume with the frozen engine or an explicit "
+                "migration instead of silently changing prompts or semantics")
     validate_artifacts(state)
     return state
 
@@ -496,12 +534,186 @@ def save_state(state: dict[str, Any]) -> None:
     validate_or_recover_anchor(state)
 
 
+def recompute_resource_usage(state: dict[str, Any]) -> None:
+    aggregate = {"wall_seconds": 0.0, "reported_cost_usd": 0.0,
+                 "reported_turns": 0, "scratch_bytes_removed": 0}
+    root = Path(state["run_directory"]) / "invocations"
+    for path in root.glob("*/*/invocation.json") if root.exists() else []:
+        try:
+            metrics = json.loads(path.read_text(encoding="utf-8")).get("metrics", {})
+        except (OSError, json.JSONDecodeError):
+            continue
+        for key in aggregate:
+            value = metrics.get(key)
+            if isinstance(value, (int, float)):
+                aggregate[key] += value
+    state["resource_usage"] = aggregate
+
+
+def active_invocation_records(state: dict[str, Any]) -> dict[str, Any]:
+    active: dict[str, Any] = {}
+    root = Path(state["run_directory"]) / "invocations"
+    for path in root.glob("*/*/invocation.json") if root.exists() else []:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if record.get("status") == "RUNNING":
+            active[record.get("assignment", path.parent.parent.name)] = {
+                "provider": record.get("provider"), "slot": record.get("slot"),
+                "started_at": record.get("started_at"), "invocation": str(path),
+                "context_digest": record.get("context_digest"),
+            }
+    return active
+
+
+def persist_invocation_state(
+    state: dict[str, Any], assignment: str, *, clear_fault: bool = False,
+) -> None:
+    """Merge one assignment's accounting without overwriting its parallel peer."""
+    project = Path(state["project"])
+    with run_lock(project, state["run_id"]):
+        latest = load_state(project, state["run_id"])
+        for field in ("usage", "infrastructure_usage", "extra_invocation_grants"):
+            if assignment in state.get(field, {}):
+                latest.setdefault(field, {})[assignment] = state[field][assignment]
+        incoming_digests = state.get("charged_context_digests", {}).get(assignment, [])
+        if incoming_digests:
+            destination = latest.setdefault("charged_context_digests", {}).setdefault(assignment, [])
+            for digest in incoming_digests:
+                if digest not in destination:
+                    destination.append(digest)
+        latest.setdefault("artifacts", {}).update({
+            key: value for key, value in state.get("artifacts", {}).items()
+            if key.startswith(f"invocation-{assignment}-")
+        })
+        fault = state.get("delivery_faults", {}).get(assignment)
+        if fault:
+            latest.setdefault("delivery_faults", {})[assignment] = fault
+        elif clear_fault:
+            latest.get("delivery_faults", {}).pop(assignment, None)
+        if (state.get("pending_decision") or {}).get("assignment") == assignment:
+            latest["status"] = "NEEDS_USER_DECISION"
+            latest["pending_decision"] = state["pending_decision"]
+        recompute_resource_usage(latest)
+        save_state(latest)
+        state.clear()
+        state.update(latest)
+
+
+def save_parallel_stage(state: dict[str, Any], stage: str) -> None:
+    """Merge a completed A/B artifact and derive the barrier state atomically."""
+    project = Path(state["project"])
+    with run_lock(project, state["run_id"]):
+        latest = load_state(project, state["run_id"])
+        for field in ("investigations", "drafts", "cross_reviews", "convergence_reviews",
+                      "final_reviews", "finding_aliases"):
+            latest.setdefault(field, {}).update(state.get(field, {}))
+        for round_number in ("1", "2", "3"):
+            latest.setdefault("draft_rounds", {}).setdefault(round_number, {}).update(
+                state.get("draft_rounds", {}).get(round_number, {}))
+        latest.setdefault("artifacts", {}).update(state.get("artifacts", {}))
+        # Merge ledger observations rather than allowing the second finisher to erase the first.
+        for key, record in state.get("finding_ledger", {}).items():
+            if key not in latest.setdefault("finding_ledger", {}):
+                latest["finding_ledger"][key] = record
+            else:
+                seen = {(item.get("source"), item.get("source_id"))
+                        for item in latest["finding_ledger"][key]["observations"]}
+                latest["finding_ledger"][key]["observations"].extend(
+                    item for item in record["observations"]
+                    if (item.get("source"), item.get("source_id")) not in seen)
+        if latest.get("status") == "NEEDS_USER_DECISION" or state.get("status") == "NEEDS_USER_DECISION":
+            latest["status"] = "NEEDS_USER_DECISION"
+            latest["pending_decision"] = state.get("pending_decision") or latest.get("pending_decision")
+        elif stage == "investigate":
+            latest["status"] = "EVIDENCE_READY" if set(latest["investigations"]) == {"A", "B"} else "INVESTIGATING"
+        elif stage == "draft":
+            latest["status"] = "DRAFTS_READY" if set(latest["drafts"]) == {"A", "B"} else "DRAFTING"
+            if latest["status"] == "DRAFTS_READY":
+                freeze_round_barrier(latest, "cross-review")
+        elif stage == "cross-review":
+            latest["status"] = (
+                "DIVERGENCE_REQUIRED" if set(latest["cross_reviews"]) == {"A", "B"}
+                and latest["planning_depth"] == "deep" else
+                "SYNTHESIS_REQUIRED" if set(latest["cross_reviews"]) == {"A", "B"} else
+                "CROSS_REVIEWING")
+            if latest["status"] == "DIVERGENCE_REQUIRED":
+                freeze_round_barrier(latest, "diverge")
+        elif stage == "diverge":
+            latest["status"] = (
+                "SYNTHESIS_REQUIRED" if set(latest["draft_rounds"]["3"]) == {"A", "B"}
+                else "DIVERGING")
+        elif stage == "convergence-review":
+            if set(latest["convergence_reviews"]) == {"A", "B"}:
+                latest["convergence_round_one_complete"] = True
+                verdicts = [item["verdict"] for item in latest["convergence_reviews"].values()]
+                if all(verdict == "PASS" for verdict in verdicts):
+                    latest["status"] = "FINAL_REVIEW_REQUIRED"
+                elif latest["synthesis_submissions"] < (
+                        MAX_SYNTHESIS_SUBMISSIONS + latest.get("extra_synthesis_grants", 0)):
+                    latest["status"] = "SYNTHESIS_REQUIRED"
+                else:
+                    latest["status"] = "NEEDS_USER_DECISION"
+                    latest["pending_decision"] = {
+                        "type": "CONVERGENCE_BUDGET_EXHAUSTED", "created_at": utc_now()}
+            else:
+                latest["status"] = "CONVERGENCE_REVIEWING"
+        elif stage == "final-review":
+            required = required_final_reviewers(latest)
+            if set(latest["final_reviews"]) == set(required):
+                verdicts = [item["verdict"] for item in latest["final_reviews"].values()]
+                if all(verdict == "PASS" for verdict in verdicts):
+                    finalize_ready_candidate(latest)
+                elif latest["synthesis_submissions"] < (
+                        MAX_SYNTHESIS_SUBMISSIONS + latest.get("extra_synthesis_grants", 0)):
+                    latest["status"] = "SYNTHESIS_REQUIRED"
+                else:
+                    latest["status"] = "NEEDS_USER_DECISION"
+                    latest["pending_decision"] = {
+                        "type": "FINAL_REVIEW_BUDGET_EXHAUSTED", "created_at": utc_now()}
+            else:
+                latest["status"] = "FINAL_REVIEWING"
+        atomic_json(Path(latest["finding_ledger_path"]), {"findings": latest["finding_ledger"]})
+        record_artifact(latest, "finding-ledger", Path(latest["finding_ledger_path"]))
+        save_state(latest)
+        state.clear()
+        state.update(latest)
+
+
+def freeze_round_barrier(state: dict[str, Any], stage: str) -> None:
+    """Snapshot mutable shared inputs before either same-round slot may add observations."""
+    existing = state.setdefault("round_barriers", {}).get(stage)
+    if existing:
+        return
+    directory = Path(state["run_directory"]) / "input" / "barriers"
+    path = directory / f"{stage}-finding-ledger.json"
+    atomic_json(path, {"findings": state.get("finding_ledger", {})})
+    state["round_barriers"][stage] = {
+        "finding_ledger": str(path), "finding_keys": sorted(state.get("finding_ledger", {})),
+        "created_at": utc_now(),
+    }
+    record_artifact(state, f"barrier-{stage}-finding-ledger", path)
+
+
 @contextmanager
 def run_lock(project: Path, run_id: str):
     directory = run_directory(project, run_id)
     if not directory.is_dir():
         raise WorkflowError(f"unknown planning run: {run_id}")
     lock_path = directory / ".lock"
+    with lock_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def assignment_lock(project: Path, run_id: str, assignment: str):
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", assignment)
+    lock_path = run_directory(project, run_id) / f".assignment-{safe}.lock"
     with lock_path.open("a", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -519,6 +731,19 @@ def validate_artifacts(state: dict[str, Any]) -> None:
 
 def record_artifact(state: dict[str, Any], key: str, path: Path) -> None:
     state.setdefault("artifacts", {})[key] = {"path": str(path), "sha256": sha256_file(path)}
+
+
+def engine_contract() -> dict[str, Any]:
+    """Identity of the local semantics that a run is allowed to use."""
+    files = {
+        "plan_workflow.py": Path(__file__).resolve(),
+        "SKILL.md": SKILL_ROOT / "SKILL.md",
+        "planning_workflow.md": SKILL_ROOT / "references" / "planning_workflow.md",
+    }
+    return {
+        "software_version": VERSION,
+        "files": {name: sha256_file(path) for name, path in files.items()},
+    }
 
 
 def valid_scope_id(value: Any) -> bool:
@@ -615,19 +840,32 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
     model = getattr(args, "codex_model", None) if args else None
     model_provider = getattr(args, "codex_model_provider", None) if args else None
     profile = getattr(args, "codex_profile", None) if args else None
+    claude_model = getattr(args, "claude_model", None) if args else None
     if profile and not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
         raise WorkflowError("--codex-profile must be a simple profile name")
     for option, value in (("--codex-model", model), ("--codex-model-provider", model_provider)):
         if value and (len(value) > 200 or not re.fullmatch(r"[A-Za-z0-9_./:+-]+", value)):
             raise WorkflowError(f"{option} must be a simple non-secret selector")
-    return {
-        "codex": codex_runtime_identity(model, model_provider, profile),
+    explicit_codex = any((model, model_provider, profile))
+    selected_codex_model = None if model == "cli-default" else model
+    if not explicit_codex:
+        selected_codex_model = DEFAULT_CODEX_MODEL
+    selected_claude_model = DEFAULT_CLAUDE_MODEL if claude_model is None else claude_model
+    if selected_claude_model == "cli-default":
+        selected_claude_model = None
+    runtime = {
+        "codex": codex_runtime_identity(selected_codex_model, model_provider, profile),
         "claude": {
             "adapter": "claude", "cli_version": executable_version("claude"),
-            "model": None, "model_provider": "anthropic", "profile": None,
-            "model_family": "claude", "identity_source": "cli_default",
+            "model": selected_claude_model, "model_provider": "anthropic", "profile": None,
+            "model_family": "claude",
+            "identity_source": "cli_default" if selected_claude_model is None else (
+                "explicit_override" if claude_model is not None else "grounded_build_default"),
         },
     }
+    if not explicit_codex:
+        runtime["codex"]["identity_source"] = "grounded_build_default"
+    return runtime
 
 
 def adapter_capabilities(provider: str) -> dict[str, Any]:
@@ -720,6 +958,61 @@ def independence_section(state: dict[str, Any]) -> str:
             f"{note['reason']}\n"
         )
     return "".join(lines)
+
+
+def write_terminal_report(state: dict[str, Any], outcome: str) -> Path:
+    """Write an honest audit handoff for both successful and abandoned runs."""
+    report = Path(state["run_directory"]) / "final_report.md"
+    candidate = state.get("candidate") or {}
+    reviews = {
+        "convergence": state.get("convergence_reviews") or {},
+        "final": state.get("final_reviews") or {},
+    }
+    abandoned = state.get("abandoned") or {}
+    report.write_text(
+        "# Grounded Build planning report\n\n"
+        f"- Outcome: `{outcome}`\n"
+        f"- Run: `{state['run_id']}`\n"
+        f"- Baseline: `{state['baseline_sha']}`\n"
+        f"- Engine contract: `{json.dumps(state.get('engine_contract', {}), sort_keys=True)}`\n"
+        f"- Planners: `{json.dumps(state['planners'], sort_keys=True)}`\n"
+        f"- Provider diversity: `{str(state['provider_diversity']).lower()}`\n"
+        f"- Model diversity: `{str(state.get('model_diversity', False)).lower()}`\n"
+        f"- Agent runtime: `{json.dumps(state.get('agent_runtime', {}), sort_keys=True)}`\n"
+        f"- Runtime warnings: `{json.dumps(state.get('runtime_warnings', []), sort_keys=True)}`\n"
+        f"- Resource usage: `{json.dumps(state.get('resource_usage', {}), sort_keys=True)}`\n"
+        f"- Quality attempts: `{json.dumps(state.get('usage', {}), sort_keys=True)}`\n"
+        f"- Infrastructure attempts: `{json.dumps(state.get('infrastructure_usage', {}), sort_keys=True)}`\n"
+        f"- Candidate: `{json.dumps(candidate, sort_keys=True)}`\n"
+        f"- Reviews: `{json.dumps(reviews, sort_keys=True)}`\n"
+        f"- Abandonment: `{json.dumps(abandoned, sort_keys=True)}`\n"
+        + independence_section(state)
+        + "\n"
+        + ("The reviewed plan is not authorized for implementation until the user explicitly approves.\n"
+           if outcome == "READY" else
+           "No plan was approved. This report preserves the last candidate, reviews, and terminal reason for audit.\n"),
+        encoding="utf-8",
+    )
+    record_artifact(state, "final-report", report)
+    return report
+
+
+def finalize_ready_candidate(state: dict[str, Any]) -> None:
+    final_dir = Path(state["run_directory"]) / "final"
+    final_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    final_plan = final_dir / "implementation_plan.md"
+    final_batches = final_dir / "batches.md"
+    shutil.copyfile(Path(state["candidate"]["plan"]), final_plan)
+    shutil.copyfile(Path(state["candidate"]["batch_manifest"]), final_batches)
+    record_artifact(state, "final-plan", final_plan)
+    record_artifact(state, "final-batches", final_batches)
+    state["final"] = {
+        "plan": str(final_plan), "batch_manifest": str(final_batches),
+        "plan_sha256": sha256_file(final_plan),
+        "batch_manifest_sha256": sha256_file(final_batches),
+    }
+    state["status"] = "READY"
+    state["final"]["report"] = str(write_terminal_report(state, "READY"))
 
 
 def context_digest(context_files: dict[str, Path]) -> str:
@@ -847,7 +1140,9 @@ def agent_command(
     if not allow_web:
         disallowed.extend(["WebFetch", "WebSearch"])
     return [
-        "claude", "-p", "--output-format", "json", "--json-schema",
+        "claude", "-p", *(["--model", str((runtime or {}).get("model"))]
+                            if (runtime or {}).get("model") else []),
+        "--output-format", "json", "--json-schema",
         json.dumps(schema, separators=(",", ":")), "--permission-mode", "dontAsk",
         "--allowedTools", allowed,
         "--disallowedTools", ",".join(disallowed),
@@ -1001,6 +1296,19 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
     if provider == "codex":
         payload = wrapper
     else:
+        if wrapper.get("is_error"):
+            detail = str(wrapper.get("result") or wrapper.get("error") or "provider API error")
+            status = str(wrapper.get("api_error_status") or "").strip()
+            joined = f"{status} {detail}".lower()
+            if "401" in joined or "auth" in joined or "unauthorized" in joined:
+                kind, retryable = "AUTHENTICATION", False
+            elif "429" in joined or "rate" in joined or "quota" in joined:
+                kind, retryable = "RATE_LIMIT", True
+            elif "529" in joined or "overload" in joined:
+                kind, retryable = "PROVIDER_OVERLOAD", True
+            else:
+                kind, retryable = "PROVIDER_API", True
+            raise ProviderInfrastructureError(provider, kind, detail[-800:], retryable=retryable)
         payload = wrapper.get("structured_output")
         if not isinstance(payload, dict) and isinstance(wrapper.get("result"), str):
             try:
@@ -1010,6 +1318,64 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
     if not isinstance(payload, dict):
         raise WorkflowError(f"{provider} did not return a structured object")
     return payload
+
+
+def classify_failed_invocation(
+    provider: str, result: subprocess.CompletedProcess[str], raw: Path,
+) -> ProviderInfrastructureError:
+    detail = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-1200:]
+    lowered = detail.lower()
+    if "401" in lowered or "unauthorized" in lowered or "authentication" in lowered:
+        return ProviderInfrastructureError(provider, "AUTHENTICATION", detail, retryable=False)
+    if "429" in lowered or "rate limit" in lowered or "quota" in lowered:
+        return ProviderInfrastructureError(provider, "RATE_LIMIT", detail, retryable=True)
+    if "529" in lowered or "overload" in lowered:
+        return ProviderInfrastructureError(provider, "PROVIDER_OVERLOAD", detail, retryable=True)
+    if "code-mode-host" in lowered and ("spawn" in lowered or "not found" in lowered):
+        return ProviderInfrastructureError(provider, "TOOL_HOST_STARTUP", detail, retryable=False)
+    return ProviderInfrastructureError(
+        provider, "ADAPTER_EXIT", detail or f"exit code {result.returncode}", retryable=True)
+
+
+def tree_bytes(path: Path) -> int:
+    total = 0
+    if path.exists():
+        for candidate in path.rglob("*"):
+            try:
+                if candidate.is_file() and not candidate.is_symlink():
+                    total += candidate.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def invocation_metrics(
+    provider: str, result: subprocess.CompletedProcess[str], elapsed: float,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {"wall_seconds": round(elapsed, 3)}
+    if provider == "claude":
+        try:
+            wrapper = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            wrapper = {}
+        cost = wrapper.get("total_cost_usd")
+        turns = wrapper.get("num_turns")
+        if isinstance(cost, (int, float)):
+            metrics["reported_cost_usd"] = float(cost)
+        if isinstance(turns, int):
+            metrics["reported_turns"] = turns
+        model_usage = wrapper.get("modelUsage")
+        if isinstance(model_usage, dict):
+            metrics["observed_models"] = sorted(model_usage)
+    return metrics
+
+
+def update_resource_usage(state: dict[str, Any], metrics: dict[str, Any]) -> None:
+    aggregate = state.setdefault("resource_usage", {})
+    for key in ("wall_seconds", "reported_cost_usd", "reported_turns", "scratch_bytes_removed"):
+        value = metrics.get(key)
+        if isinstance(value, (int, float)):
+            aggregate[key] = aggregate.get(key, 0) + value
 
 
 #: Appended to every assignment that must return a schema object. Says how to deliver a verdict,
@@ -1057,6 +1423,7 @@ def delivery_corrective(state: dict[str, Any], assignment: str) -> str:
 def invoke(
     state: dict[str, Any], assignment: str, provider: str, slot: str, context_files: dict[str, Path],
     schema: dict[str, Any], prompt: str, timeout: int, dry_run: bool,
+    validator: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     used = state["usage"].get(assignment, 0)
     granted = state.get("extra_invocation_grants", {}).get(assignment, 0)
@@ -1078,13 +1445,13 @@ def invoke(
         charged.clear()
         used = 0
         granted = 0
-        save_state(state)
+        persist_invocation_state(state, assignment, clear_fault=True)
     if not dry_run and used >= MAX_INVOCATIONS_PER_ASSIGNMENT + granted:
-        resume_status = state["status"]
         # "Out of tries" and "this provider does not deliver a verdict for this assignment" both
         # end here, and only one of them is fixed by granting another try. Say which, so the
         # decision in front of the user is the one they actually face.
         fault = (state.get("delivery_faults") or {}).get(assignment)
+        resume_status = state.get("status", "SYNTHESIS_REQUIRED")
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
             "type": "INVOCATION_BUDGET_EXHAUSTED", "assignment": assignment,
@@ -1100,7 +1467,7 @@ def invoke(
                 f"{provider} used every attempt on {assignment}."
             ),
         }
-        save_state(state)
+        persist_invocation_state(state, assignment)
         raise WorkflowError(
             f"invocation budget exhausted for {assignment}; user decision required"
             + (f" ({fault})" if fault else ""))
@@ -1128,29 +1495,136 @@ def invoke(
     command = agent_command(
         provider, worktree, context, schema, raw, prompt.format(context=context), runtime, allow_web)
     command = isolated_agent_command(command, state, root, worktree, context)
-    (root / "prompt.md").write_text(prompt.format(context=context), encoding="utf-8")
+    rendered_prompt = prompt.format(context=context)
+    (root / "prompt.md").write_text(rendered_prompt, encoding="utf-8")
+    invocation_path = root / "invocation.json"
+    invocation_record: dict[str, Any] = {
+        "assignment": assignment,
+        "provider": provider,
+        "slot": slot,
+        "quality_attempt": used + 1,
+        "context_digest": digest,
+        "context_files": {name: sha256_file(path) for name, path in context_files.items()},
+        "requested_runtime": runtime,
+        "engine_contract": state.get("engine_contract") or engine_contract(),
+        "argv": command[:-1] + ["<PROMPT>"],
+        "started_at": utc_now(),
+        "status": "PREVIEW" if dry_run else "RUNNING",
+    }
+    atomic_json(invocation_path, invocation_record)
     if dry_run:
-        return {"dry_run": True, "command": command[:-1] + ["<PROMPT>"], "context": str(context)}
-    state["usage"][assignment] = used + 1
-    if digest not in charged:
-        charged.append(digest)
-    save_state(state)
-    result = run(command, cwd=worktree, timeout=timeout, env=agent_environment())
+        return {"dry_run": True, "command": invocation_record["argv"],
+                "context": str(context), "invocation": str(invocation_path)}
+    started = time.monotonic()
+    try:
+        result = run(command, cwd=worktree, timeout=timeout, env=agent_environment())
+    except WorkflowError as exc:
+        elapsed = time.monotonic() - started
+        scratch_bytes = tree_bytes(root / "home") + tree_bytes(root / "tmp")
+        for scratch in (root / "home", root / "tmp"):
+            if scratch.exists():
+                shutil.rmtree(scratch)
+        infrastructure = ProviderInfrastructureError(
+            provider, "ADAPTER_EXECUTION", str(exc), retryable=True)
+        count = state.setdefault("infrastructure_usage", {}).get(assignment, 0) + 1
+        state["infrastructure_usage"][assignment] = count
+        resume_status = state.get("status", "SYNTHESIS_REQUIRED")
+        state["status"] = "NEEDS_USER_DECISION"
+        state["pending_decision"] = {
+            "type": "PROVIDER_INFRASTRUCTURE_FAILURE", "assignment": assignment,
+            "provider": provider, "kind": infrastructure.kind, "detail": infrastructure.detail,
+            "retryable": True, "attempt": count,
+            "maximum_infrastructure_attempts": MAX_INFRASTRUCTURE_ATTEMPTS,
+            "resume_status": resume_status, "created_at": utc_now(),
+            "choices": (["RESOLVE_AND_CONTINUE", "REASSIGN_ASSIGNMENT", "ABANDON"]
+                        if count < MAX_INFRASTRUCTURE_ATTEMPTS else
+                        ["REASSIGN_ASSIGNMENT", "ABANDON"]),
+        }
+        invocation_record.update({
+            "finished_at": utc_now(), "status": "INFRASTRUCTURE_FAILURE",
+            "diagnostic": str(infrastructure),
+            "metrics": {"wall_seconds": round(elapsed, 3),
+                        "scratch_bytes_removed": scratch_bytes},
+        })
+        atomic_json(invocation_path, invocation_record)
+        record_artifact(state, f"invocation-{assignment}-{root.name}-record", invocation_path)
+        persist_invocation_state(state, assignment)
+        raise infrastructure from exc
+    elapsed = time.monotonic() - started
     stdout_path = root / "stdout.log"
     stderr_path = root / "stderr.log"
     stdout_path.write_text(result.stdout, encoding="utf-8")
     stderr_path.write_text(result.stderr, encoding="utf-8")
-    artifact_prefix = f"invocation-{assignment}-{used + 1}"
+    artifact_prefix = f"invocation-{assignment}-{root.name}"
     for suffix, path in (("prompt", root / "prompt.md"), ("stdout", stdout_path), ("stderr", stderr_path)):
         record_artifact(state, f"{artifact_prefix}-{suffix}", path)
-    save_state(state)
+    metrics = invocation_metrics(provider, result, elapsed)
+    scratch_bytes = tree_bytes(root / "home") + tree_bytes(root / "tmp")
+    for scratch in (root / "home", root / "tmp"):
+        if scratch.exists():
+            shutil.rmtree(scratch)
+    metrics["scratch_bytes_removed"] = scratch_bytes
+    invocation_record.update({
+        "finished_at": utc_now(), "exit_code": result.returncode, "metrics": metrics,
+    })
+    infrastructure_error: ProviderInfrastructureError | None = None
     if result.returncode != 0:
-        raise WorkflowError(f"{provider} invocation failed ({result.returncode}): {result.stderr[-1000:]}")
+        infrastructure_error = classify_failed_invocation(provider, result, raw)
     try:
+        if infrastructure_error:
+            raise infrastructure_error
         payload = extract_payload(provider, result, raw)
+        state["usage"][assignment] = used + 1
+        if digest not in charged:
+            charged.append(digest)
+        if validator is not None:
+            validator(payload)
     except NoFinalAnswer as exc:
+        state["usage"][assignment] = used + 1
+        if digest not in charged:
+            charged.append(digest)
         state.setdefault("delivery_faults", {})[assignment] = str(exc)
-        save_state(state)
+        invocation_record["status"] = "NO_FINAL_ANSWER"
+        invocation_record["diagnostic"] = str(exc)
+        update_resource_usage(state, metrics)
+        atomic_json(invocation_path, invocation_record)
+        record_artifact(state, f"{artifact_prefix}-record", invocation_path)
+        persist_invocation_state(state, assignment)
+        raise
+    except ProviderInfrastructureError as exc:
+        count = state.setdefault("infrastructure_usage", {}).get(assignment, 0) + 1
+        state["infrastructure_usage"][assignment] = count
+        resume_status = state["status"]
+        state["status"] = "NEEDS_USER_DECISION"
+        state["pending_decision"] = {
+            "type": "PROVIDER_INFRASTRUCTURE_FAILURE", "assignment": assignment,
+            "provider": provider, "kind": exc.kind, "detail": exc.detail,
+            "retryable": exc.retryable, "attempt": count,
+            "maximum_infrastructure_attempts": MAX_INFRASTRUCTURE_ATTEMPTS,
+            "resume_status": resume_status, "created_at": utc_now(),
+            "choices": (["RESOLVE_AND_CONTINUE", "REASSIGN_ASSIGNMENT", "ABANDON"]
+                        if count < MAX_INFRASTRUCTURE_ATTEMPTS else
+                        ["REASSIGN_ASSIGNMENT", "ABANDON"]),
+        }
+        invocation_record["status"] = "INFRASTRUCTURE_FAILURE"
+        invocation_record["diagnostic"] = str(exc)
+        update_resource_usage(state, metrics)
+        atomic_json(invocation_path, invocation_record)
+        record_artifact(state, f"{artifact_prefix}-record", invocation_path)
+        persist_invocation_state(state, assignment)
+        raise
+    except WorkflowError as exc:
+        state["usage"][assignment] = used + 1
+        if digest not in charged:
+            charged.append(digest)
+        diagnostic = f"deterministic contract rejection: {exc}"
+        state.setdefault("delivery_faults", {})[assignment] = diagnostic
+        invocation_record["status"] = "VALIDATION_REJECTED"
+        invocation_record["diagnostic"] = diagnostic
+        update_resource_usage(state, metrics)
+        atomic_json(invocation_path, invocation_record)
+        record_artifact(state, f"{artifact_prefix}-record", invocation_path)
+        persist_invocation_state(state, assignment)
         raise
     state.get("delivery_faults", {}).pop(assignment, None)
     validate_planning_worktree(state, worktree)
@@ -1159,7 +1633,11 @@ def invoke(
     if raw.is_file():
         record_artifact(state, f"{artifact_prefix}-raw", raw)
     record_artifact(state, f"{artifact_prefix}-result", result_path)
-    save_state(state)
+    invocation_record["status"] = "DELIVERED"
+    atomic_json(invocation_path, invocation_record)
+    record_artifact(state, f"{artifact_prefix}-record", invocation_path)
+    update_resource_usage(state, metrics)
+    persist_invocation_state(state, assignment, clear_fault=True)
     return payload
 
 
@@ -1177,7 +1655,15 @@ def validate_draft(payload: dict[str, Any], state: dict[str, Any], slot: str) ->
     if not isinstance(payload["plan_markdown"], str) or not payload["plan_markdown"].strip():
         raise WorkflowError("draft plan is empty")
     investigation = json.loads(Path(state["investigations"][slot]["path"]).read_text(encoding="utf-8"))
-    known_evidence = {item["id"] for item in investigation["evidence"]}
+    new_evidence = payload.get("new_evidence")
+    if not isinstance(new_evidence, list):
+        raise WorkflowError("draft new_evidence must be an array")
+    new_ids = [item.get("id") for item in new_evidence if isinstance(item, dict)]
+    if len(new_ids) != len(set(new_ids)):
+        raise WorkflowError("draft new evidence ids must be unique")
+    if any(not valid_scope_id(item.get("scope_id")) for item in new_evidence):
+        raise WorkflowError("draft new evidence has an invalid scope id")
+    known_evidence = {item["id"] for item in investigation["evidence"]} | set(new_ids)
     if not set(payload["evidence_ids"]).issubset(known_evidence):
         raise WorkflowError("draft cites evidence outside its independent investigation")
     facts = payload["repository_facts"]
@@ -1219,7 +1705,10 @@ def validate_investigation(payload: dict[str, Any], state: dict[str, Any], slot:
             raise WorkflowError("STOP_THE_LINE requires verified or strongly inferred evidence")
 
 
-def validate_integration(payload: dict[str, Any], state: dict[str, Any], slot: str, round_number: int) -> None:
+def validate_integration(
+    payload: dict[str, Any], state: dict[str, Any], slot: str, round_number: int,
+    finding_keys: list[str] | None = None,
+) -> None:
     if set(payload) != set(INTEGRATION_SCHEMA["required"]):
         raise WorkflowError("integrated draft fields do not match the contract")
     assignment = f"cross-{slot}" if round_number == 2 else f"diverge-{slot}"
@@ -1236,12 +1725,51 @@ def validate_integration(payload: dict[str, Any], state: dict[str, Any], slot: s
     dispositions = payload["accepted_finding_ids"] + payload["rejected_finding_ids"]
     if len(dispositions) != len(set(dispositions)):
         raise WorkflowError("a finding cannot be both accepted and rejected")
-    unknown = set(dispositions) - set(state.get("finding_ledger", {}))
+    allowed_keys = set(state.get("finding_ledger", {})) if finding_keys is None else set(finding_keys)
+    unknown = set(dispositions) - allowed_keys
     if unknown:
         raise WorkflowError(f"integrated draft dispositions cite unknown finding keys: {sorted(unknown)}")
     for finding in payload["new_findings"]:
         if not valid_scope_id(finding.get("scope_id")):
             raise WorkflowError(f"new finding {finding.get('id')} has an invalid scope id")
+    ledger_keys = allowed_keys
+    aliases_seen: set[str] = set()
+    for alias in payload["finding_aliases"]:
+        canonical = alias["canonical_finding_id"]
+        members = alias["alias_finding_ids"]
+        if canonical not in ledger_keys or not members:
+            raise WorkflowError("finding alias must name a known canonical key and at least one alias")
+        unknown_aliases = set(members) - ledger_keys
+        if unknown_aliases:
+            raise WorkflowError(f"finding aliases cite unknown keys: {sorted(unknown_aliases)}")
+        if canonical in members or aliases_seen.intersection(members):
+            raise WorkflowError("finding aliases must be acyclic and non-overlapping")
+        aliases_seen.update(members)
+
+
+def record_finding_aliases(state: dict[str, Any], aliases: list[dict[str, Any]], source: str) -> None:
+    registry = state.setdefault("finding_aliases", {})
+    for proposal in aliases:
+        canonical = proposal["canonical_finding_id"]
+        for alias in proposal["alias_finding_ids"]:
+            registry[alias] = {
+                "canonical": canonical, "source": source, "rationale": proposal["rationale"],
+                "evidence_ids": proposal["evidence_ids"], "at": utc_now(),
+            }
+
+
+def integration_schema(
+    state: dict[str, Any], finding_keys: list[str] | None = None,
+) -> dict[str, Any]:
+    """Constrain dispositions and alias proposals to the current stable ledger keys."""
+    schema = copy.deepcopy(INTEGRATION_SCHEMA)
+    keys = sorted(state.get("finding_ledger", {})) if finding_keys is None else sorted(finding_keys)
+    for field in ("accepted_finding_ids", "rejected_finding_ids"):
+        schema["properties"][field]["items"] = {"type": "string", "enum": keys}
+    alias_items = schema["properties"]["finding_aliases"]["items"]["properties"]
+    alias_items["canonical_finding_id"] = {"type": "string", "enum": keys}
+    alias_items["alias_finding_ids"]["items"] = {"type": "string", "enum": keys}
+    return schema
 
 
 def validate_review(
@@ -1326,6 +1854,13 @@ def model_diversity(topology: dict[str, str], runtime: dict[str, dict[str, Any]]
     return len(identities) > 1
 
 
+def runtime_warnings(runtime: dict[str, dict[str, Any]]) -> list[str]:
+    return [
+        f"{adapter} model family is unknown; diversity uses the exact provider/model identity"
+        for adapter, identity in runtime.items() if identity.get("model_family") == "unknown"
+    ]
+
+
 def next_action(state: dict[str, Any]) -> dict[str, Any]:
     """Return one deterministic host action for the current planning state."""
     def incomplete_slot(stage: str, candidates: Any, completed: dict[str, Any]) -> str:
@@ -1338,37 +1873,37 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
     base = [sys.executable, str(Path(__file__).resolve())]
     common = ["--project", state["project"], "--run-id", state["run_id"]]
     status = state["status"]
+
+    def parallel_actions(stage: str, flag: str, completed: dict[str, Any]) -> dict[str, Any]:
+        slots = [slot for slot in ("A", "B") if slot not in completed]
+        if not slots:
+            raise WorkflowError(
+                f"workflow state is inconsistent: {status} has no incomplete {stage} slot")
+        commands = [[*base, stage, *common, flag, slot] for slot in slots]
+        return {
+            "kind": "RUN_AGENT_BATCH", "stage": stage, "parallel": True, "slots": slots,
+            "commands": commands, "preview_commands": [[*command, "--dry-run"] for command in commands],
+            "barrier": "wait for every listed slot before advancing to the next stage",
+        }
+
     if status in {"INITIALIZED", "INVESTIGATING"}:
-        slot = incomplete_slot("investigation", ("A", "B"), state["investigations"])
-        command = [*base, "investigate", *common, "--slot", slot]
-        return {"kind": "RUN_AGENT", "stage": "investigate", "slot": slot, "command": command,
-                "preview_command": [*command, "--dry-run"]}
+        return parallel_actions("investigate", "--slot", state["investigations"])
     if status in {"EVIDENCE_READY", "DRAFTING"}:
-        slot = incomplete_slot("draft", ("A", "B"), state["drafts"])
-        command = [*base, "draft", *common, "--slot", slot]
-        return {"kind": "RUN_AGENT", "stage": "draft", "slot": slot, "command": command,
-                "preview_command": [*command, "--dry-run"]}
+        return parallel_actions("draft", "--slot", state["drafts"])
     if status in {"DRAFTS_READY", "CROSS_REVIEWING"}:
-        slot = incomplete_slot("cross-review", ("A", "B"), state["cross_reviews"])
-        command = [*base, "cross-review", *common, "--slot", slot]
-        return {"kind": "RUN_AGENT", "stage": "cross-review", "slot": slot, "command": command,
-                "preview_command": [*command, "--dry-run"]}
+        return parallel_actions("cross-review", "--slot", state["cross_reviews"])
     if status in {"DIVERGENCE_REQUIRED", "DIVERGING"}:
-        slot = incomplete_slot("divergent draft", ("A", "B"), state["draft_rounds"]["3"])
-        command = [*base, "diverge", *common, "--slot", slot]
-        return {"kind": "RUN_AGENT", "stage": "diverge", "slot": slot, "command": command,
-                "preview_command": [*command, "--dry-run"]}
+        return parallel_actions("diverge", "--slot", state["draft_rounds"]["3"])
     if status == "SYNTHESIS_REQUIRED":
         return {"kind": "HOST_SYNTHESIS", "stage": "synthesis",
                 "command": [*base, "synthesis-context", *common],
                 "requires": ["implementation_plan.md", "batches.md"]}
     if status in {"CONVERGENCE_REVIEW_REQUIRED", "CONVERGENCE_REVIEWING"}:
-        slot = incomplete_slot("convergence-review", ("A", "B"), state["convergence_reviews"])
-        command = [*base, "convergence-review", *common, "--reviewer", slot]
-        return {"kind": "RUN_AGENT", "stage": "convergence-review", "slot": slot,
-                "command": command, "preview_command": [*command, "--dry-run"]}
+        return parallel_actions("convergence-review", "--reviewer", state["convergence_reviews"])
     if status in {"FINAL_REVIEW_REQUIRED", "FINAL_REVIEWING"}:
         required = required_final_reviewers(state)
+        if set(required) == {"A", "B"}:
+            return parallel_actions("final-review", "--reviewer", state["final_reviews"])
         slot = incomplete_slot("final-review", required, state["final_reviews"])
         command = [*base, "final-review", *common, "--reviewer", slot]
         return {"kind": "RUN_AGENT", "stage": "final-review", "slot": slot,
@@ -1384,7 +1919,10 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
     return {"kind": "INSPECT_STATUS", "stage": status.lower()}
 
 
-def synthesis_diagnostics(plan_text: str, batches_text: str) -> dict[str, list[str]]:
+def synthesis_diagnostics(
+    plan_text: str, batches_text: str,
+    ledger: dict[str, Any] | set[str] | None = None,
+) -> dict[str, list[str]]:
     """Check the host-authored handoff before paid final review."""
     errors: list[str] = []
     warnings: list[str] = []
@@ -1396,6 +1934,13 @@ def synthesis_diagnostics(plan_text: str, batches_text: str) -> dict[str, list[s
         errors.append("batch manifest must declare at least one Bxx batch identifier")
     if len(ids) != len(set(ids)):
         errors.append("batch manifest repeats a batch identifier")
+    declared = set(ids)
+    plan_ids = set(re.findall(r"\bB\d{2,}\b", plan_text))
+    if plan_ids - declared:
+        errors.append(f"plan cites batches absent from manifest: {sorted(plan_ids - declared)}")
+    if declared - plan_ids:
+        warnings.append(f"manifest batches not referenced by plan: {sorted(declared - plan_ids)}")
+    dependencies: dict[str, set[str]] = {identifier: set() for identifier in declared}
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(batches_text)
         block = batches_text[match.start():end]
@@ -1403,6 +1948,46 @@ def synthesis_diagnostics(plan_text: str, batches_text: str) -> dict[str, list[s
             warnings.append(f"{match.group(1)} has no explicitly labelled finite exit observation")
         if not re.search(r"(?im)^\s*(?:[-*]\s*)?(?:verification|verify|commands?)\s*:", block):
             warnings.append(f"{match.group(1)} has no explicitly labelled verification command")
+        dependency_match = re.search(
+            r"(?im)^\s*(?:[-*]\s*)?(?:depends on|dependencies?)\s*:\s*([^\n]+)", block)
+        if dependency_match:
+            dependencies[match.group(1)] = set(re.findall(r"\bB\d{2,}\b", dependency_match.group(1)))
+        unknown = dependencies[match.group(1)] - declared
+        if unknown:
+            errors.append(f"{match.group(1)} depends on unknown batches: {sorted(unknown)}")
+        if re.search(r"(?i)\b(retry|poll|wait|park|provider)\b", block) and not re.search(
+                r"(?i)\b(?:max(?:imum)?|limit|at most|up to|timeout)\b[^\n]{0,60}\d+", block):
+            warnings.append(f"{match.group(1)} mentions repeatable work without an explicit numeric bound")
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> bool:
+        if node in visiting:
+            return True
+        if node in visited:
+            return False
+        visiting.add(node)
+        cyclic = any(visit(item) for item in dependencies.get(node, set()) if item in declared)
+        visiting.remove(node)
+        visited.add(node)
+        return cyclic
+
+    if any(visit(identifier) for identifier in declared):
+        errors.append("batch dependency graph contains a cycle")
+    if ledger is not None:
+        ledger_keys = set(ledger)
+        mentioned = set(re.findall(r"\bF-[0-9a-f]{16}\b", plan_text + "\n" + batches_text))
+        missing = ledger_keys - mentioned
+        blocking = {
+            key for key in missing
+            if isinstance(ledger, dict)
+            and (ledger.get(key, {}).get("canonical") or {}).get("severity") in {"P0", "P1"}
+        }
+        if blocking:
+            errors.append(f"candidate omits blocking stable finding keys: {sorted(blocking)}")
+        advisory = missing - blocking
+        if advisory:
+            warnings.append(f"candidate does not explicitly disposition stable finding keys: {sorted(advisory)}")
     if not re.search(r"(?i)\bexcluded\b", plan_text + "\n" + batches_text):
         warnings.append("total excluded scope is not explicit")
     return {"errors": errors, "warnings": warnings}
@@ -1421,6 +2006,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         "provider_diversity": len(set(topology.values())) > 1,
         "model_diversity": model_diversity(topology, runtime),
         "agent_runtime": {name: runtime[name] for name in sorted(set(topology.values()))},
+        "runtime_warnings": runtime_warnings({name: runtime[name] for name in set(topology.values())}),
         "capabilities": {
             "bubblewrap": shutil.which("bwrap") is not None,
             "git": executable_version("git"),
@@ -1475,6 +2061,7 @@ def command_init(args: argparse.Namespace) -> None:
         "objective_source": "request.md",
         "objective_sha256": sha256_file(request_snapshot),
         "in_scope_rule": "Only work required to satisfy the frozen request and recorded user decisions.",
+        "scope_id_format": "^(TARGET|REQUIRED_SUPPORT|EVIDENCE_ONLY|PROPOSED_EXTENSION|OUT_OF_SCOPE)-[0-9]{3,}$",
         "support_classes": ["TARGET", "REQUIRED_SUPPORT", "EVIDENCE_ONLY"],
         "extension_classes": ["PROPOSED_EXTENSION", "OUT_OF_SCOPE"],
         "extension_rule": "PROPOSED_EXTENSION requires a typed user decision before entering the plan.",
@@ -1493,6 +2080,7 @@ def command_init(args: argparse.Namespace) -> None:
     state: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "software_version": VERSION,
+        "engine_contract": engine_contract(),
         "run_id": run_id,
         "run_directory": str(root),
         "project": str(project),
@@ -1502,18 +2090,21 @@ def command_init(args: argparse.Namespace) -> None:
         "scope_digest": scope_digest,
         "finding_ledger_path": str(finding_ledger_path),
         "finding_ledger": {},
+        "finding_aliases": {},
         "planning_depth": args.planning_depth,
         "research_policy": args.research_policy,
         "planners": topology,
         "provider_diversity": len(set(topology.values())) > 1,
         "model_diversity": model_diversity(topology, runtime),
         "agent_runtime": runtime,
+        "runtime_warnings": runtime_warnings(runtime),
         "final_reviewer": args.final_reviewer,
         "worktree": str(worktree),
         "status": "INITIALIZED",
         "investigations": {},
         "drafts": {},
         "draft_rounds": {"1": {}, "2": {}, "3": {}},
+        "round_barriers": {},
         "cross_reviews": {},
         "convergence_reviews": {},
         "convergence_round_one_complete": False,
@@ -1524,6 +2115,10 @@ def command_init(args: argparse.Namespace) -> None:
         "final_reviews": {},
         "pending_decision": None,
         "usage": {},
+        "infrastructure_usage": {},
+        "resource_usage": {"wall_seconds": 0.0, "reported_cost_usd": 0.0,
+                           "reported_turns": 0, "scratch_bytes_removed": 0},
+        "active_invocations": {},
         "artifacts": {},
         "created_at": utc_now(),
         "updated_at": utc_now(),
@@ -1538,6 +2133,7 @@ def command_init(args: argparse.Namespace) -> None:
         "planners": topology, "final_reviewer": args.final_reviewer,
         "provider_diversity": state["provider_diversity"],
         "model_diversity": state["model_diversity"], "agent_runtime": runtime,
+        "runtime_warnings": state["runtime_warnings"],
         "planning_depth": state["planning_depth"], "research_policy": state["research_policy"],
         "next_action": next_action(state),
     })
@@ -1562,7 +2158,9 @@ def command_investigate(args: argparse.Namespace) -> None:
     prompt = (
         "You are independent evidence investigator {slot}. Read {context}/request.md and "
         "{context}/scope_contract.json, then inspect the complete relevant repository surface at baseline {sha}. "
-        "Do not draft or edit the solution yet. Establish what is true. Every claim and finding must map to a scope id; "
+        "Do not draft or edit the solution yet. Establish what is true. Every claim and finding must map to a scope id "
+        "matching exactly TARGET-001, REQUIRED_SUPPORT-NNN, EVIDENCE_ONLY-NNN, PROPOSED_EXTENSION-NNN, or OUT_OF_SCOPE-NNN "
+        "(NNN is at least three digits; a bare class name is invalid). "
         "anything outside the frozen objective is OUT_OF_SCOPE or a PROPOSED_EXTENSION and must not enter the plan. "
         "Trace symptoms to root cause where evidence permits; label hypotheses honestly. Rank first by scope gate, then "
         "user priority, severity, urgency, dependency/blocking effect, causal leverage, evidence strength, and effort. "
@@ -1576,6 +2174,7 @@ def command_investigate(args: argparse.Namespace) -> None:
         {"request.md": Path(state["request_snapshot"]),
          "scope_contract.json": Path(state["scope_contract"])},
         INVESTIGATION_SCHEMA, prompt, args.timeout, args.dry_run,
+        validator=lambda value: validate_investigation(value, state, slot),
     )
     if args.dry_run:
         emit({"status": "INVESTIGATION_DRY_RUN", **payload})
@@ -1586,7 +2185,7 @@ def command_investigate(args: argparse.Namespace) -> None:
     record_findings(state, payload["findings"], f"investigation-{slot}")
     state["investigations"][slot] = {"provider": provider, "path": str(path)}
     state["status"] = "EVIDENCE_READY" if set(state["investigations"]) == {"A", "B"} else "INVESTIGATING"
-    save_state(state)
+    save_parallel_stage(state, "investigate")
     emit({"status": state["status"], "run_id": state["run_id"], "slot": slot,
           "investigation": str(path)})
 
@@ -1602,8 +2201,10 @@ def command_draft(args: argparse.Namespace) -> None:
     provider = assignment_provider(state, f"draft-{slot}", state["planners"][slot])
     prompt = (
         "You are independent planning instance {slot}. Read {context}/request.md, {context}/scope_contract.json, "
-        "and only your own independently produced {context}/investigation.json. Inspect the repository as needed; "
-        "you cannot see the other planner's work. Use evidence ids and preserve uncertainty. Produce a detailed "
+        "and only your own independently produced {context}/investigation.json. You cannot see the other planner's work. "
+        "Re-check repository facts before planning. If that check discovers evidence absent from investigation.json, "
+        "record it in new_evidence with a valid suffixed scope id and cite it from evidence_ids; never cite an unrecorded "
+        "observation. Use evidence ids and preserve uncertainty. Produce a detailed "
         "implementation plan ordered by the frozen priority rules, with root-cause-driven solutions, finite batch boundaries, "
         "dependencies, budget-sensitive retry limits, and decidable acceptance observations. Do not edit "
         "the repository. Return only JSON matching the supplied schema. Set provider={provider}, slot={slot}, "
@@ -1617,6 +2218,7 @@ def command_draft(args: argparse.Namespace) -> None:
          "scope_contract.json": Path(state["scope_contract"]),
          "investigation.json": Path(state["investigations"][slot]["path"])},
         DRAFT_SCHEMA, prompt, args.timeout, args.dry_run,
+        validator=lambda value: validate_draft(value, state, slot),
     )
     if args.dry_run:
         emit({"status": "DRAFT_DRY_RUN", **payload})
@@ -1630,7 +2232,7 @@ def command_draft(args: argparse.Namespace) -> None:
     state["drafts"][slot] = {"provider": provider, "path": str(path), "markdown": str(markdown)}
     state["draft_rounds"]["1"][slot] = state["drafts"][slot]
     state["status"] = "DRAFTS_READY" if set(state["drafts"]) == {"A", "B"} else "DRAFTING"
-    save_state(state)
+    save_parallel_stage(state, "draft")
     emit({"status": state["status"], "run_id": state["run_id"], "slot": slot, "draft": str(markdown)})
 
 
@@ -1643,6 +2245,9 @@ def command_cross_review(args: argparse.Namespace) -> None:
     if slot in state["cross_reviews"] and not args.dry_run:
         raise WorkflowError(f"slot {slot} already completed cross-review")
     target_slot = "B" if slot == "A" else "A"
+    barrier = state.get("round_barriers", {}).get("cross-review") or {}
+    barrier_ledger = Path(barrier.get("finding_ledger", state["finding_ledger_path"]))
+    barrier_keys = barrier.get("finding_keys")
     provider = assignment_provider(state, f"cross-{slot}", state["planners"][slot])
     target = f"draft-{target_slot}"
     prompt = (
@@ -1656,7 +2261,9 @@ def command_cross_review(args: argparse.Namespace) -> None:
         "unbounded budgets, non-decidable acceptance conditions, unsafe scope, and incompatibilities. P0/P1 "
         "mean the draft cannot safely guide implementation; P2/P3 are advisory. Integrate every supported useful "
         "part into a complete plan, explicitly disposition known stable F-* ledger keys, and return any genuinely new "
-        "finding in full solution form so the workflow can fingerprint it. Reject scope extensions. This round "
+        "finding in full solution form so the workflow can fingerprint it. When two stable F-* keys describe the same "
+        "underlying defect, propose an evidence-backed finding_aliases entry; do not merge them merely because wording "
+        "looks similar. Reject scope extensions. This round "
         "is divergent: add missing in-scope causal, failure-path, alternative, and verification coverage, never a new "
         "objective. Do not edit files. Return only schema JSON with provider={provider}, slot={slot}, "
         "reviewer_slot={slot}, target={target}, round=2, baseline_sha={sha}, scope_digest={scope_digest}."
@@ -1666,7 +2273,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
-        "finding_ledger.json": Path(state["finding_ledger_path"]),
+        "finding_ledger.json": barrier_ledger,
         "own_investigation.json": Path(state["investigations"][slot]["path"]),
         "peer_investigation.json": Path(state["investigations"][target_slot]["path"]),
         "own_plan.md": Path(state["drafts"][slot]["markdown"]),
@@ -1677,11 +2284,12 @@ def command_cross_review(args: argparse.Namespace) -> None:
     payload = invoke(
         state, f"cross-{slot}", provider, slot,
         context_files,
-        INTEGRATION_SCHEMA, prompt, args.timeout, args.dry_run,
+        integration_schema(state, barrier_keys), prompt, args.timeout, args.dry_run,
+        validator=lambda value: validate_integration(value, state, slot, 2, barrier_keys),
     )
     if args.dry_run:
         emit({"status": "CROSS_REVIEW_DRY_RUN", **payload})
-    validate_integration(payload, state, slot, 2)
+    validate_integration(payload, state, slot, 2, barrier_keys)
     path = Path(state["run_directory"]) / "cross_reviews" / f"{slot}_reviews_{target_slot}.json"
     atomic_json(path, payload)
     markdown = Path(state["run_directory"]) / "drafts" / f"round_2_{slot}.md"
@@ -1689,6 +2297,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
     record_artifact(state, f"cross-{slot}", path)
     record_artifact(state, f"draft-2-{slot}-md", markdown)
     record_findings(state, payload["new_findings"], f"draft-02-{slot}")
+    record_finding_aliases(state, payload["finding_aliases"], f"draft-02-{slot}")
     state["cross_reviews"][slot] = {"target": target_slot, "verdict": payload["verdict"], "path": str(path)}
     state["draft_rounds"]["2"][slot] = {"provider": provider, "path": str(path), "markdown": str(markdown)}
     if payload["verdict"] == "NEEDS_USER_DECISION":
@@ -1700,7 +2309,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
         state["status"] = "DIVERGENCE_REQUIRED" if state["planning_depth"] == "deep" else "SYNTHESIS_REQUIRED"
     else:
         state["status"] = "CROSS_REVIEWING"
-    save_state(state)
+    save_parallel_stage(state, "cross-review")
     emit({"status": state["status"], "run_id": state["run_id"], "review": str(path), "verdict": payload["verdict"]})
 
 
@@ -1713,6 +2322,9 @@ def command_diverge(args: argparse.Namespace) -> None:
     if slot in state["draft_rounds"]["3"] and not args.dry_run:
         raise WorkflowError(f"slot {slot} already produced draft_03")
     provider = assignment_provider(state, f"diverge-{slot}", state["planners"][slot])
+    barrier = state.get("round_barriers", {}).get("diverge") or {}
+    barrier_ledger = Path(barrier.get("finding_ledger", state["finding_ledger_path"]))
+    barrier_keys = barrier.get("finding_keys")
     target = "draft-02-both"
     prompt = (
         "You are independent deep-planning slot {slot}, producing divergent draft_03. Read the frozen request, "
@@ -1720,7 +2332,8 @@ def command_diverge(args: argparse.Namespace) -> None:
         "a claim. Mine only in-scope omissions: deeper causal chains, failure paths, required support, alternatives, "
         "and verification. Novelty without a scope id or evidentiary effect must be rejected. Do not broaden the user "
         "objective. Preserve priority order and explicitly disposition stable F-* ledger keys; return a genuinely new "
-        "finding in full solution form. Return schema JSON with "
+        "finding in full solution form. Propose evidence-backed finding_aliases when multiple stable keys are observations "
+        "of one defect; preserve separate keys when equivalence is not established. Return schema JSON with "
         "provider={provider}, slot={slot}, reviewer_slot={slot}, target={target}, round=3, baseline_sha={sha}, "
         "scope_digest={scope_digest}." + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
@@ -1728,17 +2341,18 @@ def command_diverge(args: argparse.Namespace) -> None:
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
-        "finding_ledger.json": Path(state["finding_ledger_path"]),
+        "finding_ledger.json": barrier_ledger,
         "investigation_A.json": Path(state["investigations"]["A"]["path"]),
         "investigation_B.json": Path(state["investigations"]["B"]["path"]),
         "draft_02_A.md": Path(state["draft_rounds"]["2"]["A"]["markdown"]),
         "draft_02_B.md": Path(state["draft_rounds"]["2"]["B"]["markdown"]),
     }
     payload = invoke(state, f"diverge-{slot}", provider, slot, context_files,
-                     INTEGRATION_SCHEMA, prompt, args.timeout, args.dry_run)
+                     integration_schema(state, barrier_keys), prompt, args.timeout, args.dry_run,
+                     validator=lambda value: validate_integration(value, state, slot, 3, barrier_keys))
     if args.dry_run:
         emit({"status": "DIVERGENCE_DRY_RUN", **payload})
-    validate_integration(payload, state, slot, 3)
+    validate_integration(payload, state, slot, 3, barrier_keys)
     path = Path(state["run_directory"]) / "drafts" / f"round_3_{slot}.json"
     markdown = Path(state["run_directory"]) / "drafts" / f"round_3_{slot}.md"
     atomic_json(path, payload)
@@ -1746,9 +2360,10 @@ def command_diverge(args: argparse.Namespace) -> None:
     record_artifact(state, f"draft-3-{slot}-json", path)
     record_artifact(state, f"draft-3-{slot}-md", markdown)
     record_findings(state, payload["new_findings"], f"draft-03-{slot}")
+    record_finding_aliases(state, payload["finding_aliases"], f"draft-03-{slot}")
     state["draft_rounds"]["3"][slot] = {"provider": provider, "path": str(path), "markdown": str(markdown)}
     state["status"] = "SYNTHESIS_REQUIRED" if set(state["draft_rounds"]["3"]) == {"A", "B"} else "DIVERGING"
-    save_state(state)
+    save_parallel_stage(state, "diverge")
     emit({"status": state["status"], "run_id": state["run_id"], "slot": slot, "draft": str(markdown)})
 
 
@@ -1808,7 +2423,7 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
         raise WorkflowError("both synthesized plan and batch manifest must exist")
     plan_text = plan.read_text(encoding="utf-8")
     batches_text = batches.read_text(encoding="utf-8")
-    diagnostics = synthesis_diagnostics(plan_text, batches_text)
+    diagnostics = synthesis_diagnostics(plan_text, batches_text, state.get("finding_ledger", {}))
     if "TARGET-001" not in plan_text + "\n" + batches_text:
         diagnostics["errors"].append("synthesis must map the candidate to frozen scope id TARGET-001")
     if diagnostics["errors"]:
@@ -1887,7 +2502,8 @@ def command_convergence_review(args: argparse.Namespace) -> None:
         "investigation_B.json": Path(state["investigations"]["B"]["path"]),
     }
     payload = invoke(state, f"convergence-1-{slot}", provider, slot, context_files,
-                     REVIEW_SCHEMA, prompt, args.timeout, args.dry_run)
+                     REVIEW_SCHEMA, prompt, args.timeout, args.dry_run,
+                     validator=lambda value: validate_review(value, state, provider, slot, target))
     if args.dry_run:
         emit({"status": "CONVERGENCE_REVIEW_DRY_RUN", **payload})
     validate_review(payload, state, provider, slot, target)
@@ -1898,22 +2514,12 @@ def command_convergence_review(args: argparse.Namespace) -> None:
         "provider": provider, "verdict": payload["verdict"], "path": str(path),
         "candidate_sha256": state["candidate"]["plan_sha256"],
     }
-    verdicts = [item["verdict"] for item in state["convergence_reviews"].values()]
-    if "NEEDS_USER_DECISION" in verdicts:
+    if payload["verdict"] == "NEEDS_USER_DECISION":
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {"type": "CONVERGENCE_BOUNDARY", "created_at": utc_now()}
-    elif set(state["convergence_reviews"]) == {"A", "B"}:
-        state["convergence_round_one_complete"] = True
-        if all(verdict == "PASS" for verdict in verdicts):
-            state["status"] = "FINAL_REVIEW_REQUIRED"
-        elif state["synthesis_submissions"] < MAX_SYNTHESIS_SUBMISSIONS + state.get("extra_synthesis_grants", 0):
-            state["status"] = "SYNTHESIS_REQUIRED"
-        else:
-            state["status"] = "NEEDS_USER_DECISION"
-            state["pending_decision"] = {"type": "CONVERGENCE_BUDGET_EXHAUSTED", "created_at": utc_now()}
     else:
         state["status"] = "CONVERGENCE_REVIEWING"
-    save_state(state)
+    save_parallel_stage(state, "convergence-review")
     emit({"status": state["status"], "run_id": state["run_id"], "verdict": payload["verdict"],
           "review": str(path)})
 
@@ -1938,6 +2544,8 @@ def command_final_review(args: argparse.Namespace) -> None:
         "Judge factual correctness, full request coverage, dependency order, budget bounds, batch scope, and "
         "whether every exit condition names a finite observation. The plan may choose between drafts only when "
         "the choice is supported by evidence; do not demand excluded work without identifying a request conflict. "
+        "PASS is valid only when no supported P0 or P1 finding remains; if you emit any P0/P1 finding, verdict must "
+        "be FAIL or NEEDS_USER_DECISION. "
         "Do not edit files. Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, "
         "baseline_sha={sha}."
         + DELIVERY_CONTRACT
@@ -1957,6 +2565,7 @@ def command_final_review(args: argparse.Namespace) -> None:
         state, f"final-{state['candidate']['round']}-{slot}", provider, slot,
         context_files,
         REVIEW_SCHEMA, prompt, args.timeout, args.dry_run,
+        validator=lambda value: validate_review(value, state, provider, slot, target),
     )
     if args.dry_run:
         emit({"status": "FINAL_REVIEW_DRY_RUN", **payload})
@@ -1965,55 +2574,12 @@ def command_final_review(args: argparse.Namespace) -> None:
     atomic_json(path, payload)
     record_artifact(state, f"final-{state['candidate']['round']}-{slot}", path)
     state["final_reviews"][slot] = {"provider": provider, "verdict": payload["verdict"], "path": str(path)}
-    verdicts = [item["verdict"] for item in state["final_reviews"].values()]
-    if "NEEDS_USER_DECISION" in verdicts:
+    if payload["verdict"] == "NEEDS_USER_DECISION":
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {"type": "FINAL_PLAN_BOUNDARY", "created_at": utc_now()}
-    elif set(state["final_reviews"]) == set(reviewers):
-        if all(verdict == "PASS" for verdict in verdicts):
-            final_dir = Path(state["run_directory"]) / "final"
-            final_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            final_plan = final_dir / "implementation_plan.md"
-            final_batches = final_dir / "batches.md"
-            shutil.copyfile(Path(state["candidate"]["plan"]), final_plan)
-            shutil.copyfile(Path(state["candidate"]["batch_manifest"]), final_batches)
-            record_artifact(state, "final-plan", final_plan)
-            record_artifact(state, "final-batches", final_batches)
-            state["final"] = {
-                "plan": str(final_plan), "batch_manifest": str(final_batches),
-                "plan_sha256": sha256_file(final_plan), "batch_manifest_sha256": sha256_file(final_batches),
-            }
-            report = Path(state["run_directory"]) / "final_report.md"
-            report.write_text(
-                "# Grounded Build planning report\n\n"
-                f"- Run: `{state['run_id']}`\n"
-                f"- Baseline: `{state['baseline_sha']}`\n"
-                f"- Planners: `{json.dumps(state['planners'], sort_keys=True)}`\n"
-                f"- Provider diversity: `{str(state['provider_diversity']).lower()}`\n"
-                f"- Model diversity: `{str(state.get('model_diversity', False)).lower()}`\n"
-                f"- Agent runtime: `{json.dumps(state.get('agent_runtime', {}), sort_keys=True)}`\n"
-                f"- Planning depth: `{state.get('planning_depth', 'standard')}`\n"
-                f"- Research policy: `{state.get('research_policy', 'local-only')}`\n"
-                f"- Scope contract SHA-256: `{state.get('scope_digest', '')}`\n"
-                + independence_section(state)
-                + f"- Final reviewer selection: `{state['final_reviewer']}`\n"
-                f"- Synthesis submissions: `{state['synthesis_submissions']}`\n"
-                f"- Plan SHA-256: `{state['final']['plan_sha256']}`\n"
-                f"- Batch manifest SHA-256: `{state['final']['batch_manifest_sha256']}`\n\n"
-                "The plan is reviewed but not authorized for implementation until the user explicitly approves.\n",
-                encoding="utf-8",
-            )
-            state["final"]["report"] = str(report)
-            record_artifact(state, "final-report", report)
-            state["status"] = "READY"
-        elif state["synthesis_submissions"] < MAX_SYNTHESIS_SUBMISSIONS + state.get("extra_synthesis_grants", 0):
-            state["status"] = "SYNTHESIS_REQUIRED"
-        else:
-            state["status"] = "NEEDS_USER_DECISION"
-            state["pending_decision"] = {"type": "FINAL_REVIEW_BUDGET_EXHAUSTED", "created_at": utc_now()}
     else:
         state["status"] = "FINAL_REVIEWING"
-    save_state(state)
+    save_parallel_stage(state, "final-review")
     emit({"status": state["status"], "run_id": state["run_id"], "verdict": payload["verdict"], "review": str(path)})
 
 
@@ -2043,7 +2609,11 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         # immediately. The user can clear the block; only the evidence can lift the count.
         "INVOCATION_BUDGET_EXHAUSTED": {
             "GRANT_ONE_INVOCATION", "REASSIGN_ASSIGNMENT", "RESOLVE_AND_CONTINUE", "ABANDON"},
+        "PROVIDER_INFRASTRUCTURE_FAILURE": {
+            "REASSIGN_ASSIGNMENT", "RESOLVE_AND_CONTINUE", "ABANDON"},
     }.get(decision_type, {"ABANDON"})
+    if decision_type == "PROVIDER_INFRASTRUCTURE_FAILURE":
+        allowed = set(state["pending_decision"].get("choices", allowed))
     if args.choice not in allowed:
         raise WorkflowError(f"choice {args.choice} is not allowed for {decision_type}: {','.join(sorted(allowed))}")
     pending = dict(state["pending_decision"])
@@ -2086,6 +2656,11 @@ def command_adjudicate(args: argparse.Namespace) -> None:
     state["pending_decision"] = None
     if args.choice == "ABANDON":
         state["status"] = "ABANDONED"
+        state["abandoned"] = {
+            "reason": args.decision, "actor": args.actor, "at": utc_now(),
+            "pending_decision": pending,
+        }
+        write_terminal_report(state, "ABANDONED")
     elif args.choice == "GRANT_ONE_SYNTHESIS":
         state["extra_synthesis_grants"] = 1
         state["status"] = "SYNTHESIS_REQUIRED"
@@ -2113,7 +2688,7 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         # claim is no longer intact even if the original model delivered earlier artifacts.
         state["model_diversity"] = False
         state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
-    elif decision_type == "INVOCATION_BUDGET_EXHAUSTED":
+    elif decision_type in {"INVOCATION_BUDGET_EXHAUSTED", "PROVIDER_INFRASTRUCTURE_FAILURE"}:
         # Back to where the assignment was, with the count untouched. See the allowed-choices note.
         state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
     elif decision_type == "PLANNING_BOUNDARY" and set(state["cross_reviews"]) != {"A", "B"}:
@@ -2132,11 +2707,20 @@ def command_status(args: argparse.Namespace) -> None:
         "planners": state["planners"], "provider_diversity": state["provider_diversity"],
         "model_diversity": state.get("model_diversity", False),
         "agent_runtime": state.get("agent_runtime") or {},
+        "runtime_warnings": state.get("runtime_warnings") or [],
         "assignment_providers": state.get("assignment_providers") or {},
         "independence_notes": state.get("independence_notes") or [],
         "final_reviewer": state["final_reviewer"], "drafts": state["drafts"],
         "cross_reviews": state["cross_reviews"], "synthesis_submissions": state["synthesis_submissions"],
         "final_reviews": state["final_reviews"], "pending_decision": state["pending_decision"],
+        "investigations": state.get("investigations") or {},
+        "draft_rounds": state.get("draft_rounds") or {},
+        "convergence_reviews": state.get("convergence_reviews") or {},
+        "abandoned": state.get("abandoned"),
+        "active_invocations": active_invocation_records(state),
+        "resource_usage": state.get("resource_usage") or {},
+        "infrastructure_usage": state.get("infrastructure_usage") or {},
+        "finding_aliases": state.get("finding_aliases") or {},
         "final": state.get("final"), "run_directory": state["run_directory"], "usage": state["usage"],
         "next_action": next_action(state),
     })
@@ -2162,8 +2746,50 @@ def command_export(args: argparse.Namespace) -> None:
         "provider_diversity": state["provider_diversity"],
         "model_diversity": state.get("model_diversity", False),
         "agent_runtime": state.get("agent_runtime") or {},
+        "runtime_warnings": state.get("runtime_warnings") or [],
         "handoff": "Use scripts/workflow.py init only after explicit user approval.",
     })
+
+
+def command_audit_export(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id)
+    if state["status"] not in TERMINAL_STATUSES:
+        raise WorkflowError("audit-export is allowed only after READY or ABANDONED")
+    report = Path(state["run_directory"]) / "final_report.md"
+    if not report.is_file():
+        report = write_terminal_report(state, state["status"])
+        save_state(state)
+    emit({
+        "status": state["status"], "run_id": state["run_id"], "report": str(report),
+        "candidate": state.get("candidate"), "final_reviews": state.get("final_reviews") or {},
+        "abandoned": state.get("abandoned"), "resource_usage": state.get("resource_usage") or {},
+    })
+
+
+def command_migrate_engine(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id, allow_engine_drift=True)
+    frozen = state.get("engine_contract")
+    current = engine_contract()
+    if frozen == current:
+        emit({"status": "ENGINE_CURRENT", "run_id": state["run_id"], "engine_contract": current})
+    preview = {
+        "status": "ENGINE_MIGRATION_PREVIEW", "run_id": state["run_id"],
+        "from": frozen, "to": current, "reason": args.reason, "actor": args.actor,
+        "warning": "This changes prompts and workflow semantics for an existing run; prior invocation records remain frozen.",
+    }
+    if not args.apply:
+        emit(preview)
+    decisions = Path(state["run_directory"]) / "decisions"
+    path = decisions / f"engine_migration_{len(list(decisions.glob('engine_migration_*.json'))) + 1:03d}.json"
+    atomic_json(path, {**preview, "applied_at": utc_now()})
+    record_artifact(state, f"decision-{path.stem}", path)
+    state["engine_contract"] = current
+    state["software_version"] = VERSION
+    save_state(state)
+    emit({"status": state["status"], "run_id": state["run_id"],
+          "engine_contract": current, "decision_record": str(path)})
 
 
 def command_abandon(args: argparse.Namespace) -> None:
@@ -2175,6 +2801,7 @@ def command_abandon(args: argparse.Namespace) -> None:
         emit({"status": "ABANDON_PREVIEW", "run_id": state["run_id"], "reason": args.reason})
     state["status"] = "ABANDONED"
     state["abandoned"] = {"reason": args.reason, "actor": args.actor, "at": utc_now()}
+    write_terminal_report(state, "ABANDONED")
     save_state(state)
     emit({"status": state["status"], "run_id": state["run_id"]})
 
@@ -2204,13 +2831,21 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     def add_codex_selection(command: argparse.ArgumentParser) -> None:
-        command.add_argument("--codex-model", help="freeze and pass an explicit Codex model name")
+        command.add_argument(
+            "--codex-model",
+            help=f"override the default {DEFAULT_CODEX_MODEL!r}; use 'cli-default' to defer to Codex")
         command.add_argument(
             "--codex-model-provider",
             help="freeze and pass a configured Codex model_provider (for example a DeepSeek gateway)")
         command.add_argument(
             "--codex-profile",
             help="freeze and pass a CODEX_HOME profile name; its profile config is mounted read-only")
+
+    def add_model_selection(command: argparse.ArgumentParser) -> None:
+        add_codex_selection(command)
+        command.add_argument(
+            "--claude-model",
+            help=f"override the default {DEFAULT_CLAUDE_MODEL!r}; use 'cli-default' to defer to Claude")
 
     preflight = commands.add_parser("preflight")
     preflight.add_argument("--project", required=True)
@@ -2219,7 +2854,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe", action="store_true",
         help="spend one trivial sandboxed call per provider to check it can authenticate and "
              "return a schema object; exits 2 if any cannot")
-    add_codex_selection(preflight)
+    add_model_selection(preflight)
     preflight.set_defaults(func=command_preflight)
 
     init = commands.add_parser("init")
@@ -2233,7 +2868,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--research-policy", choices=["local-only", "authoritative-web"], default="local-only",
         help="allow investigation agents to consult only official docs/GitHub when local evidence is insufficient")
-    add_codex_selection(init)
+    add_model_selection(init)
     init.set_defaults(func=command_init)
 
     for name, function in (("investigate", command_investigate), ("draft", command_draft),
@@ -2298,7 +2933,8 @@ def build_parser() -> argparse.ArgumentParser:
     adjudicate.add_argument("--apply", action="store_true")
     adjudicate.set_defaults(func=command_adjudicate)
 
-    for name, function in (("status", command_status), ("next", command_next), ("export", command_export)):
+    for name, function in (("status", command_status), ("next", command_next),
+                           ("export", command_export), ("audit-export", command_audit_export)):
         command = commands.add_parser(name)
         command.add_argument("--project", required=True)
         command.add_argument("--run-id", required=True)
@@ -2317,13 +2953,32 @@ def build_parser() -> argparse.ArgumentParser:
     abandon.add_argument("--actor", required=True)
     abandon.add_argument("--apply", action="store_true")
     abandon.set_defaults(func=command_abandon)
+
+    migrate_engine = commands.add_parser(
+        "migrate-engine", help="preview or explicitly apply engine drift to an existing planning run")
+    migrate_engine.add_argument("--project", required=True)
+    migrate_engine.add_argument("--run-id", required=True)
+    migrate_engine.add_argument("--reason", required=True)
+    migrate_engine.add_argument("--actor", required=True)
+    migrate_engine.add_argument("--apply", action="store_true")
+    migrate_engine.set_defaults(func=command_migrate_engine)
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     try:
-        if hasattr(args, "run_id") and hasattr(args, "project"):
+        parallel_commands = {
+            "investigate", "draft", "cross-review", "diverge",
+            "convergence-review", "final-review",
+        }
+        if args.command in parallel_commands:
+            project = resolve_project(args.project)
+            slot = getattr(args, "slot", None) or getattr(args, "reviewer", None)
+            with assignment_lock(project, args.run_id, f"{args.command}-{slot}"):
+                args.func(args)
+        elif (hasattr(args, "run_id") and hasattr(args, "project")
+                and args.command not in {"status", "next"}):
             project = resolve_project(args.project)
             with run_lock(project, args.run_id):
                 args.func(args)

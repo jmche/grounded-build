@@ -6,7 +6,7 @@ Grounded Build is a local coding-agent skill with two independent modes:
    drafting, integrate each other's evidence without widening scope, and converge on a host-synthesized plan.
 2. **Implement:** execute an approved plan batch by batch in isolated Git worktrees with fixed-SHA review, bounded repair, evidence tracking, and explicit final integration.
 
-Version `v0.3.0` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude` or `codex` CLI adapters are required.
+Version `v0.4.0` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude` or `codex` CLI adapters are required.
 
 The sandbox is exercised with Claude Code 2.1.238 and Codex CLI 0.149.0. Codex is treated as an adapter: its configured model may be GPT, DeepSeek through an OpenAI-compatible gateway, or another model. The run freezes and reports the non-secret model identity separately from the adapter.
 
@@ -62,7 +62,9 @@ python3 scripts/release_check.py \
 
 The planning workflow uses fake local agent adapters in tests; no paid model calls are made by the unit suite.
 
-Run `plan_workflow.py next` after every planning action. It returns the single legal next action and argv arrays, which makes orchestration independent of the host model's ability to remember the state machine.
+Run `plan_workflow.py next` after every planning action. Same-round A/B work is returned as a `RUN_AGENT_BATCH`; launch all listed commands concurrently and wait at the barrier. Other states return one legal action. This keeps orchestration independent of host memory while preventing accidental serialization and asymmetric round inputs.
+
+Planning uses Opus and `gpt-5.6-sol` by default. Implementation uses the current host unchanged and defaults only the isolated reviewer to Opus or `gpt-5.6-sol`. Every default can be overridden explicitly, including `cli-default` to defer to a CLI configuration.
 
 ## Security
 

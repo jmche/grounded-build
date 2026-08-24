@@ -13,16 +13,30 @@ Ordinary runs should follow the `next_action` returned by `plan_workflow.py`. Re
 
 Separate processes, fresh sessions, isolated context, a detached read-only worktree, and audited output provide process independence. Two Codex instances using the same model are not model-diverse. A Codex adapter configured for DeepSeek remains adapter `codex`, model family `deepseek`.
 
-Cross-review is mutual: A reviews B and B reviews A. `final_reviewer=both` independently reviews the same synthesized candidate through both slots. A single selected adapter uses fresh logical reviewer F.
+Cross-review is mutual: A reviews B and B reviews A. Every same-round A/B pair is launched concurrently
+from one frozen barrier input; a finisher is merged atomically and cannot alter the peer's already frozen
+context. `final_reviewer=both` independently reviews the same synthesized candidate through both slots. A
+single selected adapter uses fresh logical reviewer F.
+
+Planning defaults to Opus through Claude and `gpt-5.6-sol` through Codex. Explicit model, provider, or profile
+selection wins; `cli-default` defers model choice to the adapter. Initialization freezes hashes of the engine,
+skill contract, and this reference. Each invocation records the requested runtime, redacted actual argv,
+context hashes, wall time, reported cost/turns when available, and terminal delivery class.
+If a skill upgrade changes those hashes during a run, ordinary commands reject the drift. Preview and explicitly
+apply `migrate-engine --reason <reason> --actor <actor> --apply` to continue under the new semantics; the decision
+preserves both engine identities and does not rewrite earlier invocation records.
 
 ## Evidence, scope, and priority contracts
 
-Initialization freezes `request.md` and `scope_contract.json`. The contract admits `TARGET`,
-`REQUIRED_SUPPORT`, and `EVIDENCE_ONLY`; `PROPOSED_EXTENSION` requires a typed user decision and
+Initialization freezes `request.md` and `scope_contract.json`. Every scope id must use a class plus a numeric
+suffix, such as `TARGET-001` or `EVIDENCE_ONLY-003`; bare class names are invalid. The contract admits
+`TARGET`, `REQUIRED_SUPPORT`, and `EVIDENCE_ONLY`; `PROPOSED_EXTENSION` requires a typed user decision and
 `OUT_OF_SCOPE` cannot enter a candidate. A later round may deepen evidence or causal/verification coverage,
 but it cannot enlarge the objective.
 
-Both slots investigate independently before either may draft. Local repository evidence is primary. With
+Both slots investigate independently before either may draft. Each draft must re-check its material repository
+facts. Evidence first discovered during drafting is emitted through `new_evidence` with full provenance before
+the draft may cite it. Local repository evidence is primary. With
 `research_policy=authoritative-web`, investigation calls alone may consult official project documentation or
 the official GitHub repository. Each external record includes its URL, retrieval time, version/tag/commit,
 content digest, and supported claim. Search snippets are discovery aids only.
@@ -34,9 +48,11 @@ evidence strength, then effort. Verification priority and solution priority are 
 requires new evidence in the record.
 
 The workflow, not an agent, fingerprints findings from normalized scope, problem, and causal chain. The
-resulting `F-*` keys live in the frozen finding ledger. Integration rounds may accept or reject known keys;
-new discoveries must carry the complete finding contract before receiving a stable key. Repeated local IDs
-or agreement do not create duplicate facts.
+resulting `F-*` keys live in the frozen finding ledger. Integration schemas enumerate the exact keys available
+at the round barrier. Integration rounds may accept or reject known keys; new discoveries must carry the
+complete finding contract before receiving a stable key. Evidence-backed `finding_aliases` may identify
+multiple observations of the same underlying defect without deleting provenance. Repeated local IDs,
+wording similarity, or agreement alone do not establish semantic equivalence.
 
 ## State progression
 
@@ -60,6 +76,7 @@ honest termination—not forced consensus and not a claim of absolute correctnes
 
 The `next` command returns exactly one of:
 
+- `RUN_AGENT_BATCH`: preview all commands, launch every listed slot concurrently, then wait at the barrier.
 - `RUN_AGENT`: preview and execute the supplied argv arrays.
 - `HOST_SYNTHESIS`: collect all named artifacts and author the candidate.
 - `ASK_USER`: do not invoke another model until the typed decision is recorded.
@@ -74,10 +91,11 @@ verification commands; compatibility, migration, rollback, recovery, risk, evide
 dispositions of disputed proposals. Material findings use solution form: problem, evidence, root cause or
 honest unresolved status, affected surfaces, recommended solution, alternatives/tradeoffs, and verification.
 
-`check-synthesis` catches structural errors and warns before a paid final review. Every `Bxx:`
-block should use the exact labels `Exit observation:` and `Verification:` so the deterministic
-check can recognize them. Its warnings do not prove semantic quality; final reviewers still
-inspect repository evidence.
+`check-synthesis` catches structural errors and warns before a paid final review. It compares plan and manifest
+batch sets, validates dependency references and acyclicity, flags repeatable work without numeric bounds, and
+checks stable finding dispositions when run during submission. Every `Bxx:` block must use the exact labels
+`Exit observation:` and `Verification:` so the deterministic check can recognize it. Its warnings do not prove
+semantic quality; final reviewers still inspect repository evidence.
 
 ## Typed decisions
 
@@ -86,6 +104,7 @@ Read `pending_decision` from status. Show its evidence and allowed choices to th
 - Planning/final boundary: resolve and continue, or abandon.
 - Synthesis budget exhausted: at most one explicit extra synthesis, or abandon.
 - Invocation budget exhausted: one extra invocation, reassign the assignment, resume after genuinely changed input, or abandon.
+- Provider infrastructure failure: resolve the external condition and continue, reassign, or abandon. It does not consume a quality attempt.
 
 Reassignment preserves audit history and process isolation but breaks the original two-slot
 diversity claim. After any reassignment, both `provider_diversity` and `model_diversity` are
@@ -95,8 +114,13 @@ Reassignment never converts an infrastructure failure into a plan-quality verdic
 ## Recovery
 
 - Use `status` and `next`; do not repeat a completed slot.
+- `status` remains readable during paid calls and reports invocation records whose terminal status is still `RUNNING`.
 - Input-scoped budgets reset only when authoritative input changes.
-- A delivery retry is told how output failed to arrive, never which verdict to return.
+- A delivery or deterministic contract retry is told exactly how its prior output failed, never which verdict to return.
 - Final FAIL permits one evidence-driven correction by default. After exhaustion, ask the user.
 - Validate frozen artifacts and worktree cleanliness before every resumed invocation.
 - Cleanup unregisters worktrees through Git and preserves the audit record.
+- Private per-invocation homes and temporary caches are measured and removed immediately after the CLI exits;
+  prompts, stdout/stderr, results, invocation metadata, and hashes remain auditable.
+- `audit-export` works for both terminal states. `ABANDONED` preserves the last candidate, reviews, resource
+  totals, decisions, and terminal reason while stating that no plan was approved.

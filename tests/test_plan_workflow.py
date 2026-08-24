@@ -17,7 +17,7 @@ SCRIPT = ROOT / "scripts" / "plan_workflow.py"
 
 
 FAKE_AGENT = r'''#!/usr/bin/env python3
-import json, os, re, subprocess, sys
+import json, os, re, subprocess, sys, time
 from pathlib import Path
 prompt = sys.argv[-1]
 provider = re.search(r"provider=(claude|codex)", prompt).group(1)
@@ -29,6 +29,9 @@ request_text = (Path(context_match.group(1)) / "request.md").read_text() if cont
 canary_match = re.search(r"FORBIDDEN_CANARY=(.+)", request_text)
 canary_visible = bool(canary_match and Path(canary_match.group(1).strip()).exists())
 git_ok = subprocess.run(["git", "status", "--porcelain"], capture_output=True).returncode == 0
+sleep_match = re.search(r"FAKE_SLEEP=(\d+(?:\.\d+)?)", request_text)
+if sleep_match:
+    time.sleep(float(sleep_match.group(1)))
 if "independent evidence investigator" in prompt:
     slot = re.search(r"investigator ([AB])", prompt).group(1)
     payload = {
@@ -44,7 +47,7 @@ elif "independent planning instance" in prompt:
     slot = re.search(r"instance ([AB])", prompt).group(1)
     payload = {
         "provider": provider, "slot": slot, "baseline_sha": sha, "scope_digest": scope_digest,
-        "evidence_ids": [f"{slot}-E1"],
+        "evidence_ids": [f"{slot}-E1"], "new_evidence": [],
         "summary": f"independent {slot}; canary_visible={canary_visible}; git_ok={git_ok}",
         "repository_facts": [{"id": f"{slot}-F1", "claim": "README exists", "evidence": "README.md:1", "confidence": "VERIFIED"}],
         "plan_markdown": f"# Plan {slot}\n\n## Scope\nRepository-grounded proposal from {slot}.\n\n## Batches\n- B01: verify with a named command.\n",
@@ -70,6 +73,7 @@ elif "independent reviewer and integrator slot" in prompt or "independent deep-p
                "verdict": verdict, "summary": "checked", "findings": findings,
                "plan_markdown": f"# Integrated plan {round_number}{slot}\n\n## Scope\nTARGET-001\n",
                "accepted_finding_ids": [], "rejected_finding_ids": [], "new_findings": [],
+               "finding_aliases": [],
                "unresolved_questions": []}
 else:
     slot = re.search(r"reviewer \(([ABF])\)", prompt).group(1)
@@ -80,7 +84,10 @@ else:
         verdict = "PASS"
         findings = [{"id": "P0-pass", "severity": "P0", "claim": "unsafe", "evidence": "plan", "required_change": "fix"}]
     payload = {"provider": provider, "reviewer_slot": slot, "target": target, "baseline_sha": sha, "verdict": verdict, "summary": "final checked", "findings": findings}
-if "-o" in sys.argv:
+if "FAKE_529" in request_text and "independent evidence investigator A" in prompt:
+    print(json.dumps({"is_error": True, "api_error_status": 529,
+                      "result": "upstream provider overloaded"}))
+elif "-o" in sys.argv:
     output = sys.argv[sys.argv.index("-o") + 1]
     # Deliver nothing on the first attempt when the request asks for it: the shape codex hit
     # three times running, where the turn ends with no final message at all.
@@ -196,6 +203,103 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertTrue(Path(exported["plan"]).is_file())
         self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.project, text=True).strip(), self.baseline)
         self.assertEqual(subprocess.check_output(["git", "status", "--porcelain"], cwd=self.project, text=True), "")
+
+    def test_same_round_investigations_really_overlap_and_merge(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_SLEEP=1.0\n", encoding="utf-8")
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "both")
+        action = initialized["next_action"]
+        self.assertEqual(action["kind"], "RUN_AGENT_BATCH")
+        started = __import__("time").monotonic()
+        processes = [subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, env=self.env)
+                     for command in action["commands"]]
+        __import__("time").sleep(0.25)
+        running = self.call(
+            "status", "--project", str(self.project), "--run-id", initialized["run_id"])
+        self.assertEqual(set(running["active_invocations"]), {"investigate-A", "investigate-B"})
+        results = [process.communicate(timeout=15) + (process.returncode,) for process in processes]
+        elapsed = __import__("time").monotonic() - started
+        self.assertTrue(all(returncode == 0 for _, _, returncode in results), results)
+        self.assertLess(elapsed, 1.8, results)
+        state = self.get_state(initialized)
+        self.assertEqual(set(state["investigations"]), {"A", "B"})
+        self.assertEqual(state["status"], "EVIDENCE_READY")
+
+    def test_provider_overload_is_not_charged_as_quality(self) -> None:
+        self.request.write_text("# Objective\nFAKE_529\n", encoding="utf-8")
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        failure = self.call(
+            "investigate", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--slot", "A", expect=2)
+        self.assertIn("PROVIDER_OVERLOAD", failure["error"])
+        state = self.get_state(initialized)
+        self.assertNotIn("investigate-A", state["usage"])
+        self.assertEqual(state["infrastructure_usage"]["investigate-A"], 1)
+        self.assertEqual(state["pending_decision"]["type"], "PROVIDER_INFRASTRUCTURE_FAILURE")
+
+    def test_invocation_record_freezes_engine_argv_runtime_and_prunes_scratch(self) -> None:
+        initialized = self.initialize("claude", "claude")
+        record_path = next(
+            (Path(initialized["run_directory"]) / "invocations" / "investigate-A")
+            .glob("attempt_1_*/invocation.json"))
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["engine_contract"]["software_version"], "0.4.0")
+        self.assertEqual(record["requested_runtime"]["model"], "opus")
+        self.assertIn("--model", record["argv"])
+        self.assertEqual(record["argv"][-1], "<PROMPT>")
+        self.assertEqual(record["status"], "DELIVERED")
+        self.assertFalse((record_path.parent / "home").exists())
+        self.assertFalse((record_path.parent / "tmp").exists())
+
+    def test_engine_drift_requires_an_explicit_audited_migration(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        spec = importlib.util.spec_from_file_location("gb_engine_migration_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        previous = os.environ.get("GROUNDED_BUILD_PLAN_HOME")
+        os.environ["GROUNDED_BUILD_PLAN_HOME"] = self.env["GROUNDED_BUILD_PLAN_HOME"]
+        try:
+            state = self.get_state(initialized)
+            state["engine_contract"] = {"software_version": "older", "files": {}}
+            module.save_state(state)
+        finally:
+            if previous is None:
+                os.environ.pop("GROUNDED_BUILD_PLAN_HOME", None)
+            else:
+                os.environ["GROUNDED_BUILD_PLAN_HOME"] = previous
+        failure = self.call(
+            "status", "--project", str(self.project), "--run-id", initialized["run_id"], expect=2)
+        self.assertIn("engine drift", failure["error"])
+        preview = self.call(
+            "migrate-engine", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--reason", "upgrade test", "--actor", "test")
+        self.assertEqual(preview["status"], "ENGINE_MIGRATION_PREVIEW")
+        self.call(
+            "migrate-engine", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--reason", "upgrade test", "--actor", "test", "--apply")
+        status = self.call(
+            "status", "--project", str(self.project), "--run-id", initialized["run_id"])
+        self.assertEqual(status["status"], "INITIALIZED")
+
+    def test_abandoned_run_has_an_audit_export_and_no_approval_claim(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        self.call(
+            "abandon", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--reason", "operator stopped", "--actor", "test", "--apply")
+        exported = self.call(
+            "audit-export", "--project", str(self.project), "--run-id", initialized["run_id"])
+        report = Path(exported["report"]).read_text(encoding="utf-8")
+        self.assertIn("Outcome: `ABANDONED`", report)
+        self.assertIn("No plan was approved", report)
 
     def test_investigation_is_a_hard_gate_before_drafting(self) -> None:
         initialized = self.call(
@@ -468,6 +572,14 @@ class PlanWorkflowTest(unittest.TestCase):
                          "the plan is not carried twice; the .md is the plan")
         self.assertIn("repository_facts", claims)
         self.assertIn("summary", claims, "the metadata the reviewer still needs comes with it")
+        preview_b = self.call(
+            "cross-review", "--project", str(self.project), "--run-id", run_id,
+            "--slot", "B", "--dry-run")
+        context_b = Path(preview_b["context"])
+        self.assertEqual(
+            (context / "finding_ledger.json").read_bytes(),
+            (context_b / "finding_ledger.json").read_bytes(),
+            "both cross-reviewers must receive the same pre-round ledger even after A finishes")
 
     def test_an_adjudication_in_the_context_does_not_reset_a_spent_budget(self) -> None:
         """The anti-loophole half: decisions accumulate in the context on every adjudication.
@@ -577,6 +689,15 @@ class PlanWorkflowTest(unittest.TestCase):
             "--reviewer", "F", expect=2,
         )
         self.assertIn("PASS review cannot contain P0/P1", result["error"])
+        state = self.get_state(initialized)
+        assignment = "final-1-F"
+        self.assertIn("deterministic contract rejection", state["delivery_faults"][assignment])
+        record_path = next(
+            (Path(initialized["run_directory"]) / "invocations" / assignment)
+            .glob("attempt_1_*/invocation.json"))
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["status"], "VALIDATION_REJECTED")
+        self.assertIn("PASS review cannot contain P0/P1", record["diagnostic"])
 
     def test_user_decision_does_not_skip_second_cross_review(self) -> None:
         self.request.write_text(self.request.read_text() + "\nFAKE_CROSS_DECISION=A\n")
@@ -1070,26 +1191,43 @@ class HostProtocolTest(unittest.TestCase):
     def test_next_action_removes_slot_guessing(self) -> None:
         state = self.state("INITIALIZED")
         first = self.module.next_action(state)
-        self.assertEqual((first["stage"], first["slot"]), ("investigate", "A"))
+        self.assertEqual((first["stage"], first["slots"]), ("investigate", ["A", "B"]))
+        self.assertEqual(first["kind"], "RUN_AGENT_BATCH")
+        self.assertTrue(first["parallel"])
         state["status"] = "INVESTIGATING"
         state["investigations"]["A"] = {}
-        self.assertEqual(self.module.next_action(state)["slot"], "B")
+        self.assertEqual(self.module.next_action(state)["slots"], ["B"])
         state["status"] = "DRAFTING"
         state["drafts"]["A"] = {}
-        self.assertEqual(self.module.next_action(state)["slot"], "B")
+        self.assertEqual(self.module.next_action(state)["slots"], ["B"])
 
     def test_ready_stops_for_separate_implementation_authority(self) -> None:
         action = self.module.next_action(self.state("READY"))
         self.assertEqual(action["kind"], "STOP_FOR_IMPLEMENTATION_APPROVAL")
 
+    def test_dual_final_review_is_returned_as_one_parallel_barrier(self) -> None:
+        state = self.state("FINAL_REVIEW_REQUIRED")
+        state["final_reviewer"] = "both"
+        action = self.module.next_action(state)
+        self.assertEqual(action["kind"], "RUN_AGENT_BATCH")
+        self.assertEqual(action["slots"], ["A", "B"])
+
     def test_synthesis_diagnostics_bind_each_batch_to_observations(self) -> None:
         good = self.module.synthesis_diagnostics(
-            "# Plan\n\nExcluded: none.\n",
+            "# Plan\n\nB01 implements the request.\n\nExcluded: none.\n",
             "B01: core\nExit observation: tests pass\nVerification: pytest -q\n")
         self.assertEqual(good, {"errors": [], "warnings": []})
         weak = self.module.synthesis_diagnostics("# Plan\n", "B01: core\n")
         self.assertEqual(weak["errors"], [])
         self.assertGreaterEqual(len(weak["warnings"]), 3)
+
+    def test_synthesis_diagnostics_reject_dependency_cycles_and_unknown_batches(self) -> None:
+        diagnostics = self.module.synthesis_diagnostics(
+            "# Plan\nB01 then B02.\nExcluded: none.\n",
+            "B01: one\nDependencies: B02\nExit observation: done\nVerification: test\n"
+            "B02: two\nDependencies: B01 B99\nExit observation: done\nVerification: test\n")
+        self.assertTrue(any("unknown batches" in item for item in diagnostics["errors"]))
+        self.assertTrue(any("cycle" in item for item in diagnostics["errors"]))
 
     def test_finding_ledger_uses_stable_content_fingerprints(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="gb-ledger-test-"))

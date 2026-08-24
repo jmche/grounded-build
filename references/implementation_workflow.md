@@ -11,8 +11,9 @@ Collect or infer:
 - `plan`: an existing local plan file, resolved to an absolute path.
 - `batch_manifest`: a host-authored file that explicitly declares this run's included and excluded total scope and maps every batch ID to plan work. This is execution authority, not reviewer output.
 - `reviewer`: exactly `claude` or `codex`; it may match the host/implementer.
-- `reviewer_runtime`: the non-secret model identity frozen at initialization. For Codex, optional
-  `--codex-model`, `--codex-model-provider`, and `--codex-profile` select GPT, an
+- `reviewer_runtime`: the non-secret model identity frozen at initialization. Claude defaults to Opus and
+  Codex defaults to `gpt-5.6-sol`; optional `--claude-model`, `--codex-model`,
+  `--codex-model-provider`, and `--codex-profile` select GPT, an
   OpenAI-compatible DeepSeek gateway, or another configured model without treating the CLI name
   as the model family.
 - `fix_policy`: `ask` by default, `auto` only when explicitly requested, or `never` for review without repair.
@@ -143,13 +144,15 @@ python3 <skill-root>/scripts/workflow.py init \
   --target-branch <branch>
 ```
 
-When selecting a non-default Codex runtime, append the same selection verified during preflight:
+The current host remains the implementer and is never model-overridden by this workflow. To override the
+isolated reviewer's advanced default, append the same selection verified during preflight:
 
 ```bash
+--claude-model <model>
 --codex-model <model> --codex-model-provider <configured-provider> --codex-profile <profile>
 ```
 
-These values are frozen in `reviewer_runtime`; credentials, bearer tokens, and endpoint URLs are
+Use `cli-default` for either model to defer to its CLI. These values are frozen in `reviewer_runtime`; credentials, bearer tokens, and endpoint URLs are
 never copied into workflow state.
 
 Initialization snapshots both the plan and batch manifest, records their digests, verifies that the manifest names every declared batch ID, creates a unique implementation branch and reviewer worktree, and leaves the original project's branch, HEAD, index, and files unchanged. The new run starts at `AWAITING_CONTRACT_REVIEW`.
