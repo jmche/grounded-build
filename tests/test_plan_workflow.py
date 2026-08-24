@@ -22,27 +22,55 @@ from pathlib import Path
 prompt = sys.argv[-1]
 provider = re.search(r"provider=(claude|codex)", prompt).group(1)
 sha = re.search(r"[0-9a-f]{40}", prompt).group(0)
+scope_match = re.search(r"scope_digest=([0-9a-f]{64})", prompt)
+scope_digest = scope_match.group(1) if scope_match else ""
 context_match = re.search(r"Read (/.+?)/request\.md", prompt)
 request_text = (Path(context_match.group(1)) / "request.md").read_text() if context_match else ""
 canary_match = re.search(r"FORBIDDEN_CANARY=(.+)", request_text)
 canary_visible = bool(canary_match and Path(canary_match.group(1).strip()).exists())
 git_ok = subprocess.run(["git", "status", "--porcelain"], capture_output=True).returncode == 0
-if "independent planning instance" in prompt:
+if "independent evidence investigator" in prompt:
+    slot = re.search(r"investigator ([AB])", prompt).group(1)
+    payload = {
+        "provider": provider, "slot": slot, "baseline_sha": sha, "scope_digest": scope_digest,
+        "summary": f"investigated {slot}",
+        "evidence": [{"id": f"{slot}-E1", "scope_id": "TARGET-001", "claim": "README exists",
+                      "status": "VERIFIED", "source_type": "REPOSITORY", "locator": "README.md:1",
+                      "retrieved_at": "2026-01-01T00:00:00Z", "version_or_commit": sha,
+                      "content_sha256": "0" * 64}],
+        "findings": [], "unresolved_questions": [],
+    }
+elif "independent planning instance" in prompt:
     slot = re.search(r"instance ([AB])", prompt).group(1)
     payload = {
-        "provider": provider, "slot": slot, "baseline_sha": sha,
+        "provider": provider, "slot": slot, "baseline_sha": sha, "scope_digest": scope_digest,
+        "evidence_ids": [f"{slot}-E1"],
         "summary": f"independent {slot}; canary_visible={canary_visible}; git_ok={git_ok}",
         "repository_facts": [{"id": f"{slot}-F1", "claim": "README exists", "evidence": "README.md:1", "confidence": "VERIFIED"}],
         "plan_markdown": f"# Plan {slot}\n\n## Scope\nRepository-grounded proposal from {slot}.\n\n## Batches\n- B01: verify with a named command.\n",
         "unresolved_questions": [],
     }
-elif "independent reviewer slot" in prompt:
-    slot = re.search(r"reviewer slot ([AB])", prompt).group(1)
-    target = re.search(r"target=(draft-[AB])", prompt).group(1)
-    if f"FAKE_CROSS_DECISION={slot}" in request_text:
-        payload = {"provider": provider, "reviewer_slot": slot, "target": target, "baseline_sha": sha, "verdict": "NEEDS_USER_DECISION", "summary": "scope decision", "findings": [{"id": "P1-scope", "severity": "P1", "claim": "scope unclear", "evidence": "request", "required_change": "choose scope"}]}
+elif "independent reviewer and integrator slot" in prompt or "independent deep-planning slot" in prompt:
+    if "integrator slot" in prompt:
+        slot = re.search(r"integrator slot ([AB])", prompt).group(1)
+        round_number = 2
+        target = re.search(r"target=(draft-[AB])", prompt).group(1)
     else:
-        payload = {"provider": provider, "reviewer_slot": slot, "target": target, "baseline_sha": sha, "verdict": "PASS", "summary": "checked", "findings": []}
+        slot = re.search(r"deep-planning slot ([AB])", prompt).group(1)
+        round_number = 3
+        target = "draft-02-both"
+    if f"FAKE_CROSS_DECISION={slot}" in request_text:
+        verdict = "NEEDS_USER_DECISION"
+        findings = [{"id": "P1-scope", "severity": "P1", "claim": "scope unclear", "evidence": "request", "required_change": "choose scope"}]
+    else:
+        verdict = "PASS"
+        findings = []
+    payload = {"provider": provider, "slot": slot, "reviewer_slot": slot, "target": target,
+               "round": round_number, "baseline_sha": sha, "scope_digest": scope_digest,
+               "verdict": verdict, "summary": "checked", "findings": findings,
+               "plan_markdown": f"# Integrated plan {round_number}{slot}\n\n## Scope\nTARGET-001\n",
+               "accepted_finding_ids": [], "rejected_finding_ids": [], "new_findings": [],
+               "unresolved_questions": []}
 else:
     slot = re.search(r"reviewer \(([ABF])\)", prompt).group(1)
     target = re.search(r"target=(candidate-round-\d+)", prompt).group(1)
@@ -57,7 +85,7 @@ if "-o" in sys.argv:
     # Deliver nothing on the first attempt when the request asks for it: the shape codex hit
     # three times running, where the turn ends with no final message at all.
     always = re.search(r"FAKE_EMPTY_ALWAYS=(\S+)", request_text)
-    if (always and f"/{always.group(1)}/" in output) or ("FAKE_EMPTY_FIRST" in request_text and "attempt_1_" in output):
+    if (always and f"/{always.group(1)}/" in output) or ("FAKE_EMPTY_FIRST" in request_text and "/draft-" in output and "attempt_1_" in output):
         open(output, "w").close()
         sys.exit(0)
     with open(output, "w", encoding="utf-8") as handle:
@@ -105,10 +133,14 @@ class PlanWorkflowTest(unittest.TestCase):
         return json.loads(source)
 
     def initialize(self, backend: str = "claude", final: str = "both") -> dict:
-        return self.call(
+        initialized = self.call(
             "init", "--project", str(self.project), "--request", str(self.request),
             "--backend", backend, "--final-reviewer", final,
         )
+        for slot in ("A", "B"):
+            self.call("investigate", "--project", str(self.project),
+                      "--run-id", initialized["run_id"], "--slot", slot)
+        return initialized
 
     def get_state(self, initialized: dict) -> dict:
         return json.loads((Path(initialized["run_directory"]) / "workflow.json").read_text(encoding="utf-8"))
@@ -125,7 +157,7 @@ class PlanWorkflowTest(unittest.TestCase):
         directory = Path(output["output_directory"])
         plan = directory / "host_plan.md"
         batches = directory / "host_batches.md"
-        plan.write_text("# Implementation plan\n\n## Scope\nImplement the request.\n\n## Verification\nRun a named test.\n", encoding="utf-8")
+        plan.write_text("# Implementation plan\n\n## Scope\nTARGET-001: Implement the request.\n\n## Verification\nRun a named test.\n", encoding="utf-8")
         batches.write_text("# Batches\n\n- B01: request scope; exit when the named test returns zero.\n", encoding="utf-8")
         self.call(
             "submit-synthesis", "--project", str(self.project), "--run-id", initialized["run_id"],
@@ -152,7 +184,10 @@ class PlanWorkflowTest(unittest.TestCase):
                 f"invocations/draft-{slot}/attempt_1_*"))
             self.assertNotEqual(invocation / "home", Path(state["worktree"]))
         draft_a_context = next((Path(initialized["run_directory"]) / "invocations" / "draft-A").glob("attempt_1_*/context"))
-        self.assertEqual([item.name for item in draft_a_context.iterdir() if item.name != "schema.json"], ["request.md"])
+        self.assertEqual(
+            sorted(item.name for item in draft_a_context.iterdir() if item.name != "schema.json"),
+            ["investigation.json", "request.md", "scope_contract.json"],
+        )
         self.submit_candidate(initialized)
         for reviewer in ("A", "B"):
             self.call("final-review", "--project", str(self.project), "--run-id", initialized["run_id"], "--reviewer", reviewer)
@@ -161,6 +196,63 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertTrue(Path(exported["plan"]).is_file())
         self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.project, text=True).strip(), self.baseline)
         self.assertEqual(subprocess.check_output(["git", "status", "--porcelain"], cwd=self.project, text=True), "")
+
+    def test_investigation_is_a_hard_gate_before_drafting(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "both",
+        )
+        blocked = self.call(
+            "draft", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--slot", "A", expect=2,
+        )
+        self.assertIn("draft is not allowed from INITIALIZED", blocked["error"])
+        for slot in ("A", "B"):
+            self.call("investigate", "--project", str(self.project),
+                      "--run-id", initialized["run_id"], "--slot", slot)
+        drafted = self.call("draft", "--project", str(self.project),
+                            "--run-id", initialized["run_id"], "--slot", "A")
+        self.assertEqual(drafted["status"], "DRAFTING")
+
+    def test_authoritative_web_is_explicit_and_limited_to_investigation(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "codex", "--final-reviewer", "codex",
+            "--research-policy", "authoritative-web",
+        )
+        preview = self.call(
+            "investigate", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--slot", "A", "--dry-run",
+        )
+        self.assertIn("tools.web_search=true", " ".join(preview["command"]))
+
+    def test_deep_mode_requires_draft_03_and_two_convergence_rounds(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "both", "--planning-depth", "deep",
+        )
+        run_id = initialized["run_id"]
+        for command in ("investigate", "draft"):
+            for slot in ("A", "B"):
+                self.call(command, "--project", str(self.project), "--run-id", run_id, "--slot", slot)
+        for slot in ("A", "B"):
+            result = self.call("cross-review", "--project", str(self.project),
+                               "--run-id", run_id, "--slot", slot)
+        self.assertEqual(result["status"], "DIVERGENCE_REQUIRED")
+        for slot in ("A", "B"):
+            result = self.call("diverge", "--project", str(self.project),
+                               "--run-id", run_id, "--slot", slot)
+        self.assertEqual(result["status"], "SYNTHESIS_REQUIRED")
+        self.submit_candidate(initialized)
+        self.assertEqual(self.get_state(initialized)["status"], "CONVERGENCE_REVIEW_REQUIRED")
+        for slot in ("A", "B"):
+            result = self.call("convergence-review", "--project", str(self.project),
+                               "--run-id", run_id, "--reviewer", slot)
+        self.assertEqual(result["status"], "FINAL_REVIEW_REQUIRED")
+        for slot in ("A", "B"):
+            result = self.call("final-review", "--project", str(self.project),
+                               "--run-id", run_id, "--reviewer", slot)
+        self.assertEqual(result["status"], "READY")
 
     def test_mixed_topology_records_provider_diversity(self) -> None:
         initialized = self.initialize("mixed", "codex")
@@ -439,7 +531,7 @@ class PlanWorkflowTest(unittest.TestCase):
         directory = Path(output["output_directory"])
         plan = directory / "implementation_plan.md"
         batches = directory / "batches.md"
-        plan.write_text("# Implementation plan\n\n## Scope\nImplement the request.\n", encoding="utf-8")
+        plan.write_text("# Implementation plan\n\n## Scope\nTARGET-001: Implement the request.\n", encoding="utf-8")
         batches.write_text("# Batches\n\n- B01: scope; exit when the named test returns zero.\n",
                            encoding="utf-8")
 
@@ -754,8 +846,8 @@ class DeliveryFailureTest(unittest.TestCase):
     def test_every_assignment_that_returns_a_schema_carries_the_contract(self) -> None:
         """Drafting has not failed this way, which is not a reason to leave it unsaid."""
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertEqual(source.count("+ DELIVERY_CONTRACT"), 3,
-                         "draft, cross-review and final-review each return a schema object")
+        self.assertEqual(source.count("+ DELIVERY_CONTRACT"), 6,
+                         "every investigation, draft, integration and convergence assignment carries it")
 
 
 class CodexTrustStoreTest(unittest.TestCase):
@@ -969,7 +1061,8 @@ class HostProtocolTest(unittest.TestCase):
     def state(self, status: str) -> dict:
         return {
             "status": status, "project": "/repo", "run_id": "run-1",
-            "drafts": {}, "cross_reviews": {}, "final_reviews": {},
+            "investigations": {}, "drafts": {}, "draft_rounds": {"1": {}, "2": {}, "3": {}},
+            "cross_reviews": {}, "convergence_reviews": {}, "final_reviews": {},
             "planners": {"A": "codex", "B": "codex"}, "final_reviewer": "codex",
             "candidate": {"round": 1}, "pending_decision": None,
         }
@@ -977,7 +1070,10 @@ class HostProtocolTest(unittest.TestCase):
     def test_next_action_removes_slot_guessing(self) -> None:
         state = self.state("INITIALIZED")
         first = self.module.next_action(state)
-        self.assertEqual((first["stage"], first["slot"]), ("draft", "A"))
+        self.assertEqual((first["stage"], first["slot"]), ("investigate", "A"))
+        state["status"] = "INVESTIGATING"
+        state["investigations"]["A"] = {}
+        self.assertEqual(self.module.next_action(state)["slot"], "B")
         state["status"] = "DRAFTING"
         state["drafts"]["A"] = {}
         self.assertEqual(self.module.next_action(state)["slot"], "B")
@@ -994,6 +1090,30 @@ class HostProtocolTest(unittest.TestCase):
         weak = self.module.synthesis_diagnostics("# Plan\n", "B01: core\n")
         self.assertEqual(weak["errors"], [])
         self.assertGreaterEqual(len(weak["warnings"]), 3)
+
+    def test_finding_ledger_uses_stable_content_fingerprints(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="gb-ledger-test-"))
+        try:
+            path = root / "finding_ledger.json"
+            path.write_text('{"findings": {}}\n', encoding="utf-8")
+            state = {"finding_ledger": {}, "finding_ledger_path": str(path), "artifacts": {}}
+            finding = {
+                "id": "local-1", "scope_id": "TARGET-001", "severity": "P1", "urgency": "U1",
+                "lane": "MUST_RESOLVE", "evidence_status": "VERIFIED", "problem": " Missing guard ",
+                "evidence_ids": ["E1"], "root_cause_status": "PROVEN",
+                "causal_chain": ["Input bypasses guard"], "affected_surfaces": ["parser"],
+                "recommended_solution": "validate input", "alternatives_and_tradeoffs": [],
+                "verification": ["run parser test"],
+            }
+            self.module.record_findings(state, [finding], "investigation-A")
+            finding["id"] = "different-local-id"
+            finding["problem"] = "missing   guard"
+            self.module.record_findings(state, [finding], "investigation-B")
+            self.assertEqual(len(state["finding_ledger"]), 1)
+            record = next(iter(state["finding_ledger"].values()))
+            self.assertEqual(len(record["observations"]), 2)
+        finally:
+            shutil.rmtree(root)
 
     def test_inconsistent_progress_state_has_an_operator_facing_error(self) -> None:
         for status, completed_key in (

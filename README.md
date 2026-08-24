@@ -2,12 +2,13 @@
 
 Grounded Build is a local coding-agent skill with two independent modes:
 
-1. **Plan:** two isolated Claude/Codex instances inspect the same Git snapshot, draft independently, cross-review factual claims, and review a host-synthesized implementation plan.
+1. **Plan:** two isolated Claude/Codex instances investigate the same Git snapshot independently before
+   drafting, integrate each other's evidence without widening scope, and converge on a host-synthesized plan.
 2. **Implement:** execute an approved plan batch by batch in isolated Git worktrees with fixed-SHA review, bounded repair, evidence tracking, and explicit final integration.
 
-Version `v0.2.0` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude` or `codex` CLI adapters are required.
+Version `v0.3.0` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude` or `codex` CLI adapters are required.
 
-The v0.2.0 sandbox is exercised with Claude Code 2.1.238 and Codex CLI 0.149.0. Codex is treated as an adapter: its configured model may be GPT, DeepSeek through an OpenAI-compatible gateway, or another model. The run freezes and reports the non-secret model identity separately from the adapter.
+The sandbox is exercised with Claude Code 2.1.238 and Codex CLI 0.149.0. Codex is treated as an adapter: its configured model may be GPT, DeepSeek through an OpenAI-compatible gateway, or another model. The run freezes and reports the non-secret model identity separately from the adapter.
 
 ## Install
 
@@ -32,6 +33,10 @@ Use $grounded-build to create a repository-grounded plan for this change.
 Use Claude and Codex as isolated planners, have them cross-review each other,
 use Codex for final review, and stop before implementation.
 ```
+
+Use `--planning-depth deep` when the risk justifies an additional `draft_03` divergence round and two
+bounded convergence reviews. Use `--research-policy authoritative-web` only when official upstream evidence
+may be needed; local-only is the default.
 
 If only one provider is available:
 

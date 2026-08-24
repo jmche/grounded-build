@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import hashlib
 import hmac
 import json
@@ -22,8 +23,8 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.2.0"
-SCHEMA_VERSION = 1
+VERSION = "0.3.0"
+SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex")
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
 MAX_SYNTHESIS_SUBMISSIONS = 2
@@ -56,6 +57,61 @@ CODEX_POLICY_OVERRIDES = (
     "-c", "tool_output_token_limit=200000",
 )
 
+EVIDENCE_STATUSES = ["VERIFIED", "STRONGLY_INFERRED", "WEAKLY_INFERRED", "UNRESOLVED", "REFUTED"]
+PRIORITY_LANES = ["STOP_THE_LINE", "MUST_RESOLVE", "INVESTIGATE_IF_BUDGET", "RECORD_ONLY"]
+
+FINDING_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "id": {"type": "string"}, "scope_id": {"type": "string"},
+        "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+        "urgency": {"type": "string", "enum": ["U0", "U1", "U2", "U3"]},
+        "lane": {"type": "string", "enum": PRIORITY_LANES},
+        "evidence_status": {"type": "string", "enum": EVIDENCE_STATUSES},
+        "problem": {"type": "string"}, "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "root_cause_status": {"type": "string", "enum": ["PROVEN", "HYPOTHESIS", "UNRESOLVED"]},
+        "causal_chain": {"type": "array", "items": {"type": "string"}},
+        "affected_surfaces": {"type": "array", "items": {"type": "string"}},
+        "recommended_solution": {"type": "string"},
+        "alternatives_and_tradeoffs": {"type": "array", "items": {"type": "string"}},
+        "verification": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["id", "scope_id", "severity", "urgency", "lane", "evidence_status",
+                 "problem", "evidence_ids", "root_cause_status", "causal_chain",
+                 "affected_surfaces", "recommended_solution", "alternatives_and_tradeoffs",
+                 "verification"],
+}
+
+
+INVESTIGATION_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "provider": {"type": "string", "enum": list(SUPPORTED_PROVIDERS)},
+        "slot": {"type": "string", "enum": ["A", "B"]},
+        "baseline_sha": {"type": "string"},
+        "scope_digest": {"type": "string"},
+        "summary": {"type": "string"},
+        "evidence": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "id": {"type": "string"}, "scope_id": {"type": "string"},
+                "claim": {"type": "string"},
+                "status": {"type": "string", "enum": EVIDENCE_STATUSES},
+                "source_type": {"type": "string", "enum": [
+                    "REPOSITORY", "COMMAND", "OFFICIAL_DOCS", "OFFICIAL_GITHUB"]},
+                "locator": {"type": "string"}, "retrieved_at": {"type": "string"},
+                "version_or_commit": {"type": "string"}, "content_sha256": {"type": "string"},
+            },
+            "required": ["id", "scope_id", "claim", "status", "source_type", "locator",
+                         "retrieved_at", "version_or_commit", "content_sha256"],
+        }},
+        "findings": {"type": "array", "items": FINDING_SCHEMA},
+        "unresolved_questions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["provider", "slot", "baseline_sha", "scope_digest", "summary", "evidence",
+                 "findings", "unresolved_questions"],
+}
+
 
 DRAFT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -65,6 +121,8 @@ DRAFT_SCHEMA: dict[str, Any] = {
         "slot": {"type": "string", "enum": ["A", "B"]},
         "baseline_sha": {"type": "string"},
         "summary": {"type": "string"},
+        "scope_digest": {"type": "string"},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
         "repository_facts": {
             "type": "array",
             "items": {
@@ -83,9 +141,41 @@ DRAFT_SCHEMA: dict[str, Any] = {
         "unresolved_questions": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
-        "provider", "slot", "baseline_sha", "summary", "repository_facts",
+        "provider", "slot", "baseline_sha", "scope_digest", "evidence_ids", "summary", "repository_facts",
         "plan_markdown", "unresolved_questions",
     ],
+}
+
+
+INTEGRATION_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "provider": {"type": "string", "enum": list(SUPPORTED_PROVIDERS)},
+        "slot": {"type": "string", "enum": ["A", "B"]},
+        "reviewer_slot": {"type": "string", "enum": ["A", "B"]},
+        "target": {"type": "string"},
+        "round": {"type": "integer", "enum": [2, 3]},
+        "baseline_sha": {"type": "string"}, "scope_digest": {"type": "string"},
+        "summary": {"type": "string"}, "plan_markdown": {"type": "string"},
+        "accepted_finding_ids": {"type": "array", "items": {"type": "string"}},
+        "rejected_finding_ids": {"type": "array", "items": {"type": "string"}},
+        "new_findings": {"type": "array", "items": FINDING_SCHEMA},
+        "verdict": {"type": "string", "enum": ["PASS", "FAIL", "NEEDS_USER_DECISION"]},
+        "findings": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "id": {"type": "string"},
+                "severity": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                "claim": {"type": "string"}, "evidence": {"type": "string"},
+                "required_change": {"type": "string"},
+            },
+            "required": ["id", "severity", "claim", "evidence", "required_change"],
+        }},
+        "unresolved_questions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["provider", "slot", "reviewer_slot", "target", "round", "baseline_sha", "scope_digest", "summary",
+                 "plan_markdown", "accepted_finding_ids", "rejected_finding_ids",
+                 "new_findings", "verdict", "findings", "unresolved_questions"],
 }
 
 
@@ -431,10 +521,39 @@ def record_artifact(state: dict[str, Any], key: str, path: Path) -> None:
     state.setdefault("artifacts", {})[key] = {"path": str(path), "sha256": sha256_file(path)}
 
 
+def valid_scope_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(
+        r"(?:TARGET|REQUIRED_SUPPORT|EVIDENCE_ONLY|PROPOSED_EXTENSION|OUT_OF_SCOPE)-\d{3,}", value))
+
+
+def finding_fingerprint(finding: dict[str, Any]) -> str:
+    normalized = json.dumps({
+        "scope_id": finding.get("scope_id"),
+        "problem": " ".join(str(finding.get("problem", "")).lower().split()),
+        "causal_chain": [" ".join(str(item).lower().split()) for item in finding.get("causal_chain", [])],
+    }, sort_keys=True, separators=(",", ":"))
+    return "F-" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def record_findings(state: dict[str, Any], findings: list[dict[str, Any]], source: str) -> None:
+    ledger = state.setdefault("finding_ledger", {})
+    for finding in findings:
+        key = finding_fingerprint(finding)
+        observation = {"source": source, "source_id": finding["id"], "at": utc_now(), **finding}
+        if key not in ledger:
+            ledger[key] = {"fingerprint": key, "canonical": finding, "observations": [observation]}
+        else:
+            ledger[key]["observations"].append(observation)
+    path = Path(state["finding_ledger_path"])
+    atomic_json(path, {"findings": ledger})
+    record_artifact(state, "finding-ledger", path)
+
+
 def available(provider: str) -> bool:
     return shutil.which(provider) is not None
 
 
+@functools.lru_cache(maxsize=None)
 def executable_version(provider: str) -> str | None:
     """Return a short CLI version without making a model/API call."""
     if not available(provider):
@@ -498,6 +617,9 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
     profile = getattr(args, "codex_profile", None) if args else None
     if profile and not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
         raise WorkflowError("--codex-profile must be a simple profile name")
+    for option, value in (("--codex-model", model), ("--codex-model-provider", model_provider)):
+        if value and (len(value) > 200 or not re.fullmatch(r"[A-Za-z0-9_./:+-]+", value)):
+            raise WorkflowError(f"{option} must be a simple non-secret selector")
     return {
         "codex": codex_runtime_identity(model, model_provider, profile),
         "claude": {
@@ -683,7 +805,7 @@ def validate_planning_worktree(state: dict[str, Any], worktree: Path) -> None:
 
 def agent_command(
     provider: str, worktree: Path, context: Path, schema: dict[str, Any], raw: Path, prompt: str,
-    runtime: dict[str, Any] | None = None,
+    runtime: dict[str, Any] | None = None, allow_web: bool = False,
 ) -> list[str]:
     if provider == "codex":
         schema_path = context / "schema.json"
@@ -696,10 +818,14 @@ def agent_command(
             selection.extend(["-m", str(runtime["model"])])
         if runtime.get("model_provider"):
             selection.extend(["-c", f'model_provider={json.dumps(runtime["model_provider"])}'])
+        policy = list(CODEX_POLICY_OVERRIDES)
+        if allow_web:
+            index = policy.index("tools.web_search=false")
+            policy[index] = "tools.web_search=true"
         return [
             "codex", "-a", "never", "exec", "--ephemeral", "-s", "read-only",
             *selection,
-            *CODEX_POLICY_OVERRIDES,
+            *policy,
             "-C", str(worktree), "--add-dir", str(context), "--output-schema", str(schema_path),
             "-o", str(raw), prompt,
         ]
@@ -713,12 +839,18 @@ def agent_command(
     # `gate_code_discovery.py` and `extract_urd_delivery_languages` and settled them. That asymmetry
     # was this file's doing, not a difference between the two CLIs, and it silently halved the
     # evidence one side of the cross-check could bring.
-    allowed = ",".join(["Read", "Grep", "Glob", "Bash"])
+    allowed_tools = ["Read", "Grep", "Glob", "Bash"]
+    if allow_web:
+        allowed_tools.extend(["WebFetch", "WebSearch"])
+    allowed = ",".join(allowed_tools)
+    disallowed = ["Edit", "Write", "NotebookEdit"]
+    if not allow_web:
+        disallowed.extend(["WebFetch", "WebSearch"])
     return [
         "claude", "-p", "--output-format", "json", "--json-schema",
         json.dumps(schema, separators=(",", ":")), "--permission-mode", "dontAsk",
         "--allowedTools", allowed,
-        "--disallowedTools", "Edit,Write,NotebookEdit,WebFetch,WebSearch",
+        "--disallowedTools", ",".join(disallowed),
         "--add-dir", str(context), "--no-session-persistence", prompt,
     ]
 
@@ -989,8 +1121,12 @@ def invoke(
     validate_planning_worktree(state, worktree)
     prompt = delivery_corrective(state, assignment) + prompt
     runtime = (state.get("agent_runtime") or {}).get(provider) or {}
+    allow_web = (
+        assignment.startswith("investigate-")
+        and state.get("research_policy") == "authoritative-web"
+    )
     command = agent_command(
-        provider, worktree, context, schema, raw, prompt.format(context=context), runtime)
+        provider, worktree, context, schema, raw, prompt.format(context=context), runtime, allow_web)
     command = isolated_agent_command(command, state, root, worktree, context)
     (root / "prompt.md").write_text(prompt.format(context=context), encoding="utf-8")
     if dry_run:
@@ -1036,14 +1172,76 @@ def validate_draft(payload: dict[str, Any], state: dict[str, Any], slot: str) ->
         raise WorkflowError("draft identity mismatch")
     if payload["baseline_sha"] != state["baseline_sha"]:
         raise WorkflowError("draft baseline SHA mismatch")
+    if payload["scope_digest"] != state["scope_digest"]:
+        raise WorkflowError("draft scope digest mismatch")
     if not isinstance(payload["plan_markdown"], str) or not payload["plan_markdown"].strip():
         raise WorkflowError("draft plan is empty")
+    investigation = json.loads(Path(state["investigations"][slot]["path"]).read_text(encoding="utf-8"))
+    known_evidence = {item["id"] for item in investigation["evidence"]}
+    if not set(payload["evidence_ids"]).issubset(known_evidence):
+        raise WorkflowError("draft cites evidence outside its independent investigation")
     facts = payload["repository_facts"]
     if not isinstance(facts, list) or not facts:
         raise WorkflowError("draft must include repository facts")
     ids = [item.get("id") for item in facts if isinstance(item, dict)]
     if len(ids) != len(set(ids)):
         raise WorkflowError("draft fact ids must be unique")
+
+
+def validate_investigation(payload: dict[str, Any], state: dict[str, Any], slot: str) -> None:
+    if set(payload) != set(INVESTIGATION_SCHEMA["required"]):
+        raise WorkflowError("investigation output fields do not match the contract")
+    provider = assignment_provider(state, f"investigate-{slot}", state["planners"][slot])
+    if payload["provider"] != provider or payload["slot"] != slot:
+        raise WorkflowError("investigation identity mismatch")
+    if payload["baseline_sha"] != state["baseline_sha"] or payload["scope_digest"] != state["scope_digest"]:
+        raise WorkflowError("investigation baseline or scope mismatch")
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        raise WorkflowError("investigation must contain evidence")
+    evidence_ids = [item.get("id") for item in evidence if isinstance(item, dict)]
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise WorkflowError("investigation evidence ids must be unique")
+    if any(not valid_scope_id(item.get("scope_id")) for item in evidence):
+        raise WorkflowError("investigation evidence has an invalid scope id")
+    finding_ids = [item.get("id") for item in payload.get("findings", []) if isinstance(item, dict)]
+    if len(finding_ids) != len(set(finding_ids)):
+        raise WorkflowError("investigation finding ids must be unique")
+    known = set(evidence_ids)
+    for finding in payload.get("findings", []):
+        if not valid_scope_id(finding.get("scope_id")):
+            raise WorkflowError(f"finding {finding.get('id')} has an invalid scope id")
+        if not set(finding.get("evidence_ids", [])).issubset(known):
+            raise WorkflowError(f"finding {finding.get('id')} cites unknown evidence")
+        if finding.get("lane") == "STOP_THE_LINE" and finding.get("evidence_status") not in {
+            "VERIFIED", "STRONGLY_INFERRED"
+        }:
+            raise WorkflowError("STOP_THE_LINE requires verified or strongly inferred evidence")
+
+
+def validate_integration(payload: dict[str, Any], state: dict[str, Any], slot: str, round_number: int) -> None:
+    if set(payload) != set(INTEGRATION_SCHEMA["required"]):
+        raise WorkflowError("integrated draft fields do not match the contract")
+    assignment = f"cross-{slot}" if round_number == 2 else f"diverge-{slot}"
+    provider = assignment_provider(state, assignment, state["planners"][slot])
+    if (payload["provider"] != provider or payload["slot"] != slot
+            or payload["reviewer_slot"] != slot or payload["round"] != round_number):
+        raise WorkflowError("integrated draft identity mismatch")
+    if payload["baseline_sha"] != state["baseline_sha"] or payload["scope_digest"] != state["scope_digest"]:
+        raise WorkflowError("integrated draft baseline or scope mismatch")
+    if not payload["plan_markdown"].strip():
+        raise WorkflowError("integrated draft plan is empty")
+    if payload["verdict"] != "PASS" and not payload["findings"]:
+        raise WorkflowError("a non-PASS integrated review requires findings")
+    dispositions = payload["accepted_finding_ids"] + payload["rejected_finding_ids"]
+    if len(dispositions) != len(set(dispositions)):
+        raise WorkflowError("a finding cannot be both accepted and rejected")
+    unknown = set(dispositions) - set(state.get("finding_ledger", {}))
+    if unknown:
+        raise WorkflowError(f"integrated draft dispositions cite unknown finding keys: {sorted(unknown)}")
+    for finding in payload["new_findings"]:
+        if not valid_scope_id(finding.get("scope_id")):
+            raise WorkflowError(f"new finding {finding.get('id')} has an invalid scope id")
 
 
 def validate_review(
@@ -1075,6 +1273,15 @@ def validate_ready_invariants(state: dict[str, Any]) -> None:
         raise WorkflowError(f"planning run is not ready: {state.get('status')}")
     if set(state.get("drafts", {})) != {"A", "B"}:
         raise WorkflowError("READY invariant failed: both drafts are required")
+    if set(state.get("investigations", {})) != {"A", "B"}:
+        raise WorkflowError("READY invariant failed: both investigations are required")
+    if set(state.get("draft_rounds", {}).get("2", {})) != {"A", "B"}:
+        raise WorkflowError("READY invariant failed: both draft_02 integrations are required")
+    if state.get("planning_depth") == "deep":
+        if set(state.get("draft_rounds", {}).get("3", {})) != {"A", "B"}:
+            raise WorkflowError("READY invariant failed: both draft_03 plans are required")
+        if set(state.get("convergence_reviews", {})) != {"A", "B"}:
+            raise WorkflowError("READY invariant failed: deep mode convergence round one is incomplete")
     if set(state.get("cross_reviews", {})) != {"A", "B"}:
         raise WorkflowError("READY invariant failed: mutual cross-review is incomplete")
     candidate = state.get("candidate") or {}
@@ -1131,7 +1338,12 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
     base = [sys.executable, str(Path(__file__).resolve())]
     common = ["--project", state["project"], "--run-id", state["run_id"]]
     status = state["status"]
-    if status in {"INITIALIZED", "DRAFTING"}:
+    if status in {"INITIALIZED", "INVESTIGATING"}:
+        slot = incomplete_slot("investigation", ("A", "B"), state["investigations"])
+        command = [*base, "investigate", *common, "--slot", slot]
+        return {"kind": "RUN_AGENT", "stage": "investigate", "slot": slot, "command": command,
+                "preview_command": [*command, "--dry-run"]}
+    if status in {"EVIDENCE_READY", "DRAFTING"}:
         slot = incomplete_slot("draft", ("A", "B"), state["drafts"])
         command = [*base, "draft", *common, "--slot", slot]
         return {"kind": "RUN_AGENT", "stage": "draft", "slot": slot, "command": command,
@@ -1141,10 +1353,20 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
         command = [*base, "cross-review", *common, "--slot", slot]
         return {"kind": "RUN_AGENT", "stage": "cross-review", "slot": slot, "command": command,
                 "preview_command": [*command, "--dry-run"]}
+    if status in {"DIVERGENCE_REQUIRED", "DIVERGING"}:
+        slot = incomplete_slot("divergent draft", ("A", "B"), state["draft_rounds"]["3"])
+        command = [*base, "diverge", *common, "--slot", slot]
+        return {"kind": "RUN_AGENT", "stage": "diverge", "slot": slot, "command": command,
+                "preview_command": [*command, "--dry-run"]}
     if status == "SYNTHESIS_REQUIRED":
         return {"kind": "HOST_SYNTHESIS", "stage": "synthesis",
                 "command": [*base, "synthesis-context", *common],
                 "requires": ["implementation_plan.md", "batches.md"]}
+    if status in {"CONVERGENCE_REVIEW_REQUIRED", "CONVERGENCE_REVIEWING"}:
+        slot = incomplete_slot("convergence-review", ("A", "B"), state["convergence_reviews"])
+        command = [*base, "convergence-review", *common, "--reviewer", slot]
+        return {"kind": "RUN_AGENT", "stage": "convergence-review", "slot": slot,
+                "command": command, "preview_command": [*command, "--dry-run"]}
     if status in {"FINAL_REVIEW_REQUIRED", "FINAL_REVIEWING"}:
         required = required_final_reviewers(state)
         slot = incomplete_slot("final-review", required, state["final_reviews"])
@@ -1243,10 +1465,23 @@ def command_init(args: argparse.Namespace) -> None:
     root = run_directory(project, run_id)
     if root.exists():
         raise WorkflowError(f"run directory already exists: {root}")
-    for relative in ("input", "drafts", "cross_reviews", "synthesis", "final_reviews", "decisions", "invocations", "worktrees"):
+    for relative in ("input", "investigations", "drafts", "cross_reviews", "synthesis", "convergence_reviews", "final_reviews", "decisions", "invocations", "worktrees"):
         (root / relative).mkdir(parents=True, exist_ok=True, mode=0o700)
     request_snapshot = root / "input" / "request.md"
     shutil.copyfile(request, request_snapshot)
+    scope_contract = root / "input" / "scope_contract.json"
+    atomic_json(scope_contract, {
+        "objective_id": "TARGET-001",
+        "objective_source": "request.md",
+        "objective_sha256": sha256_file(request_snapshot),
+        "in_scope_rule": "Only work required to satisfy the frozen request and recorded user decisions.",
+        "support_classes": ["TARGET", "REQUIRED_SUPPORT", "EVIDENCE_ONLY"],
+        "extension_classes": ["PROPOSED_EXTENSION", "OUT_OF_SCOPE"],
+        "extension_rule": "PROPOSED_EXTENSION requires a typed user decision before entering the plan.",
+    })
+    scope_digest = sha256_file(scope_contract)
+    finding_ledger_path = root / "input" / "finding_ledger.json"
+    atomic_json(finding_ledger_path, {"findings": {}})
     # One checkout, shared by both slots and by the final reviewers. See reviewer_worktree.
     worktree = root / "worktrees" / "baseline"
     result = run(
@@ -1263,6 +1498,12 @@ def command_init(args: argparse.Namespace) -> None:
         "project": str(project),
         "baseline_sha": baseline,
         "request_snapshot": str(request_snapshot),
+        "scope_contract": str(scope_contract),
+        "scope_digest": scope_digest,
+        "finding_ledger_path": str(finding_ledger_path),
+        "finding_ledger": {},
+        "planning_depth": args.planning_depth,
+        "research_policy": args.research_policy,
         "planners": topology,
         "provider_diversity": len(set(topology.values())) > 1,
         "model_diversity": model_diversity(topology, runtime),
@@ -1270,8 +1511,12 @@ def command_init(args: argparse.Namespace) -> None:
         "final_reviewer": args.final_reviewer,
         "worktree": str(worktree),
         "status": "INITIALIZED",
+        "investigations": {},
         "drafts": {},
+        "draft_rounds": {"1": {}, "2": {}, "3": {}},
         "cross_reviews": {},
+        "convergence_reviews": {},
+        "convergence_round_one_complete": False,
         "synthesis_submissions": 0,
         "extra_synthesis_grants": 0,
         "extra_invocation_grants": {},
@@ -1285,37 +1530,92 @@ def command_init(args: argparse.Namespace) -> None:
         "revision": 0,
     }
     record_artifact(state, "request", request_snapshot)
+    record_artifact(state, "scope-contract", scope_contract)
+    record_artifact(state, "finding-ledger", finding_ledger_path)
     save_state(state)
     emit({
         "status": state["status"], "run_id": run_id, "run_directory": str(root),
         "planners": topology, "final_reviewer": args.final_reviewer,
         "provider_diversity": state["provider_diversity"],
         "model_diversity": state["model_diversity"], "agent_runtime": runtime,
+        "planning_depth": state["planning_depth"], "research_policy": state["research_policy"],
         "next_action": next_action(state),
     })
+
+
+def command_investigate(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id)
+    slot = args.slot
+    if state["status"] not in {"INITIALIZED", "INVESTIGATING"}:
+        raise WorkflowError(f"investigate is not allowed from {state['status']}")
+    if slot in state["investigations"] and not args.dry_run:
+        raise WorkflowError(f"slot {slot} already completed investigation")
+    provider = assignment_provider(state, f"investigate-{slot}", state["planners"][slot])
+    web_rule = (
+        "When repository evidence is insufficient, you MAY use only the upstream project's official "
+        "documentation or official GitHub repository. Record the exact URL, retrieval time, version/tag/commit "
+        "and a content digest. Search snippets and third-party summaries are discovery leads, never evidence."
+        if state["research_policy"] == "authoritative-web" else
+        "Do not use external network sources in this run; mark claims UNRESOLVED when the repository cannot establish them."
+    )
+    prompt = (
+        "You are independent evidence investigator {slot}. Read {context}/request.md and "
+        "{context}/scope_contract.json, then inspect the complete relevant repository surface at baseline {sha}. "
+        "Do not draft or edit the solution yet. Establish what is true. Every claim and finding must map to a scope id; "
+        "anything outside the frozen objective is OUT_OF_SCOPE or a PROPOSED_EXTENSION and must not enter the plan. "
+        "Trace symptoms to root cause where evidence permits; label hypotheses honestly. Rank first by scope gate, then "
+        "user priority, severity, urgency, dependency/blocking effect, causal leverage, evidence strength, and effort. "
+        "Keep verification priority separate from solution priority. {web_rule} Return only schema JSON with "
+        "provider={provider}, slot={slot}, baseline_sha={sha}, scope_digest={scope_digest}."
+        + DELIVERY_CONTRACT
+    ).format(slot=slot, provider=provider, sha=state["baseline_sha"],
+             scope_digest=state["scope_digest"], web_rule=web_rule, context="{context}")
+    payload = invoke(
+        state, f"investigate-{slot}", provider, slot,
+        {"request.md": Path(state["request_snapshot"]),
+         "scope_contract.json": Path(state["scope_contract"])},
+        INVESTIGATION_SCHEMA, prompt, args.timeout, args.dry_run,
+    )
+    if args.dry_run:
+        emit({"status": "INVESTIGATION_DRY_RUN", **payload})
+    validate_investigation(payload, state, slot)
+    path = Path(state["run_directory"]) / "investigations" / f"{slot}.json"
+    atomic_json(path, payload)
+    record_artifact(state, f"investigation-{slot}", path)
+    record_findings(state, payload["findings"], f"investigation-{slot}")
+    state["investigations"][slot] = {"provider": provider, "path": str(path)}
+    state["status"] = "EVIDENCE_READY" if set(state["investigations"]) == {"A", "B"} else "INVESTIGATING"
+    save_state(state)
+    emit({"status": state["status"], "run_id": state["run_id"], "slot": slot,
+          "investigation": str(path)})
 
 
 def command_draft(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     state = load_state(project, args.run_id)
     slot = args.slot
-    if state["status"] not in {"INITIALIZED", "DRAFTING"}:
+    if state["status"] not in {"EVIDENCE_READY", "DRAFTING"}:
         raise WorkflowError(f"draft is not allowed from {state['status']}")
     if slot in state["drafts"] and not args.dry_run:
         raise WorkflowError(f"slot {slot} already produced a draft")
     provider = assignment_provider(state, f"draft-{slot}", state["planners"][slot])
     prompt = (
-        "You are independent planning instance {slot}. Read {context}/request.md and inspect the "
-        "repository at the assigned baseline. You cannot see the other planner's work. Verify factual "
-        "claims against named files, symbols, tests, or commands. Separate VERIFIED facts from INFERRED "
-        "or UNRESOLVED claims. Produce a detailed implementation plan with finite batch boundaries, "
+        "You are independent planning instance {slot}. Read {context}/request.md, {context}/scope_contract.json, "
+        "and only your own independently produced {context}/investigation.json. Inspect the repository as needed; "
+        "you cannot see the other planner's work. Use evidence ids and preserve uncertainty. Produce a detailed "
+        "implementation plan ordered by the frozen priority rules, with root-cause-driven solutions, finite batch boundaries, "
         "dependencies, budget-sensitive retry limits, and decidable acceptance observations. Do not edit "
         "the repository. Return only JSON matching the supplied schema. Set provider={provider}, slot={slot}, "
-        "and baseline_sha={sha}."
+        "baseline_sha={sha}, and scope_digest={scope_digest}."
         + DELIVERY_CONTRACT
-    ).format(slot=slot, provider=provider, sha=state["baseline_sha"], context="{context}")
+    ).format(slot=slot, provider=provider, sha=state["baseline_sha"],
+             scope_digest=state["scope_digest"], context="{context}")
     payload = invoke(
-        state, f"draft-{slot}", provider, slot, {"request.md": Path(state["request_snapshot"])},
+        state, f"draft-{slot}", provider, slot,
+        {"request.md": Path(state["request_snapshot"]),
+         "scope_contract.json": Path(state["scope_contract"]),
+         "investigation.json": Path(state["investigations"][slot]["path"])},
         DRAFT_SCHEMA, prompt, args.timeout, args.dry_run,
     )
     if args.dry_run:
@@ -1328,6 +1628,7 @@ def command_draft(args: argparse.Namespace) -> None:
     record_artifact(state, f"draft-{slot}-json", path)
     record_artifact(state, f"draft-{slot}-md", markdown)
     state["drafts"][slot] = {"provider": provider, "path": str(path), "markdown": str(markdown)}
+    state["draft_rounds"]["1"][slot] = state["drafts"][slot]
     state["status"] = "DRAFTS_READY" if set(state["drafts"]) == {"A", "B"} else "DRAFTING"
     save_state(state)
     emit({"status": state["status"], "run_id": state["run_id"], "slot": slot, "draft": str(markdown)})
@@ -1345,19 +1646,30 @@ def command_cross_review(args: argparse.Namespace) -> None:
     provider = assignment_provider(state, f"cross-{slot}", state["planners"][slot])
     target = f"draft-{target_slot}"
     prompt = (
-        "You are independent reviewer slot {slot}. Read {context}/request.md, the other planner's "
+        "You are independent reviewer and integrator slot {slot}, producing draft_02. Read {context}/request.md, "
+        "{context}/scope_contract.json, {context}/finding_ledger.json, your own investigation and draft, and the other planner's "
         "plan at {context}/target_plan.md, and its claims at {context}/target_claims.json (the same "
         "draft, split so the plan is readable prose rather than one escaped JSON string). Read the "
         "plan IN FULL, in parts if your reader truncates it, before judging it. Then inspect the "
-        "repository at baseline {sha}. Do not assume agreement "
+        "repository at baseline {sha}. Re-verify material claims; do not assume agreement "
         "means truth: verify claims against repository evidence. Find factual errors, missing dependencies, "
         "unbounded budgets, non-decidable acceptance conditions, unsafe scope, and incompatibilities. P0/P1 "
-        "mean the draft cannot safely guide implementation; P2 is advisory. Do not edit files. Return only "
-        "schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, baseline_sha={sha}."
+        "mean the draft cannot safely guide implementation; P2/P3 are advisory. Integrate every supported useful "
+        "part into a complete plan, explicitly disposition known stable F-* ledger keys, and return any genuinely new "
+        "finding in full solution form so the workflow can fingerprint it. Reject scope extensions. This round "
+        "is divergent: add missing in-scope causal, failure-path, alternative, and verification coverage, never a new "
+        "objective. Do not edit files. Return only schema JSON with provider={provider}, slot={slot}, "
+        "reviewer_slot={slot}, target={target}, round=2, baseline_sha={sha}, scope_digest={scope_digest}."
         + DELIVERY_CONTRACT
-    ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"], context="{context}")
+    ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
+             scope_digest=state["scope_digest"], context="{context}")
     context_files = {
         "request.md": Path(state["request_snapshot"]),
+        "scope_contract.json": Path(state["scope_contract"]),
+        "finding_ledger.json": Path(state["finding_ledger_path"]),
+        "own_investigation.json": Path(state["investigations"][slot]["path"]),
+        "peer_investigation.json": Path(state["investigations"][target_slot]["path"]),
+        "own_plan.md": Path(state["drafts"][slot]["markdown"]),
         **split_draft_for_review(state, target_slot),
     }
     for index, decision in enumerate(sorted((Path(state["run_directory"]) / "decisions").glob("*.json")), 1):
@@ -1365,26 +1677,79 @@ def command_cross_review(args: argparse.Namespace) -> None:
     payload = invoke(
         state, f"cross-{slot}", provider, slot,
         context_files,
-        REVIEW_SCHEMA, prompt, args.timeout, args.dry_run,
+        INTEGRATION_SCHEMA, prompt, args.timeout, args.dry_run,
     )
     if args.dry_run:
         emit({"status": "CROSS_REVIEW_DRY_RUN", **payload})
-    validate_review(payload, state, provider, slot, target)
+    validate_integration(payload, state, slot, 2)
     path = Path(state["run_directory"]) / "cross_reviews" / f"{slot}_reviews_{target_slot}.json"
     atomic_json(path, payload)
+    markdown = Path(state["run_directory"]) / "drafts" / f"round_2_{slot}.md"
+    markdown.write_text(payload["plan_markdown"].rstrip() + "\n", encoding="utf-8")
     record_artifact(state, f"cross-{slot}", path)
+    record_artifact(state, f"draft-2-{slot}-md", markdown)
+    record_findings(state, payload["new_findings"], f"draft-02-{slot}")
     state["cross_reviews"][slot] = {"target": target_slot, "verdict": payload["verdict"], "path": str(path)}
+    state["draft_rounds"]["2"][slot] = {"provider": provider, "path": str(path), "markdown": str(markdown)}
     if payload["verdict"] == "NEEDS_USER_DECISION":
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
             "type": "PLANNING_BOUNDARY", "source": f"cross-{slot}", "created_at": utc_now(),
         }
     elif set(state["cross_reviews"]) == {"A", "B"}:
-        state["status"] = "SYNTHESIS_REQUIRED"
+        state["status"] = "DIVERGENCE_REQUIRED" if state["planning_depth"] == "deep" else "SYNTHESIS_REQUIRED"
     else:
         state["status"] = "CROSS_REVIEWING"
     save_state(state)
     emit({"status": state["status"], "run_id": state["run_id"], "review": str(path), "verdict": payload["verdict"]})
+
+
+def command_diverge(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id)
+    slot = args.slot
+    if state["planning_depth"] != "deep" or state["status"] not in {"DIVERGENCE_REQUIRED", "DIVERGING"}:
+        raise WorkflowError(f"diverge is not allowed from {state['status']}")
+    if slot in state["draft_rounds"]["3"] and not args.dry_run:
+        raise WorkflowError(f"slot {slot} already produced draft_03")
+    provider = assignment_provider(state, f"diverge-{slot}", state["planners"][slot])
+    target = "draft-02-both"
+    prompt = (
+        "You are independent deep-planning slot {slot}, producing divergent draft_03. Read the frozen request, "
+        "scope contract, stable finding ledger, both investigations, and both draft_02 plans. Re-check repository evidence before accepting "
+        "a claim. Mine only in-scope omissions: deeper causal chains, failure paths, required support, alternatives, "
+        "and verification. Novelty without a scope id or evidentiary effect must be rejected. Do not broaden the user "
+        "objective. Preserve priority order and explicitly disposition stable F-* ledger keys; return a genuinely new "
+        "finding in full solution form. Return schema JSON with "
+        "provider={provider}, slot={slot}, reviewer_slot={slot}, target={target}, round=3, baseline_sha={sha}, "
+        "scope_digest={scope_digest}." + DELIVERY_CONTRACT
+    ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
+             scope_digest=state["scope_digest"])
+    context_files = {
+        "request.md": Path(state["request_snapshot"]),
+        "scope_contract.json": Path(state["scope_contract"]),
+        "finding_ledger.json": Path(state["finding_ledger_path"]),
+        "investigation_A.json": Path(state["investigations"]["A"]["path"]),
+        "investigation_B.json": Path(state["investigations"]["B"]["path"]),
+        "draft_02_A.md": Path(state["draft_rounds"]["2"]["A"]["markdown"]),
+        "draft_02_B.md": Path(state["draft_rounds"]["2"]["B"]["markdown"]),
+    }
+    payload = invoke(state, f"diverge-{slot}", provider, slot, context_files,
+                     INTEGRATION_SCHEMA, prompt, args.timeout, args.dry_run)
+    if args.dry_run:
+        emit({"status": "DIVERGENCE_DRY_RUN", **payload})
+    validate_integration(payload, state, slot, 3)
+    path = Path(state["run_directory"]) / "drafts" / f"round_3_{slot}.json"
+    markdown = Path(state["run_directory"]) / "drafts" / f"round_3_{slot}.md"
+    atomic_json(path, payload)
+    markdown.write_text(payload["plan_markdown"].rstrip() + "\n", encoding="utf-8")
+    record_artifact(state, f"draft-3-{slot}-json", path)
+    record_artifact(state, f"draft-3-{slot}-md", markdown)
+    record_findings(state, payload["new_findings"], f"draft-03-{slot}")
+    state["draft_rounds"]["3"][slot] = {"provider": provider, "path": str(path), "markdown": str(markdown)}
+    state["status"] = "SYNTHESIS_REQUIRED" if set(state["draft_rounds"]["3"]) == {"A", "B"} else "DIVERGING"
+    save_state(state)
+    emit({"status": state["status"], "run_id": state["run_id"], "slot": slot, "draft": str(markdown)})
 
 
 def command_synthesis_context(args: argparse.Namespace) -> None:
@@ -1398,9 +1763,11 @@ def command_synthesis_context(args: argparse.Namespace) -> None:
     assignment.write_text(
         "# Host synthesis assignment\n\n"
         f"Baseline: `{state['baseline_sha']}`\n\n"
-        "Read the frozen request, both independent drafts, and both cross-reviews. Resolve claims by "
+        "Read the frozen request, scope contract, both investigations, every completed draft round, and reviews. Resolve claims by "
         "repository evidence rather than vote count. Preserve material disagreements and unresolved product "
-        "choices. Produce `implementation_plan.md` and `batches.md`. The plan must distinguish proposed plan "
+        "choices. Scope-lock every item to the frozen objective, preserve priority order, and record each material "
+        "finding as problem, evidence, root cause, affected surfaces, solution/tradeoffs, and verification. Produce "
+        "`implementation_plan.md` and `batches.md`. The plan must distinguish proposed plan "
         "items from future Git commits; each batch needs a finite, decidable exit observation. Do not implement.\n",
         encoding="utf-8",
     )
@@ -1411,10 +1778,15 @@ def command_synthesis_context(args: argparse.Namespace) -> None:
     emit({
         "status": "SYNTHESIS_REQUIRED", "run_id": state["run_id"], "assignment": str(assignment),
         "request": state["request_snapshot"],
+        "scope_contract": state["scope_contract"],
+        "finding_ledger": state["finding_ledger_path"],
+        "investigations": {key: value["path"] for key, value in state["investigations"].items()},
         "drafts": {key: value["path"] for key, value in state["drafts"].items()},
+        "draft_rounds": state["draft_rounds"],
         "cross_reviews": {key: value["path"] for key, value in state["cross_reviews"].items()},
         "decisions": decisions,
         "previous_final_reviews": previous_final_reviews,
+        "previous_convergence_reviews": {key: value["path"] for key, value in state["convergence_reviews"].items()},
         "output_directory": str(root),
     })
 
@@ -1437,6 +1809,8 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
     plan_text = plan.read_text(encoding="utf-8")
     batches_text = batches.read_text(encoding="utf-8")
     diagnostics = synthesis_diagnostics(plan_text, batches_text)
+    if "TARGET-001" not in plan_text + "\n" + batches_text:
+        diagnostics["errors"].append("synthesis must map the candidate to frozen scope id TARGET-001")
     if diagnostics["errors"]:
         raise WorkflowError("; ".join(diagnostics["errors"]))
     number = state["synthesis_submissions"] + 1
@@ -1460,7 +1834,11 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
     }
     state["final_reviews"] = {}
     state["pending_decision"] = None
-    state["status"] = "FINAL_REVIEW_REQUIRED"
+    state["status"] = (
+        "CONVERGENCE_REVIEW_REQUIRED"
+        if state["planning_depth"] == "deep" and not state["convergence_round_one_complete"]
+        else "FINAL_REVIEW_REQUIRED"
+    )
     save_state(state)
     emit({"status": state["status"], "run_id": state["run_id"], "candidate": state["candidate"],
           "next_action": next_action(state)})
@@ -1475,6 +1853,69 @@ def command_check_synthesis(args: argparse.Namespace) -> None:
         plan.read_text(encoding="utf-8"), batches.read_text(encoding="utf-8"))
     emit({"status": "SYNTHESIS_VALID" if not diagnostics["errors"] else "SYNTHESIS_INVALID",
           **diagnostics}, code=0 if not diagnostics["errors"] else 2)
+
+
+def command_convergence_review(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id)
+    if state["status"] not in {"CONVERGENCE_REVIEW_REQUIRED", "CONVERGENCE_REVIEWING"}:
+        raise WorkflowError(f"convergence-review is not allowed from {state['status']}")
+    slot = args.reviewer
+    if slot not in {"A", "B"}:
+        raise WorkflowError("convergence reviewer must be A or B")
+    if slot in state["convergence_reviews"] and not args.dry_run:
+        raise WorkflowError(f"convergence reviewer {slot} already completed round one")
+    provider = assignment_provider(state, f"convergence-1-{slot}", state["planners"][slot])
+    target = f"candidate-round-{state['candidate']['round']}"
+    prompt = (
+        "You are convergence reviewer ({slot}), round one of exactly two bounded convergence rounds. Read the "
+        "request, scope contract, synthesized plan, batches, and finding evidence. Inspect the repository at "
+        "baseline {sha}. This is not a novelty round: reject new objectives. A new finding is admissible only when "
+        "it is in scope, materially affects correctness/safety/verification, cites evidence, and states root cause or "
+        "honest uncertainty. Check that high-priority findings have dispositions and that priority changes are "
+        "evidence-backed. PASS means no supported P0/P1 defect remains; it does not claim consensus or certainty. "
+        "Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, baseline_sha={sha}."
+        + DELIVERY_CONTRACT
+    ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"])
+    context_files = {
+        "request.md": Path(state["request_snapshot"]),
+        "scope_contract.json": Path(state["scope_contract"]),
+        "finding_ledger.json": Path(state["finding_ledger_path"]),
+        "implementation_plan.md": Path(state["candidate"]["plan"]),
+        "batches.md": Path(state["candidate"]["batch_manifest"]),
+        "investigation_A.json": Path(state["investigations"]["A"]["path"]),
+        "investigation_B.json": Path(state["investigations"]["B"]["path"]),
+    }
+    payload = invoke(state, f"convergence-1-{slot}", provider, slot, context_files,
+                     REVIEW_SCHEMA, prompt, args.timeout, args.dry_run)
+    if args.dry_run:
+        emit({"status": "CONVERGENCE_REVIEW_DRY_RUN", **payload})
+    validate_review(payload, state, provider, slot, target)
+    path = Path(state["run_directory"]) / "convergence_reviews" / f"round_1_{slot}.json"
+    atomic_json(path, payload)
+    record_artifact(state, f"convergence-1-{slot}", path)
+    state["convergence_reviews"][slot] = {
+        "provider": provider, "verdict": payload["verdict"], "path": str(path),
+        "candidate_sha256": state["candidate"]["plan_sha256"],
+    }
+    verdicts = [item["verdict"] for item in state["convergence_reviews"].values()]
+    if "NEEDS_USER_DECISION" in verdicts:
+        state["status"] = "NEEDS_USER_DECISION"
+        state["pending_decision"] = {"type": "CONVERGENCE_BOUNDARY", "created_at": utc_now()}
+    elif set(state["convergence_reviews"]) == {"A", "B"}:
+        state["convergence_round_one_complete"] = True
+        if all(verdict == "PASS" for verdict in verdicts):
+            state["status"] = "FINAL_REVIEW_REQUIRED"
+        elif state["synthesis_submissions"] < MAX_SYNTHESIS_SUBMISSIONS + state.get("extra_synthesis_grants", 0):
+            state["status"] = "SYNTHESIS_REQUIRED"
+        else:
+            state["status"] = "NEEDS_USER_DECISION"
+            state["pending_decision"] = {"type": "CONVERGENCE_BUDGET_EXHAUSTED", "created_at": utc_now()}
+    else:
+        state["status"] = "CONVERGENCE_REVIEWING"
+    save_state(state)
+    emit({"status": state["status"], "run_id": state["run_id"], "verdict": payload["verdict"],
+          "review": str(path)})
 
 
 def command_final_review(args: argparse.Namespace) -> None:
@@ -1503,6 +1944,8 @@ def command_final_review(args: argparse.Namespace) -> None:
     ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"], context="{context}")
     context_files = {
         "request.md": Path(state["request_snapshot"]),
+        "scope_contract.json": Path(state["scope_contract"]),
+        "finding_ledger.json": Path(state["finding_ledger_path"]),
         "implementation_plan.md": Path(state["candidate"]["plan"]),
         "batches.md": Path(state["candidate"]["batch_manifest"]),
     }
@@ -1549,6 +1992,9 @@ def command_final_review(args: argparse.Namespace) -> None:
                 f"- Provider diversity: `{str(state['provider_diversity']).lower()}`\n"
                 f"- Model diversity: `{str(state.get('model_diversity', False)).lower()}`\n"
                 f"- Agent runtime: `{json.dumps(state.get('agent_runtime', {}), sort_keys=True)}`\n"
+                f"- Planning depth: `{state.get('planning_depth', 'standard')}`\n"
+                f"- Research policy: `{state.get('research_policy', 'local-only')}`\n"
+                f"- Scope contract SHA-256: `{state.get('scope_digest', '')}`\n"
                 + independence_section(state)
                 + f"- Final reviewer selection: `{state['final_reviewer']}`\n"
                 f"- Synthesis submissions: `{state['synthesis_submissions']}`\n"
@@ -1781,10 +2227,17 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--request", required=True)
     init.add_argument("--backend", choices=["auto", "mixed", *SUPPORTED_PROVIDERS], default="auto")
     init.add_argument("--final-reviewer", choices=["both", *SUPPORTED_PROVIDERS], required=True)
+    init.add_argument(
+        "--planning-depth", choices=["standard", "deep"], default="standard",
+        help="standard stops after draft_02; deep adds draft_03 and an extra convergence review")
+    init.add_argument(
+        "--research-policy", choices=["local-only", "authoritative-web"], default="local-only",
+        help="allow investigation agents to consult only official docs/GitHub when local evidence is insufficient")
     add_codex_selection(init)
     init.set_defaults(func=command_init)
 
-    for name, function in (("draft", command_draft), ("cross-review", command_cross_review)):
+    for name, function in (("investigate", command_investigate), ("draft", command_draft),
+                           ("cross-review", command_cross_review), ("diverge", command_diverge)):
         command = commands.add_parser(name)
         command.add_argument("--project", required=True)
         command.add_argument("--run-id", required=True)
@@ -1818,6 +2271,14 @@ def build_parser() -> argparse.ArgumentParser:
     final_review.add_argument("--timeout", type=int, default=1800)
     final_review.add_argument("--dry-run", action="store_true")
     final_review.set_defaults(func=command_final_review)
+
+    convergence_review = commands.add_parser("convergence-review")
+    convergence_review.add_argument("--project", required=True)
+    convergence_review.add_argument("--run-id", required=True)
+    convergence_review.add_argument("--reviewer", choices=["A", "B"], required=True)
+    convergence_review.add_argument("--timeout", type=int, default=1800)
+    convergence_review.add_argument("--dry-run", action="store_true")
+    convergence_review.set_defaults(func=command_convergence_review)
 
     adjudicate = commands.add_parser("adjudicate")
     adjudicate.add_argument("--project", required=True)

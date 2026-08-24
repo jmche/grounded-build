@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.2.0
+  version: 0.3.0
   compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude or Codex CLI adapter
 ---
 
@@ -24,6 +24,10 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
 - Preserve the original branch, index, checkout, and files until explicitly approved final integration.
 - A CLI adapter is not a model identity. Record `agent_runtime`, `provider_diversity`, and `model_diversity` exactly as reported. Codex may run GPT, DeepSeek, or another configured model.
 - Agreement is not evidence. Bind claims to files, symbols, tests, commands, or authoritative sources.
+- Freeze scope before investigation. Divergence may widen evidence, causal analysis, failure-path coverage,
+  alternatives, and verification, but never the user-authorized objective.
+- Order work by scope gate, user priority, severity, urgency, blockers/dependencies, causal leverage,
+  evidence strength, then effort. Do not promote or demote a finding without new evidence.
 - Infrastructure failure, malformed output, timeout, or quota exhaustion is not a quality FAIL.
 - Stop at every typed user decision and at implementation approval. Never infer authority from plan approval.
 
@@ -52,12 +56,28 @@ These options support both normal GPT-backed Codex and Codex configured for an O
 
 ### 2. Freeze request and initialize
 
-Write the objective, constraints, exclusions, and known decisions to a local Markdown request file. Use `final-reviewer=both` by default for independently verified planning; use one adapter only when requested or when cost/availability requires it.
+Write the objective, constraints, exclusions, priorities, success conditions, and known decisions to a local
+Markdown request file. Use `final-reviewer=both` by default for independently verified planning; use one
+adapter only when requested or when cost/availability requires it.
+
+Choose the planning depth explicitly:
+
+- `standard` (default): two independent investigations, two independent `draft_01` plans, two mutual
+  evidence-checked integrations (`draft_02`), host synthesis, and final review.
+- `deep`: all standard evidence work, then two additional divergent `draft_03` plans, host synthesis,
+  convergence review round one, and final review as convergence round two. Deep mode is bounded and is
+  never selected silently.
+
+External research is off by default. Select `authoritative-web` only when local evidence may be insufficient;
+investigators may then use official project documentation or the official GitHub repository. Search snippets
+and third-party summaries are never evidence.
 
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py init \
   --project <project> --request <request.md> \
   --backend <backend> --final-reviewer <both|claude|codex> \
+  --planning-depth <standard|deep> \
+  --research-policy <local-only|authoritative-web> \
   [Codex selection options from preflight]
 ```
 
@@ -76,6 +96,13 @@ python3 <skill-root>/scripts/plan_workflow.py next \
 - For `STOP_FOR_IMPLEMENTATION_APPROVAL`, export and stop.
 
 Repeat `next` after each completed action. Do not guess a slot, reviewer, phase, or retry.
+
+Every investigation finding must state its scope id, severity (`P0`–`P3`), urgency (`U0`–`U3`),
+priority lane, evidence status, problem, evidence ids, root-cause status and causal chain, affected surfaces,
+recommended solution, alternatives/tradeoffs, and verification. Keep unresolved claims visible. A bounded
+convergence run guarantees an honest terminal state or typed user decision—not consensus or correctness.
+The workflow computes stable `F-*` fingerprints from scope, problem, and causal chain; later rounds must
+dispose those ledger keys and must submit genuinely new findings in full solution form.
 
 Before submitting synthesis, run:
 

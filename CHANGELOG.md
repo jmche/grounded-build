@@ -2,6 +2,18 @@
 
 All notable changes use semantic versioning.
 
+## [0.3.0] - 2026-08-24
+
+- Made two independent evidence investigations a hard prerequisite for drafting.
+- Added standard and explicit deep planning modes. Deep mode adds two `draft_03` plans and an extra
+  convergence review, while all loops remain bounded.
+- Froze a scope contract and prohibited divergent rounds from widening the user-authorized objective.
+- Added structured evidence states, severity/urgency lanes, root-cause chains, solution-form findings,
+  authoritative-source provenance, and evidence-backed priority ordering.
+- Added opt-in official web research for investigation calls only; local-only remains the default.
+- Added state-machine and regression coverage for investigation gates, web policy, deep divergence, and
+  both convergence rounds.
+
 ## [0.2.0] - 2026-08-22
 
 - Added a deterministic `next` action protocol so GPT, DeepSeek, Claude, and other host models do

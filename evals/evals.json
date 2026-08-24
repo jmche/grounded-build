@@ -4,13 +4,26 @@
     {
       "id": 1,
       "prompt": "Use grounded-build to create a plan for replacing this repository's physical attempt_N rollback copies with auditable Git history. Claude and Codex are both available; Codex must perform final review. Do not implement.",
-      "expected_output": "The host selects Plan mode, freezes the request and Git SHA, obtains isolated Claude/Codex drafts and mutual cross-reviews, synthesizes evidence-backed plan and batch artifacts, runs a fresh Codex final review, and stops for user approval.",
+      "expected_output": "The host selects Plan mode, freezes the request, scope contract, and Git SHA, obtains independent Claude/Codex investigations before draft_01, produces mutual evidence-checked draft_02 integrations, synthesizes plan and batch artifacts, runs a fresh Codex final review, and stops for user approval.",
       "files": [],
       "assertions": [
         "Planning does not create an implementation branch or modify the original checkout.",
         "The two initial drafts cannot see one another.",
+        "Neither initial draft can run before both independent investigations complete.",
         "Repository claims cite named evidence rather than agent agreement.",
         "Implementation does not begin without explicit approval."
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "Use grounded-build deep planning for this high-risk defect. If the repository is insufficient, consult only the upstream official docs or GitHub. Do not expand beyond my requested defect.",
+      "expected_output": "The host explicitly selects deep and authoritative-web policies, runs two independent investigations, draft_01, two divergent integrated draft_02 plans, two draft_03 gap-mining plans, then two bounded convergence rounds without expanding scope.",
+      "files": [],
+      "assertions": [
+        "External sources include exact URL, retrieval time, version or commit, digest, and supported claim.",
+        "Search snippets and third-party summaries are not treated as evidence.",
+        "Every finding maps to the frozen scope and stable finding ledger.",
+        "The workflow reaches READY, a typed user decision, or a bounded terminal state without an unbounded review loop."
       ]
     },
     {
