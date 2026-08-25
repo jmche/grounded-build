@@ -1476,11 +1476,18 @@ def reviewer_command(
         schema_text = json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
         dsh_prompt = (
             prompt
-            + "\n\nOUTPUT CONTRACT. Reply with ONLY a single JSON object matching this schema "
-            + "exactly: no prose, no markdown code fences, and nothing before or after the object.\n"
+            + "\n\nOUTPUT CONTRACT. The deliverable of this review is the single JSON object "
+            + "matching the schema below. Your task is NOT complete until you have emitted it. "
+            + "Before your final message, you MUST also write that exact JSON object to the file "
+            + "`.review-out/review.json` (relative to the current working directory) using the "
+            + "Bash tool: `mkdir -p .review-out && cat > .review-out/review.json <<'JSON'` then the "
+            + "object, then a line containing exactly `JSON`. Then, as your FINAL assistant message, "
+            + "reply with ONLY the same single JSON object: no prose, no markdown code fences, and "
+            + "nothing before or after the object. Verify the JSON is complete and valid before "
+            + "stopping; a review that ends without emitting it has failed its task.\n"
             + schema_text
         )
-        return ["env", "DSH_PERMISSION_MODE=read-only", "dsh", "--profile", "headless", dsh_prompt]
+        return ["env", "DSH_PERMISSION_MODE=workspace-write", "dsh", "--profile", "headless", dsh_prompt]
     if reviewer == "codex":
         runtime = runtime or {}
         selection: list[str] = []
