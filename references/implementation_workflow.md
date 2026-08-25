@@ -4,6 +4,18 @@ Execute a user-provided implementation plan without changing the original projec
 
 Use the bundled script for Git, worktrees, state, fixed-SHA review dispatch, and integration. The host agent owns plan interpretation, implementation, tests, and semantic repair.
 
+## Choose and preserve the controller interpreter
+
+Resolve a stable CPython 3.11+ executable before preflight and invoke every command for the run with
+that same absolute path. The bare name `python3` is a PATH lookup and may select a different Conda,
+system, or activated-environment interpreter in a later shell. Preflight reports
+`controller_runtime.command_prefix`; initialization freezes that identity, status reports drift, and
+state-changing commands reject silent interpreter changes. If the PATH-selected interpreter is
+unstable for the repository workload, use a known-good explicit interpreter path. Do not encode one
+machine's `/usr/bin/python3` path as a portable skill requirement.
+
+Examples below use `<controller-python>` for that resolved executable.
+
 ## Inputs
 
 Collect or infer:
@@ -85,7 +97,7 @@ Read `references/reviewer_prompt.md` before initializing or reviewing a run. It 
 Before initializing, inspect the current local baseline:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py preflight \
+<controller-python> <skill-root>/scripts/workflow.py preflight \
   --project <absolute-project-root> \
   --target-branch <branch>
 ```
@@ -124,7 +136,7 @@ Descriptions such as "machine checkable", "robust", "complete", or "sufficiently
 Check existing runs:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py list \
+<controller-python> <skill-root>/scripts/workflow.py list \
   --project <absolute-project-root>
 ```
 
@@ -133,7 +145,7 @@ If a nonterminal active run exists, resume it or ask whether to supersede it. Ne
 Initialize a new run:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py init \
+<controller-python> <skill-root>/scripts/workflow.py init \
   --project <absolute-project-root> \
   --plan <absolute-plan-path> \
   --batch-manifest <absolute-batch-manifest-path> \
@@ -164,7 +176,7 @@ The run also freezes its quality-round, reviewer-invocation, contract-invocation
 Before implementation, run:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py contract-review \
+<controller-python> <skill-root>/scripts/workflow.py contract-review \
   --project <absolute-project-root> \
   --run-id <run-id>
 ```
@@ -176,11 +188,11 @@ A READY contract must cover every declared batch. Each criterion states an evide
 When it returns `NEEDS_USER_DECISION`, present the issues and proposed observations to the user. Record the chosen boundary in a JSON decision file containing `reason` and normalized `criteria`, preview it, then apply it:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py contract-adjudicate \
+<controller-python> <skill-root>/scripts/workflow.py contract-adjudicate \
   --project <absolute-project-root> --run-id <run-id> \
   --decision-file <absolute-json-path>
 
-python3 <skill-root>/scripts/workflow.py contract-adjudicate \
+<controller-python> <skill-root>/scripts/workflow.py contract-adjudicate \
   --project <absolute-project-root> --run-id <run-id> \
   --decision-file <absolute-json-path> --apply
 ```
@@ -194,14 +206,14 @@ Read the returned `run_id` and `implementation_worktree`. Perform every implemen
 Inspect the active run:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py status \
+<controller-python> <skill-root>/scripts/workflow.py status \
   --project <absolute-project-root>
 ```
 
 Inspect a historical run explicitly:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py status \
+<controller-python> <skill-root>/scripts/workflow.py status \
   --project <absolute-project-root> \
   --run-id <run-id>
 ```
@@ -216,8 +228,8 @@ The current script deliberately does not merge or rebase a stale run. Reconcilia
 If status reports `MIGRATION_REQUIRED`, preview and explicitly apply the migration before any mutation:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py migrate --project <project> --run-id <run-id>
-python3 <skill-root>/scripts/workflow.py migrate --project <project> --run-id <run-id> --apply
+<controller-python> <skill-root>/scripts/workflow.py migrate --project <project> --run-id <run-id>
+<controller-python> <skill-root>/scripts/workflow.py migrate --project <project> --run-id <run-id> --apply
 ```
 
 Migration preserves a mode-0600 backup of the prior state, records its digest, labels unverifiable legacy information, and appends a migration event. It never silently invents missing evidence.
@@ -238,7 +250,7 @@ Use small logical commits. The reviewer evaluates the cumulative batch range fro
 ## Run an independent review
 
 ```bash
-python3 <skill-root>/scripts/workflow.py review \
+<controller-python> <skill-root>/scripts/workflow.py review \
   --project <absolute-project-root> \
   --run-id <run-id> \
   --batch <batch-id>
@@ -262,11 +274,11 @@ Every real reviewer call is stored under a unique `round_N/invocation_N/` direct
 If the selected reviewer becomes unavailable—for example, Codex exhausts its token quota—switch subsequent calls without restarting the run:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py change-reviewer \
+<controller-python> <skill-root>/scripts/workflow.py change-reviewer \
   --project <absolute-project-root> --run-id <run-id> \
   --reviewer claude --reason "Codex quota exhausted" --actor <actor>
 
-python3 <skill-root>/scripts/workflow.py change-reviewer \
+<controller-python> <skill-root>/scripts/workflow.py change-reviewer \
   --project <absolute-project-root> --run-id <run-id> \
   --reviewer claude --reason "Codex quota exhausted" --actor <actor> --apply
 ```
@@ -300,12 +312,12 @@ Convergence policy:
 `NEEDS_USER_DECISION` is a typed state, not prose. Read `pending_decision` from status, show its allowed choices, and preview/apply the selected choice:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py adjudicate \
+<controller-python> <skill-root>/scripts/workflow.py adjudicate \
   --project <project> --run-id <run-id> \
   --decision-id <id> --choice <allowed-choice> \
   --reason <reason> --actor <actor>
 
-python3 <skill-root>/scripts/workflow.py adjudicate \
+<controller-python> <skill-root>/scripts/workflow.py adjudicate \
   --project <project> --run-id <run-id> \
   --decision-id <id> --choice <allowed-choice> \
   --reason <reason> --actor <actor> --apply
@@ -322,7 +334,7 @@ Do not repair deferred findings by default. Consider a P2 only when the change i
 The reviewer may return `NEEDS_VERIFICATION` with argv-based requests. The workflow records them without consuming a valid review round. Preview the exact command before execution:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py verify \
+<controller-python> <skill-root>/scripts/workflow.py verify \
   --project <absolute-project-root> --run-id <run-id> \
   --request-id <request-key>
 ```
@@ -331,7 +343,26 @@ After explicit approval, repeat with `--apply`. The default `--network-policy of
 
 Three infrastructure failures exhaust the normal request budget. The workflow then exposes one bounded `GRANT_ONE_VERIFICATION_ATTEMPT` decision; it never consumes a quality-review round. Required final COMMAND criteria cannot be rejected or waived. If their evidence cannot be obtained, the only safe terminal choices are to supersede or abandon the run.
 
-The sandbox uses an environment allowlist, hides the host home, supplies private HOME/TMP locations, exposes the fixed-SHA worktree read-only at `/mnt`, and read-only mounts an explicitly selected interpreter runtime when it lives below the host home. Verification commands must place generated data in `$TMPDIR`, not mutate source files. The sandbox does not inherit SSH, cloud, proxy, or token variables. stdout/stderr are size-limited, mode 0600, hashed, and copied with the evidence manifest into the next reviewer context.
+The sandbox uses an environment allowlist, hides the host home, supplies private HOME/TMP locations,
+exposes the fixed-SHA worktree read-only at `/mnt`, and read-only mounts an explicitly selected
+interpreter runtime when it lives below the host home. Verification commands must place generated
+data in `$TMPDIR`, not mutate source files. The sandbox does not inherit SSH, cloud, proxy, or token
+variables. stdout/stderr are size-limited, mode 0600, hashed, and copied with the evidence manifest
+into the next reviewer context.
+
+Git-ignored environments do not appear in implementation, reviewer, or verification worktrees. This
+is expected, not missing source. For a command whose executable begins `.venv/`, the verifier resolves
+the launcher from `<project>/.venv`, mounts that environment and its interpreter chain read-only, and
+runs it with the fixed-SHA worktree as the current directory. A reviewer manually entering its detached
+worktree therefore cannot rerun `.venv/bin/python ...` directly and must not classify that absence as a
+code failure; use the harness evidence instead.
+
+Preflight reports whether `<project>/.venv/bin/python` exists and whether a uv project is detectable.
+When the environment is absent, the verifier fails with an infrastructure diagnostic before launching
+bubblewrap. It never runs `uv sync` or installs dependencies silently. If the repository uses uv, prepare
+the environment explicitly with its locked, documented workflow before verification. Any future automated
+provisioning must be an explicit apply operation that records the uv version, lock digest, interpreter, and
+network authorization in run-owned state.
 
 If a request is unsafe, unnecessary, or outside authority, preview and apply `--reject-reason <reason>` instead. Rejection is recorded and returned to the reviewer; it is not treated as passing evidence. Verification infrastructure/request cycles do not consume code-review rounds.
 
@@ -340,7 +371,7 @@ If a request is unsafe, unnecessary, or outside authority, preview and apply `--
 After `REVIEW_PASS` and required tests pass:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py accept \
+<controller-python> <skill-root>/scripts/workflow.py accept \
   --project <absolute-project-root> \
   --run-id <run-id> \
   --batch <batch-id> \
@@ -354,7 +385,7 @@ Only the latest registered `PASS` report for the current clean implementation HE
 When the user chooses to abandon an active or stale run in favor of the latest project code:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py supersede \
+<controller-python> <skill-root>/scripts/workflow.py supersede \
   --project <absolute-project-root> \
   --run-id <run-id> \
   --apply
@@ -367,7 +398,7 @@ This preserves its branch, worktrees, reports, and state for audit but releases 
 After the last batch is accepted, the workflow automatically schedules every COMMAND criterion again against the final cumulative SHA. Run each returned request through `verify`. A failure reopens the last batch; all PASS results produce `final_verification=PASS`. If the contract contains no executable criteria, the state records an explicit `NOT_APPLICABLE` reason rather than pretending tests ran. Preview finalization only after this gate closes:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py finalize \
+<controller-python> <skill-root>/scripts/workflow.py finalize \
   --project <absolute-project-root> \
   --run-id <run-id>
 ```
@@ -377,7 +408,7 @@ The preview must confirm that the original target branch still equals the record
 After approval:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py finalize \
+<controller-python> <skill-root>/scripts/workflow.py finalize \
   --project <absolute-project-root> \
   --run-id <run-id> \
   --apply
@@ -392,11 +423,11 @@ Finalization first persists a `FINALIZING` transaction and only then advances th
 After finalization or explicit supersession, preview and then remove registered worktrees:
 
 ```bash
-python3 <skill-root>/scripts/workflow.py cleanup \
+<controller-python> <skill-root>/scripts/workflow.py cleanup \
   --project <absolute-project-root> \
   --run-id <run-id>
 
-python3 <skill-root>/scripts/workflow.py cleanup \
+<controller-python> <skill-root>/scripts/workflow.py cleanup \
   --project <absolute-project-root> \
   --run-id <run-id> \
   --apply

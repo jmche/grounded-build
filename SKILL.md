@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.4.0
+  version: 0.4.1
   compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude or Codex CLI adapter
 ---
 
@@ -142,6 +142,13 @@ At either `READY` or `ABANDONED`, use `audit-export` to retrieve the terminal au
 Implementation state lives separately under `~/.grounded-build/implementation/`. For a Plan handoff, initialize with the exported plan and batch manifest. For a user-provided plan without a manifest, derive a finite, observable batch manifest and obtain confirmation before freezing it.
 
 The implementation host remains the current host model. Its isolated reviewer defaults to Opus for Claude or `gpt-5.6-sol` for Codex; `--claude-model`, `--codex-model`, `--codex-model-provider`, and `--codex-profile` may override that selection at `init` and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.
+
+Before implementation preflight, resolve one stable CPython 3.11+ executable and use its absolute path
+for every `workflow.py` command in that run. Report and preserve the frozen `controller_runtime`; never
+silently switch between a Conda interpreter, system Python, and an activated environment. An ignored
+project `.venv` is expected not to appear in Git worktrees: the verifier reuses it read-only from the
+original checkout. If it is absent, do not install dependencies or run `uv sync` without explicit user
+authority; follow the environment diagnostic in the implementation reference.
 
 Follow [references/implementation_workflow.md](references/implementation_workflow.md) exactly. Never treat the current host conversation as its own independent reviewer.
 

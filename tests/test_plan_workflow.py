@@ -248,7 +248,7 @@ class PlanWorkflowTest(unittest.TestCase):
             (Path(initialized["run_directory"]) / "invocations" / "investigate-A")
             .glob("attempt_1_*/invocation.json"))
         record = json.loads(record_path.read_text(encoding="utf-8"))
-        self.assertEqual(record["engine_contract"]["software_version"], "0.4.0")
+        self.assertEqual(record["engine_contract"]["software_version"], "0.4.1")
         self.assertEqual(record["requested_runtime"]["model"], "opus")
         self.assertIn("--model", record["argv"])
         self.assertEqual(record["argv"][-1], "<PROMPT>")

@@ -2,6 +2,17 @@
 
 All notable changes use semantic versioning.
 
+## [0.4.1] - 2026-08-25
+
+- Recorded and froze the implementation workflow's controller Python identity so PATH changes cannot
+  silently switch interpreters while resuming a run.
+- Made preflight report the project `.venv`, uv availability, lock metadata, and the exact read-only
+  runtime bridge used for fixed-SHA verification.
+- Added an actionable infrastructure error for missing relative `.venv` launchers and documented why
+  ignored environments do not follow worktrees.
+- Kept dependency provisioning explicit: Grounded Build never runs `uv sync` or installs packages
+  silently during verification.
+
 ## [0.4.0] - 2026-08-24
 
 - Made every same-round A/B stage genuinely parallel with an atomic merge barrier and observable running invocation records.

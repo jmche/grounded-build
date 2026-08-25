@@ -53,6 +53,12 @@ Verdicts:
 
 When fixed-SHA verification evidence is supplied, assess it and do not request the same successful command again. A rejected request is feedback from the host, not proof of correctness; either decide from other evidence or explain the remaining material uncertainty. For all verdicts other than `NEEDS_VERIFICATION`, return an empty `verification_requests` list.
 
+Git-ignored virtual environments do not follow detached worktrees. Their absence in this reviewer
+worktree is expected and is not a code defect. A verification request beginning `.venv/` is resolved by
+the workflow from the original project environment, mounted read-only, and executed with the fixed-SHA
+worktree as cwd. Judge the resulting fixed-SHA evidence; do not demand that `.venv` be copied into a
+review worktree or report an environment-only direct rerun failure as a batch finding.
+
 Return one `criterion_results` entry for every acceptance-contract criterion assigned to this batch whenever the verdict is not `NEEDS_VERIFICATION`. A `PASS` verdict requires each result to be `PASS`. Cite supplied fixed-SHA evidence IDs for `COMMAND` criteria; do not treat a pathname or implementer claim as evidence. `REPOSITORY_ASSERTION` criteria may be decided from the reviewed SHA with a concrete rationale. The workflow validates coverage and evidence provenance, while you retain responsibility for semantic judgment.
 
 Do not modify files. Do not create commits, branches, or worktrees. Do not merge, rebase, reset, clean, stash, or push. Return only the requested structured result.

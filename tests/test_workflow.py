@@ -192,6 +192,40 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--target-branch", "main",
         )
 
+    def test_preflight_and_init_record_controller_and_project_runtime(self) -> None:
+        preflight = self.workflow(
+            "preflight", "--project", str(self.project), "--target-branch", "main"
+        )
+        controller = preflight["controller_runtime"]
+        self.assertEqual(controller["resolved_executable"], str(Path(sys.executable).resolve()))
+        self.assertTrue(controller["supported"])
+        self.assertEqual(
+            controller["command_prefix"],
+            [str(Path(sys.executable).absolute()), str(WORKFLOW.resolve())],
+        )
+        project_runtime = preflight["project_runtime"]
+        self.assertFalse(project_runtime["project_venv"]["available"])
+        self.assertFalse(project_runtime["project_venv"]["worktree_copy_expected"])
+        self.assertFalse(project_runtime["uv"]["auto_provision"])
+
+        initialized = self.initialize_raw()
+        self.assertEqual(initialized["controller_runtime"], controller)
+        self.assertEqual(initialized["project_runtime_at_start"], project_runtime)
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
+        )
+        self.assertFalse(status["controller_runtime_drift"])
+        self.assertEqual(status["controller_runtime"], controller)
+
+    def test_controller_runtime_drift_is_rejected_but_legacy_runs_remain_usable(self) -> None:
+        current = WORKFLOW_MODULE.controller_runtime()
+        changed = {**current, "version": "0.0-different"}
+        with self.assertRaisesRegex(
+            WORKFLOW_MODULE.WorkflowError, "controller runtime changed"
+        ):
+            WORKFLOW_MODULE.validate_controller_runtime({"controller_runtime": changed})
+        WORKFLOW_MODULE.validate_controller_runtime({})
+
     def commit_batch_change(self, implementation: Path, content: str = "implemented\n") -> str:
         (implementation / "tracked.txt").write_text(content, encoding="utf-8")
         self.run_command("git", "-C", str(implementation), "add", "tracked.txt")
@@ -1277,6 +1311,19 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertIn("verdict=NEEDS_USER_DECISION", reviewer)
         self.assertIn("exactly one P1 finding", reviewer)
 
+    def test_runtime_contract_explains_controller_identity_and_venv_bridge(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        workflow = (SKILL_ROOT / "references" / "implementation_workflow.md").read_text(
+            encoding="utf-8"
+        )
+        reviewer = (SKILL_ROOT / "references" / "reviewer_prompt.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("controller_runtime", skill)
+        self.assertIn("<controller-python>", workflow)
+        self.assertIn("original project environment", reviewer)
+        self.assertIn("never runs `uv sync`", workflow)
+
 
 
 class SharedVerificationWorktreeTests(unittest.TestCase):
@@ -1322,6 +1369,44 @@ class SharedVerificationWorktreeTests(unittest.TestCase):
         other = WORKFLOW_MODULE._shared_verification_worktree(self.run_root, self.second)
         self.assertEqual(same_a, same_b, "two verifications of one commit must address one tree")
         self.assertNotEqual(same_a, other, "different commits must not collide")
+
+    def test_missing_project_venv_fails_before_sandbox_with_actionable_diagnostic(self) -> None:
+        with self.assertRaisesRegex(
+            WORKFLOW_MODULE.WorkflowError,
+            "Git-ignored virtual environments do not follow worktrees",
+        ):
+            WORKFLOW_MODULE._sandbox_command(
+                "bwrap",
+                [".venv/bin/python", "-m", "pytest"],
+                self.project,
+                self.project,
+                self.root / "tmp",
+                "offline",
+            )
+
+    def test_project_venv_is_reported_and_bridged_from_original_checkout(self) -> None:
+        launcher = self.project / ".venv" / "bin" / "python"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\necho 'Python fixture'\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        runtime = WORKFLOW_MODULE.project_runtime_payload(self.project)
+        self.assertTrue(runtime["project_venv"]["available"])
+        self.assertEqual(runtime["project_venv"]["version_probe"], "NOT_EXECUTED")
+        self.assertEqual(runtime["project_venv"]["resolved_launcher"], str(launcher.resolve()))
+        self.assertEqual(
+            runtime["project_venv"]["verification_source"], "ORIGINAL_PROJECT_READ_ONLY"
+        )
+
+        sandboxed, executed = WORKFLOW_MODULE._sandbox_command(
+            "bwrap",
+            [".venv/bin/python", "-V"],
+            self.project,
+            self.project,
+            self.root / "tmp",
+            "offline",
+        )
+        self.assertEqual(executed[0], str(launcher))
+        self.assertIn(str((self.project / ".venv").resolve()), sandboxed)
 
     def test_the_second_verification_reuses_the_checkout_instead_of_failing(self) -> None:
         """`git worktree add` refuses an existing path, so reuse has to be a decision, not luck."""

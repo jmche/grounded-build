@@ -6,7 +6,7 @@ Grounded Build is a local coding-agent skill with two independent modes:
    drafting, integrate each other's evidence without widening scope, and converge on a host-synthesized plan.
 2. **Implement:** execute an approved plan batch by batch in isolated Git worktrees with fixed-SHA review, bounded repair, evidence tracking, and explicit final integration.
 
-Version `v0.4.0` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude` or `codex` CLI adapters are required.
+Version `v0.4.1` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude` or `codex` CLI adapters are required.
 
 The sandbox is exercised with Claude Code 2.1.238 and Codex CLI 0.149.0. Codex is treated as an adapter: its configured model may be GPT, DeepSeek through an OpenAI-compatible gateway, or another model. The run freezes and reports the non-secret model identity separately from the adapter.
 
@@ -46,6 +46,18 @@ independently, review each other, and both review the synthesized plan.
 ```
 
 An existing plan can go directly to Implement mode without paying for planning again.
+
+## Implementation runtime notes
+
+Invoke `scripts/workflow.py` with one stable, absolute CPython 3.11+ path for the lifetime of a run.
+Preflight reports the exact controller identity and initialization freezes it, preventing a later shell
+from silently selecting a different `python3` through PATH.
+
+Project `.venv` directories are normally ignored and therefore do not follow Git worktrees. Fixed-SHA
+verification deliberately reuses `<project>/.venv` read-only while keeping the reviewed worktree as cwd.
+If it is absent, preflight reports whether uv metadata and the uv executable are available, but Grounded
+Build does not install dependencies automatically. Provisioning remains an explicit operator action so
+network access, lockfile selection, and executed build hooks cannot be hidden inside verification.
 
 ## Coexistence with implement-plan-with-review
 

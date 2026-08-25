@@ -109,6 +109,19 @@
         "NEEDS_USER_DECISION is surfaced rather than bypassed.",
         "READY exports artifacts and does not start implementation."
       ]
+    },
+    {
+      "id": 10,
+      "prompt": "Use grounded-build to implement this approved Python plan. The repository's .venv is gitignored, uv.lock is present, and my shell's python3 may resolve to an unstable Conda build. Keep verification reproducible and do not install anything without asking.",
+      "expected_output": "The host chooses one stable absolute controller interpreter, confirms the preflight runtime record, preserves it for the run, explains the read-only project-.venv bridge, and treats missing dependencies as infrastructure requiring explicit provisioning authority.",
+      "files": [],
+      "assertions": [
+        "Every workflow.py invocation uses the same absolute controller Python recorded by preflight and init.",
+        "The host does not expect a gitignored .venv to be copied into implementation or reviewer worktrees.",
+        "Fixed-SHA verification reuses the original project's .venv read-only while the reviewed worktree remains cwd.",
+        "The host does not run uv sync, download an interpreter, or install dependencies without explicit authority.",
+        "An absent .venv is classified as an actionable infrastructure condition rather than a code-review failure."
+      ]
     }
   ]
 }

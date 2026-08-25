@@ -10,6 +10,7 @@ import functools
 import hashlib
 import json
 import os
+import platform
 import re
 import resource
 import secrets
@@ -309,6 +310,85 @@ def executable_version(name: str) -> str | None:
     result = run([name, "--version"], check=False, timeout=30)
     value = (result.stdout or result.stderr).strip().splitlines()
     return value[0][:200] if result.returncode == 0 and value else None
+
+
+def controller_runtime() -> dict[str, Any]:
+    """Describe the interpreter that owns workflow state transitions.
+
+    ``python3`` is a PATH lookup, not an identity. Recording the resolved interpreter makes a
+    run resumable without silently changing Python distributions between invocations.
+    """
+    invoked = Path(sys.executable).absolute()
+    resolved = invoked.resolve()
+    path_python = shutil.which("python3")
+    return {
+        "implementation": platform.python_implementation(),
+        "version": platform.python_version(),
+        "executable": str(invoked),
+        "resolved_executable": str(resolved),
+        "path_python3": str(Path(path_python).absolute()) if path_python else None,
+        "path_python3_matches": bool(path_python and Path(path_python).resolve() == resolved),
+        "supported": sys.version_info >= (3, 11),
+        "command_prefix": [str(invoked), str(Path(__file__).resolve())],
+    }
+
+
+def validate_controller_runtime(state: dict[str, Any]) -> None:
+    """Reject silent interpreter drift for runs new enough to record controller identity."""
+    recorded = state.get("controller_runtime")
+    if not isinstance(recorded, dict):
+        return
+    current = controller_runtime()
+    identity = ("implementation", "version", "resolved_executable")
+    if any(recorded.get(key) != current.get(key) for key in identity):
+        prefix = recorded.get("command_prefix") or [recorded.get("executable"), "workflow.py"]
+        raise WorkflowError(
+            "workflow controller runtime changed after initialization; resume with the recorded "
+            f"command prefix {json.dumps(prefix)} or explicitly supersede the run"
+        )
+
+
+def project_runtime_payload(project: Path) -> dict[str, Any]:
+    """Report, but never provision, the project's optional verification environment."""
+    launcher = project / ".venv" / "bin" / "python"
+    available = launcher.is_file() and os.access(launcher, os.X_OK)
+    uv_lock = project / "uv.lock"
+    pyproject = project / "pyproject.toml"
+    uv_path = shutil.which("uv")
+    if available:
+        guidance = (
+            "Relative .venv commands are resolved from the original project and mounted read-only "
+            "while the fixed-SHA worktree remains the verification cwd."
+        )
+    elif uv_path and (uv_lock.is_file() or pyproject.is_file()):
+        guidance = (
+            "No project .venv is available. Provision one explicitly with the repository's locked "
+            "uv workflow before verification; grounded-build never installs dependencies silently."
+        )
+    else:
+        guidance = (
+            "No project .venv is available. Provision the repository's documented environment "
+            "explicitly before requesting a relative .venv verification command."
+        )
+    return {
+        "project_venv": {
+            "launcher": str(launcher),
+            "available": available,
+            "resolved_launcher": str(launcher.resolve()) if available else None,
+            "version_probe": "NOT_EXECUTED",
+            "worktree_copy_expected": False,
+            "verification_source": "ORIGINAL_PROJECT_READ_ONLY" if available else None,
+        },
+        "uv": {
+            "available": bool(uv_path),
+            "executable": uv_path,
+            "version": executable_version("uv") if uv_path else None,
+            "lockfile": str(uv_lock) if uv_lock.is_file() else None,
+            "pyproject": str(pyproject) if pyproject.is_file() else None,
+            "auto_provision": False,
+        },
+        "guidance": guidance,
+    }
 
 
 def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
@@ -894,6 +974,8 @@ def preflight_payload(project: Path, target_branch: str) -> dict[str, Any]:
         "target_sha": target_sha,
         "working_tree_clean": not dirty,
         "working_tree_changes": dirty,
+        "controller_runtime": controller_runtime(),
+        "project_runtime": project_runtime_payload(project),
         **upstream_info(project, target_branch),
     }
 
@@ -959,6 +1041,7 @@ def validate_active_state(project: Path, state: dict[str, Any]) -> None:
         raise WorkflowError(f"run {state['run_id']} is not the active run")
     if state["status"] in TERMINAL_STATUSES:
         raise WorkflowError(f"run is terminal: {state['status']}")
+    validate_controller_runtime(state)
 
 
 def validate_implementation(state: dict[str, Any]) -> Path:
@@ -1099,6 +1182,8 @@ def command_init(args: argparse.Namespace) -> None:
         "batch_manifest_snapshot_digest": sha256_file(manifest_snapshot),
         "reviewer": args.reviewer,
         "reviewer_runtime": runtime,
+        "controller_runtime": controller_runtime(),
+        "project_runtime_at_start": before["project_runtime"],
         "reviewer_history": [{
             "reviewer": args.reviewer, "selected_at": utc_now(), "source": "RUN_INITIALIZED",
             "actor": args.implementer,
@@ -1146,6 +1231,8 @@ def command_init(args: argparse.Namespace) -> None:
         "batch_manifest_snapshot_sha256": state["batch_manifest_snapshot_digest"],
         "batches": batches,
         "budgets": state["budgets"],
+        "controller_runtime": state["controller_runtime"],
+        "project_runtime_at_start": state["project_runtime_at_start"],
     })
     save_state(state)
     project_meta = {
@@ -1177,6 +1264,8 @@ def command_init(args: argparse.Namespace) -> None:
             "batches": batches,
             "next_batch": batches[0],
             "reviewer_runtime": runtime,
+            "controller_runtime": state["controller_runtime"],
+            "project_runtime_at_start": state["project_runtime_at_start"],
         }
     )
 
@@ -2169,6 +2258,13 @@ def _sandbox_command(
         # and both narrow, and invoke the launcher itself so it computes its own prefix.
         venv_root = (project / ".venv").resolve()
         launcher = project / executable
+        if not launcher.is_file() or not os.access(launcher, os.X_OK):
+            runtime = project_runtime_payload(project)
+            raise WorkflowError(
+                f"verification requests {executable!r}, but the original project has no executable "
+                f"launcher at {launcher}; Git-ignored virtual environments do not follow worktrees. "
+                f"{runtime['guidance']}"
+            )
         runtime_mounts.extend(["--ro-bind", str(venv_root), str(venv_root)])
         # Walk the launcher's symlink chain and mount EVERY prefix on it. Mounting only the fully
         # resolved interpreter is not enough: uv points the venv at an unversioned directory
@@ -3188,6 +3284,15 @@ def command_adjudicate(args: argparse.Namespace) -> None:
 
 def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
     target_sha = git(project, "rev-parse", state["target_branch"])
+    current_controller = controller_runtime()
+    recorded_controller = state.get("controller_runtime")
+    controller_drift = bool(
+        isinstance(recorded_controller, dict)
+        and any(
+            recorded_controller.get(key) != current_controller.get(key)
+            for key in ("implementation", "version", "resolved_executable")
+        )
+    )
     stale = not state["finalized"] and target_sha != state["baseline_sha"]
     implementation = Path(state["implementation_worktree"])
     implementation_head = git(implementation, "rev-parse", "HEAD") if implementation.is_dir() else None
@@ -3220,6 +3325,10 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "implementation_sha": implementation_head,
         "reviewer": state["reviewer"], "reviewer_worktree": state["reviewer_worktree"],
         "reviewer_runtime": state.get("reviewer_runtime") or {},
+        "controller_runtime": recorded_controller,
+        "current_controller_runtime": current_controller,
+        "controller_runtime_drift": controller_drift,
+        "project_runtime_at_start": state.get("project_runtime_at_start"),
         "reviewer_history": state.get("reviewer_history", []),
         "implementer": state.get("implementer", "legacy-unknown"),
         "fix_policy": state["fix_policy"], "batches": state["batches"],
@@ -3378,6 +3487,8 @@ def write_final_report(state: dict[str, Any], integrated: bool) -> Path:
         f"- Plan SHA-256: `{state['plan_digest']}`\n- Reviewer: `{state['reviewer']}`\n"
         f"- Reviewer history: `{json.dumps(state.get('reviewer_history', []), ensure_ascii=False, sort_keys=True)}`\n"
         f"- Implementer: `{state.get('implementer', 'legacy-unknown')}`\n"
+        f"- Controller runtime: `{json.dumps(state.get('controller_runtime'), ensure_ascii=False, sort_keys=True)}`\n"
+        f"- Project runtime at start: `{json.dumps(state.get('project_runtime_at_start'), ensure_ascii=False, sort_keys=True)}`\n"
         f"- Acceptance contract: `{contract.get('status')}`\n"
         f"- Acceptance contract digest: `{contract.get('digest')}`\n"
         f"- Plan snapshot SHA-256: `{state.get('plan_snapshot_digest')}`\n"

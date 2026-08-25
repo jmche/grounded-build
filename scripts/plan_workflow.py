@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex")
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
