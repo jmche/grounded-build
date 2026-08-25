@@ -39,21 +39,25 @@ Use `scripts/plan_workflow.py`. Detailed state and failure semantics are in [ref
 
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py preflight \
-  --project <absolute-project> --backend <auto|mixed|claude|codex>
+  --project <absolute-project> --backend <auto|claude|codex|dsh>
 ```
 
 Use `--probe` when provider authentication/configuration is uncertain; it makes one small paid, sandboxed schema call per selected adapter.
 
-Planning defaults to Claude Opus and Codex `gpt-5.6-sol`. Explicit user selection always wins:
+Planning defaults to Claude Opus and Codex `gpt-5.6-sol`; the dsh adapter reads its model from the
+harness settings (`~/.dsh/settings.yaml`). `auto` fills the two slots from the preference order
+`claude -> dsh -> codex` (the default pair is claude + dsh). Explicit user selection always wins:
 
 ```bash
 --codex-model <model> \
 --codex-model-provider <configured-provider> \
 --codex-profile <profile>
 --claude-model <model>
+--dsh-model <model> \
+--dsh-model-provider <configured-provider>
 ```
 
-Use `cli-default` as either model value to defer to that CLI. A Codex provider/profile override without a model preserves the configured model. Pass the same selection to `init`; the run freezes only non-secret identity fields. Never paste credentials or endpoint tokens into arguments.
+Use `cli-default` as a model value to defer to that CLI/harness. A Codex provider/profile override without a model preserves the configured model. Pass the same selection to `init`; the run freezes only non-secret identity fields. Never paste credentials or endpoint tokens into arguments.
 
 ### 2. Freeze request and initialize
 
@@ -76,7 +80,7 @@ and third-party summaries are never evidence.
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py init \
   --project <project> --request <request.md> \
-  --backend <backend> --final-reviewer <both|claude|codex> \
+  --backend <backend> --final-reviewer <both|claude|codex|dsh> \
   --planning-depth <standard|deep> \
   --research-policy <local-only|authoritative-web> \
   [Codex selection options from preflight]

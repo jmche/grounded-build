@@ -46,7 +46,7 @@ MAX_VERIFICATION_TEMP_BYTES = 256 * 1024 * 1024
 MAX_VERIFICATION_TEMP_FILES = 200_000
 MAX_VERIFICATION_PROCESSES = 64
 MAX_VERIFICATION_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
-SUPPORTED_REVIEWERS = ("claude", "codex")
+SUPPORTED_REVIEWERS = ("claude", "codex", "dsh")
 DEFAULT_CLAUDE_REVIEWER_MODEL = "opus"
 DEFAULT_CODEX_REVIEWER_MODEL = "gpt-5.6-sol"
 TERMINAL_STATUSES = {"FINALIZED", "SUPERSEDED", "ABANDONED"}
@@ -391,6 +391,48 @@ def project_runtime_payload(project: Path) -> dict[str, Any]:
     }
 
 
+def dsh_reviewer_identity(model: str | None = None, model_provider: str | None = None) -> dict[str, Any]:
+    """Freeze the non-secret ``dsh`` adapter identity from the harness settings file.
+
+    ``dsh`` is the DeepSeek Harness CLI adapter, not a model family; its effective model/provider
+    come from ``settings.yaml`` (the user's saved selection layered over the profile default), so
+    the selection is read rather than invented. Explicit overrides win, matching claude/codex.
+    """
+    configured: dict[str, Any] = {}
+    dsh_home = Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
+    settings = dsh_home / "settings.yaml"
+    if settings.is_file():
+        try:
+            import yaml  # dsh identity is the only YAML consumer; guarded to stay optional
+        except ImportError:
+            yaml = None
+        if yaml is not None:
+            try:
+                document = yaml.safe_load(settings.read_text(encoding="utf-8")) or {}
+            except (OSError, UnicodeDecodeError):
+                document = {}
+            selection = document.get("agent-default-model") or {}
+            if isinstance(selection, dict):
+                if isinstance(selection.get("provider"), str):
+                    configured["provider"] = selection["provider"].strip()
+                if isinstance(selection.get("model"), str):
+                    configured["model"] = selection["model"].strip()
+    # The harness composition default (dsh-base/cordis.patch.yml `agent-default-model`) is
+    # deepseek-v4-flash; report it honestly so an unpinned run does not claim "no model" while the
+    # fast tier actually serves it.
+    selected_model = model or configured.get("model") or "deepseek-v4-flash"
+    selected_provider = model_provider or configured.get("provider") or "deepseek-official"
+    lowered = " ".join(str(value).lower() for value in (selected_model, selected_provider) if value)
+    family = "deepseek" if "deepseek" in lowered else "gpt" if any(
+        marker in lowered for marker in ("gpt", "openai", "o1", "o3", "o4")
+    ) else "unknown"
+    return {"adapter": "dsh", "cli_version": executable_version("dsh"),
+            "model": selected_model, "model_provider": selected_provider, "profile": None,
+            "model_family": family, "identity_source": (
+                "explicit_override" if any((model, model_provider)) else
+                "dsh_settings" if configured else "harness_default")}
+
+
 def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
     """Freeze the selected reviewer model separately from its CLI adapter."""
     if reviewer == "claude":
@@ -403,6 +445,16 @@ def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
                 "model_family": "claude", "identity_source": (
                     "cli_default" if model is None else
                     "explicit_override" if requested is not None else "grounded_build_default")}
+    if reviewer == "dsh":
+        model = getattr(args, "dsh_model", None)
+        model_provider = getattr(args, "dsh_model_provider", None)
+        for option, value in (("--dsh-model", model), ("--dsh-model-provider", model_provider)):
+            if value and value != "cli-default" and (
+                    len(value) > 200 or not re.fullmatch(r"[A-Za-z0-9_./:+-]+", value)):
+                raise WorkflowError(f"{option} must be a simple non-secret selector")
+        if model == "cli-default":
+            model = None
+        return dsh_reviewer_identity(model, model_provider)
     profile = getattr(args, "codex_profile", None)
     if profile and not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
         raise WorkflowError("--codex-profile must be a simple profile name")
@@ -1416,6 +1468,19 @@ def reviewer_command(
     schema: dict[str, Any] = REVIEW_SCHEMA,
     runtime: dict[str, Any] | None = None,
 ) -> list[str]:
+    if reviewer == "dsh":
+        # dsh-headless has no structured-output flag, so the schema travels IN the prompt and the
+        # host parses the printed final message. DSH_PERMISSION_MODE=read-only is set inline via
+        # `env` because the implementation reviewer is not bubblewrap-wrapped (matching the
+        # existing claude/codex implementation-reviewer isolation, which relies on CLI flags).
+        schema_text = json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
+        dsh_prompt = (
+            prompt
+            + "\n\nOUTPUT CONTRACT. Reply with ONLY a single JSON object matching this schema "
+            + "exactly: no prose, no markdown code fences, and nothing before or after the object.\n"
+            + schema_text
+        )
+        return ["env", "DSH_PERMISSION_MODE=read-only", "dsh", "--profile", "headless", dsh_prompt]
     if reviewer == "codex":
         runtime = runtime or {}
         selection: list[str] = []
@@ -1448,6 +1513,24 @@ def reviewer_command(
 
 
 def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]:
+    if reviewer == "dsh":
+        text = stdout.strip()
+        fenced = re.fullmatch(r"```(?:json)?[ \t]*\n?(.*?)\n?```", text, flags=re.DOTALL)
+        if fenced:
+            text = fenced.group(1).strip()
+        candidates = [text]
+        start = text.find("{")
+        end = text.rfind("}")
+        if 0 <= start < end:
+            candidates.append(text[start:end + 1])
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        raise WorkflowError("dsh output did not contain a structured review result")
     if reviewer == "codex":
         source = raw_path.read_text(encoding="utf-8") if raw_path.is_file() else stdout
         try:
@@ -2920,7 +3003,7 @@ def command_review(args: argparse.Namespace) -> None:
     duration = round(time.monotonic() - started, 3)
     stderr_path.write_text(result.stderr, encoding="utf-8")
     stderr_path.chmod(0o600)
-    if state["reviewer"] == "claude":
+    if state["reviewer"] in {"claude", "dsh"}:
         raw_path.write_text(result.stdout, encoding="utf-8")
         raw_path.chmod(0o600)
     atomic_json(
@@ -3877,6 +3960,13 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--claude-model",
             help=f"override reviewer default {DEFAULT_CLAUDE_REVIEWER_MODEL!r}; use 'cli-default' to defer")
+        command.add_argument(
+            "--dsh-model",
+            help="override the dsh reviewer model (read from ~/.dsh/settings.yaml when omitted); "
+                 "use 'cli-default' to defer to the harness")
+        command.add_argument(
+            "--dsh-model-provider",
+            help="override the dsh reviewer model provider (defaults to deepseek-official)")
 
     preflight = commands.add_parser("preflight", help="inspect local target and upstream refs")
     add_project_argument(preflight)

@@ -6,20 +6,25 @@ Ordinary runs should follow the `next_action` returned by `plan_workflow.py`. Re
 
 | Backend | A | B | Adapter diversity |
 |---|---|---|---|
-| `auto`, both installed | Claude | Codex | true |
+| `auto`, top two installed | claude | dsh | true |
+| `auto`, one of the top two missing | next available in preference order | same adapter | varies |
 | `auto`, one installed | two isolated instances of it | same adapter | false |
-| `mixed` | Claude | Codex | true |
-| `claude` or `codex` | two isolated instances | same adapter | false |
+| `claude`, `codex`, or `dsh` | two isolated instances | same adapter | false |
 
-Separate processes, fresh sessions, isolated context, a detached read-only worktree, and audited output provide process independence. Two Codex instances using the same model are not model-diverse. A Codex adapter configured for DeepSeek remains adapter `codex`, model family `deepseek`.
+`auto` fills the two slots from the preference order `claude -> dsh -> codex`: it takes the first two
+available adapters, degrades to the third when one of the first two is missing, and uses two isolated
+instances of a lone adapter.
+
+Separate processes, fresh sessions, isolated context, a detached read-only worktree, and audited output provide process independence. Two instances of one adapter using the same model are not model-diverse. A Codex adapter configured for DeepSeek remains adapter `codex`, model family `deepseek`; the dsh adapter reports the model selected in the harness settings.
 
 Cross-review is mutual: A reviews B and B reviews A. Every same-round A/B pair is launched concurrently
 from one frozen barrier input; a finisher is merged atomically and cannot alter the peer's already frozen
 context. `final_reviewer=both` independently reviews the same synthesized candidate through both slots. A
 single selected adapter uses fresh logical reviewer F.
 
-Planning defaults to Opus through Claude and `gpt-5.6-sol` through Codex. Explicit model, provider, or profile
-selection wins; `cli-default` defers model choice to the adapter. Initialization freezes hashes of the engine,
+Planning defaults to Opus through Claude, `gpt-5.6-sol` through Codex, and the harness-saved model through
+dsh (`~/.dsh/settings.yaml`). Explicit model, provider, or profile selection wins; `cli-default` defers model
+choice to the adapter. Initialization freezes hashes of the engine,
 skill contract, and this reference. Each invocation records the requested runtime, redacted actual argv,
 context hashes, wall time, reported cost/turns when available, and terminal delivery class.
 If a skill upgrade changes those hashes during a run, ordinary commands reject the drift. Preview and explicitly

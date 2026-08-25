@@ -20,7 +20,7 @@ FAKE_AGENT = r'''#!/usr/bin/env python3
 import json, os, re, subprocess, sys, time
 from pathlib import Path
 prompt = sys.argv[-1]
-provider = re.search(r"provider=(claude|codex)", prompt).group(1)
+provider = re.search(r"provider=(claude|codex|dsh)", prompt).group(1)
 sha = re.search(r"[0-9a-f]{40}", prompt).group(0)
 scope_match = re.search(r"scope_digest=([0-9a-f]{64})", prompt)
 scope_digest = scope_match.group(1) if scope_match else ""
@@ -84,6 +84,22 @@ else:
         verdict = "PASS"
         findings = [{"id": "P0-pass", "severity": "P0", "claim": "unsafe", "evidence": "plan", "required_change": "fix"}]
     payload = {"provider": provider, "reviewer_slot": slot, "target": target, "baseline_sha": sha, "verdict": verdict, "summary": "final checked", "findings": findings}
+def fake_assignment(prompt_text):
+    """Derive the workflow's assignment name from the prompt, for empty-delivery markers."""
+    if "independent evidence investigator" in prompt_text:
+        return "investigate-" + re.search(r"investigator ([AB])", prompt_text).group(1)
+    if "independent planning instance" in prompt_text:
+        return "draft-" + re.search(r"instance ([AB])", prompt_text).group(1)
+    if "independent reviewer and integrator slot" in prompt_text:
+        return "cross-" + re.search(r"integrator slot ([AB])", prompt_text).group(1)
+    if "independent deep-planning slot" in prompt_text:
+        return "diverge-" + re.search(r"deep-planning slot ([AB])", prompt_text).group(1)
+    if "fresh final planning reviewer" in prompt_text:
+        round_no = re.search(r"target=candidate-round-(\d+)", prompt_text).group(1)
+        return "final-" + round_no + "-" + re.search(r"reviewer \(([ABF])\)", prompt_text).group(1)
+    return ""
+
+
 if "FAKE_529" in request_text and "independent evidence investigator A" in prompt:
     print(json.dumps({"is_error": True, "api_error_status": 529,
                       "result": "upstream provider overloaded"}))
@@ -97,6 +113,13 @@ elif "-o" in sys.argv:
         sys.exit(0)
     with open(output, "w", encoding="utf-8") as handle:
         json.dump(payload, handle)
+elif "OUTPUT CONTRACT" in prompt:
+    # dsh-headless prints the final message to stdout as bare text; deliver nothing when the
+    # request asks this assignment to end without a final message.
+    always = re.search(r"FAKE_EMPTY_ALWAYS=(\S+)", request_text)
+    if always and always.group(1) == fake_assignment(prompt):
+        sys.exit(0)
+    print(json.dumps(payload))
 else:
     print(json.dumps({"structured_output": payload}))
 '''
@@ -118,7 +141,7 @@ class PlanWorkflowTest(unittest.TestCase):
         self.request.write_text("# Objective\nCreate a verified plan without editing the project.\n", encoding="utf-8")
         self.bin = self.temp / "bin"
         self.bin.mkdir()
-        for name in ("claude", "codex"):
+        for name in ("claude", "codex", "dsh"):
             path = self.bin / name
             path.write_text(FAKE_AGENT, encoding="utf-8")
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -358,9 +381,9 @@ class PlanWorkflowTest(unittest.TestCase):
                                "--run-id", run_id, "--reviewer", slot)
         self.assertEqual(result["status"], "READY")
 
-    def test_mixed_topology_records_provider_diversity(self) -> None:
-        initialized = self.initialize("mixed", "codex")
-        self.assertEqual(initialized["planners"], {"A": "claude", "B": "codex"})
+    def test_auto_topology_records_provider_diversity(self) -> None:
+        initialized = self.initialize("auto", "codex")
+        self.assertEqual(initialized["planners"], {"A": "claude", "B": "dsh"})
         self.assertTrue(initialized["provider_diversity"])
         self.run_through_cross_review(initialized)
         self.submit_candidate(initialized)
@@ -458,18 +481,18 @@ class PlanWorkflowTest(unittest.TestCase):
     def test_a_reassigned_run_stops_claiming_provider_diversity(self) -> None:
         """The whole point of allowing the swap is that the record still tells the truth after it.
 
-        Drives the real path: mixed topology, codex exhausts cross-B without delivering, the user
+        Drives the real path: auto topology, dsh exhausts draft-B without delivering, the user
         reassigns to claude, the run finishes. The report must then say the run was NOT
         provider-diverse and name the swap -- otherwise a reader sees `provider_diversity: true`
         describing a topology that was frozen rather than one that ran.
         """
         self.request.write_text(self.request.read_text() + "\nFAKE_EMPTY_ALWAYS=draft-B\n")
-        initialized = self.initialize("mixed", "claude")
+        initialized = self.initialize("auto", "claude")
         run_id = initialized["run_id"]
         self.assertTrue(initialized["provider_diversity"])
 
         self.call("draft", "--project", str(self.project), "--run-id", run_id, "--slot", "A")
-        for _ in range(3):  # codex slot: every attempt delivers an empty file
+        for _ in range(3):  # dsh slot: every attempt ends with no final message on stdout
             failure = self.call("draft", "--project", str(self.project), "--run-id", run_id,
                                 "--slot", "B", expect=2)
             self.assertIn("without a final message", failure["error"])
@@ -479,13 +502,13 @@ class PlanWorkflowTest(unittest.TestCase):
 
         state = self.get_state(initialized)
         pending = state["pending_decision"]
-        self.assertEqual(pending["provider"], "codex")
+        self.assertEqual(pending["provider"], "dsh")
         self.assertIn("without ever delivering a verdict", pending["diagnosis"])
         self.assertIn("REASSIGN_ASSIGNMENT", pending["diagnosis"])
 
         self.call("adjudicate", "--project", str(self.project), "--run-id", run_id,
                   "--choice", "REASSIGN_ASSIGNMENT", "--to-provider", "claude",
-                  "--decision", "codex never delivered", "--actor", "tester", "--apply")
+                  "--decision", "dsh never delivered", "--actor", "tester", "--apply")
 
         state = self.get_state(initialized)
         self.assertEqual(state["assignment_providers"], {"draft-B": "claude"})
@@ -512,12 +535,12 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("Provider diversity: `false`", report)
         self.assertIn("Model diversity: `false`", report)
         self.assertIn("draft-B", report)
-        self.assertIn("codex -> claude", report)
+        self.assertIn("dsh -> claude", report)
 
     def test_a_reassigned_final_reviewer_can_still_be_exported(self) -> None:
         """READY validation must use the provider that actually produced the final review."""
         self.request.write_text(self.request.read_text() + "\nFAKE_EMPTY_ALWAYS=final-1-B\n")
-        initialized = self.initialize("mixed", "both")
+        initialized = self.initialize("auto", "both")
         run_id = initialized["run_id"]
         self.run_through_cross_review(initialized)
         self.submit_candidate(initialized)
@@ -532,7 +555,7 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("budget exhausted", exhausted["error"])
         self.call("adjudicate", "--project", str(self.project), "--run-id", run_id,
                   "--choice", "REASSIGN_ASSIGNMENT", "--to-provider", "claude",
-                  "--decision", "codex never delivered", "--actor", "tester", "--apply")
+                  "--decision", "dsh never delivered", "--actor", "tester", "--apply")
         self.call("final-review", "--project", str(self.project), "--run-id", run_id,
                   "--reviewer", "B")
 
@@ -1171,6 +1194,108 @@ class CodexTrustStoreTest(unittest.TestCase):
         identity = self.module.codex_runtime_identity(profile="deepseek")
         self.assertEqual(identity["model_family"], "deepseek")
         self.assertEqual(identity["model"], "deepseek-reasoner")
+
+
+class DshAdapterTest(unittest.TestCase):
+    """The dsh adapter: identity, trust store, command shape, and free-text payload parsing."""
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp(prefix="gb-dsh-home-"))
+        self.previous_home = os.environ.get("HOME")
+        self.previous_dsh_home = os.environ.get("DSH_HOME")
+        os.environ["HOME"] = str(self.home)
+        os.environ["DSH_HOME"] = str(self.home / ".dsh")
+        spec = importlib.util.spec_from_file_location("gb_dsh_workflow", SCRIPT)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.dsh_home = self.home / ".dsh"
+        self.dsh_home.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        if self.previous_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self.previous_home
+        if self.previous_dsh_home is None:
+            os.environ.pop("DSH_HOME", None)
+        else:
+            os.environ["DSH_HOME"] = self.previous_dsh_home
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_identity_reads_the_settings_selection_without_leaking_secrets(self) -> None:
+        (self.dsh_home / "settings.yaml").write_text(
+            "llm-deepseek:\n  api_key: sk-never-record-this\n  base_url: https://secret.invalid/v1\n"
+            "agent-default-model:\n  provider: deepseek-official\n  model: ap/deepseek-v4-pro\n"
+            "  reasoningEffort: high\n", encoding="utf-8")
+        identity = self.module.dsh_runtime_identity()
+        self.assertEqual(identity["adapter"], "dsh")
+        self.assertEqual(identity["model_family"], "deepseek")
+        self.assertEqual(identity["model_provider"], "deepseek-official")
+        self.assertEqual(identity["model"], "ap/deepseek-v4-pro")
+        self.assertEqual(identity["identity_source"], "dsh_settings")
+        serialized = json.dumps(identity)
+        self.assertNotIn("secret.invalid", serialized)
+        self.assertNotIn("never-record-this", serialized)
+
+    def test_identity_falls_back_to_the_harness_default_when_unpinned(self) -> None:
+        identity = self.module.dsh_runtime_identity()
+        self.assertEqual(identity["model"], "deepseek-v4-flash")
+        self.assertEqual(identity["identity_source"], "harness_default")
+        self.assertEqual(identity["model_family"], "deepseek")
+
+    def test_runtime_warnings_flag_an_unpinned_dsh_model(self) -> None:
+        warnings = self.module.runtime_warnings({"dsh": self.module.dsh_runtime_identity()})
+        self.assertTrue(any("not pinned" in warning for warning in warnings), warnings)
+        self.assertTrue(any("deepseek-v4-flash" in warning for warning in warnings), warnings)
+
+    def test_trust_store_carries_credentials_and_settings(self) -> None:
+        credentials = self.dsh_home / ".credentials.yaml"
+        credentials.write_text("version: 1\nrefs: {}\n", encoding="utf-8")
+        settings = self.dsh_home / "settings.yaml"
+        settings.write_text("agent-default-model: {}\n", encoding="utf-8")
+        store = self.module.provider_trust_store("dsh")
+        self.assertIn(credentials.resolve(), store)
+        self.assertIn(settings.resolve(), store)
+
+    def test_command_embeds_the_schema_and_uses_the_headless_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            command = self.module.agent_command(
+                "dsh", root, root, {"type": "object"}, root / "raw.json", "do the task")
+        self.assertEqual(command[0], "dsh")
+        self.assertEqual(command[1], "--profile")
+        self.assertEqual(command[2], "headless")
+        prompt = command[-1]
+        self.assertIn("do the task", prompt)
+        self.assertIn("OUTPUT CONTRACT", prompt)
+        self.assertIn('{"type":"object"}', prompt)
+
+    def test_extract_dsh_object_accepts_bare_fenced_and_wrapped_json(self) -> None:
+        extract = self.module.extract_dsh_object
+        self.assertEqual(extract("dsh", '{"ready": true}'), {"ready": True})
+        self.assertEqual(extract("dsh", '```json\n{"ready": true}\n```'), {"ready": True})
+        self.assertEqual(extract("dsh", 'here is my answer: {"ready": true}\nthanks'), {"ready": True})
+
+    def test_extract_dsh_object_rejects_non_json_as_no_final_answer(self) -> None:
+        with self.assertRaises(self.module.NoFinalAnswer):
+            self.module.extract_dsh_object("dsh", "I could not complete the analysis.")
+
+    def test_auto_preference_orders_claude_dsh_codex(self) -> None:
+        resolve = self.module.resolve_topology
+
+        def present(*names: str) -> None:
+            self.module.available = lambda provider: provider in set(names)
+
+        present("claude", "codex", "dsh")
+        self.assertEqual(resolve("auto"), {"A": "claude", "B": "dsh"})
+        present("claude", "codex")
+        self.assertEqual(resolve("auto"), {"A": "claude", "B": "codex"})
+        present("codex")
+        self.assertEqual(resolve("auto"), {"A": "codex", "B": "codex"})
+
+    def test_dsh_single_backend_uses_two_isolated_instances(self) -> None:
+        self.module.available = lambda provider: provider == "dsh"
+        self.assertEqual(self.module.resolve_topology("dsh"), {"A": "dsh", "B": "dsh"})
 
 
 class HostProtocolTest(unittest.TestCase):

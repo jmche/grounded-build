@@ -27,12 +27,16 @@ from typing import Any, Callable
 
 VERSION = "0.4.1"
 SCHEMA_VERSION = 2
-SUPPORTED_PROVIDERS = ("claude", "codex")
+SUPPORTED_PROVIDERS = ("claude", "codex", "dsh")
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
 MAX_SYNTHESIS_SUBMISSIONS = 2
 MAX_INFRASTRUCTURE_ATTEMPTS = 3
 DEFAULT_CLAUDE_MODEL = "opus"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+#: `auto` fills the two planning slots with the first two available adapters in this order and
+#: degrades gracefully when one is missing; the third is the fallback. The default pair is
+#: therefore claude + dsh (codex is the fallback).
+AUTO_PREFERENCE = ("claude", "dsh", "codex")
 TERMINAL_STATUSES = {"READY", "ABANDONED"}
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 
@@ -786,7 +790,10 @@ def executable_version(provider: str) -> str | None:
     executable = shutil.which(provider)
     if not executable:
         return None
-    result = run([executable, "--version"], timeout=30, env=agent_environment())
+    # PATH is preserved so a script-based CLI (dsh is `#!/usr/bin/env node`) can resolve its
+    # interpreter; `--version` is a local no-network call, so this leaks nothing sensitive.
+    version_env = {**agent_environment(), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    result = run([executable, "--version"], timeout=30, env=version_env)
     if result.returncode != 0:
         return None
     value = (result.stdout or result.stderr).strip().splitlines()
@@ -835,15 +842,70 @@ def codex_runtime_identity(
     }
 
 
+def dsh_runtime_identity(
+    model: str | None = None, model_provider: str | None = None,
+) -> dict[str, Any]:
+    """Describe the ``dsh`` adapter without persisting credentials or endpoint URLs.
+
+    ``dsh`` is DeepSeek Harness's CLI adapter, not a model family. Its effective model and provider
+    come from the harness settings file (the user's saved selection layered over the profile
+    composition default), so the non-secret selection is read from ``settings.yaml`` rather than
+    invented here. Explicit ``--dsh-model`` / ``--dsh-model-provider`` win, matching codex/claude.
+    """
+    configured: dict[str, Any] = {}
+    dsh_home = Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
+    settings = dsh_home / "settings.yaml"
+    if settings.is_file():
+        try:
+            import yaml  # dsh identity is the only YAML consumer; guarded to stay optional
+        except ImportError:
+            yaml = None
+        if yaml is not None:
+            try:
+                document = yaml.safe_load(settings.read_text(encoding="utf-8")) or {}
+            except (OSError, UnicodeDecodeError):
+                document = {}
+            selection = document.get("agent-default-model") or {}
+            if isinstance(selection, dict):
+                if isinstance(selection.get("provider"), str):
+                    configured["provider"] = selection["provider"].strip()
+                if isinstance(selection.get("model"), str):
+                    configured["model"] = selection["model"].strip()
+    # The harness composition default (dsh-base/cordis.patch.yml `agent-default-model`) is
+    # deepseek-v4-flash; report it honestly so an unpinned run does not claim "no model" while the
+    # fast tier actually serves it.
+    selected_model = model or configured.get("model") or "deepseek-v4-flash"
+    selected_provider = model_provider or configured.get("provider") or "deepseek-official"
+    lowered = " ".join(str(value).lower() for value in (selected_model, selected_provider) if value)
+    family = "deepseek" if "deepseek" in lowered else "gpt" if any(
+        marker in lowered for marker in ("gpt", "openai", "o1", "o3", "o4")
+    ) else "unknown"
+    return {
+        "adapter": "dsh",
+        "cli_version": executable_version("dsh"),
+        "model": selected_model,
+        "model_provider": selected_provider,
+        "profile": None,
+        "model_family": family,
+        "identity_source": "explicit_override" if any((model, model_provider)) else (
+            "dsh_settings" if configured else "harness_default"),
+    }
+
+
 def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str, Any]]:
     """Build the non-secret adapter identity frozen into a new run."""
     model = getattr(args, "codex_model", None) if args else None
     model_provider = getattr(args, "codex_model_provider", None) if args else None
     profile = getattr(args, "codex_profile", None) if args else None
     claude_model = getattr(args, "claude_model", None) if args else None
+    dsh_model = getattr(args, "dsh_model", None) if args else None
+    dsh_model_provider = getattr(args, "dsh_model_provider", None) if args else None
     if profile and not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
         raise WorkflowError("--codex-profile must be a simple profile name")
-    for option, value in (("--codex-model", model), ("--codex-model-provider", model_provider)):
+    for option, value in (
+        ("--codex-model", model), ("--codex-model-provider", model_provider),
+        ("--dsh-model", dsh_model), ("--dsh-model-provider", dsh_model_provider),
+    ):
         if value and (len(value) > 200 or not re.fullmatch(r"[A-Za-z0-9_./:+-]+", value)):
             raise WorkflowError(f"{option} must be a simple non-secret selector")
     explicit_codex = any((model, model_provider, profile))
@@ -853,6 +915,8 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
     selected_claude_model = DEFAULT_CLAUDE_MODEL if claude_model is None else claude_model
     if selected_claude_model == "cli-default":
         selected_claude_model = None
+    if dsh_model == "cli-default":
+        dsh_model = None
     runtime = {
         "codex": codex_runtime_identity(selected_codex_model, model_provider, profile),
         "claude": {
@@ -862,6 +926,7 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
             "identity_source": "cli_default" if selected_claude_model is None else (
                 "explicit_override" if claude_model is not None else "grounded_build_default"),
         },
+        "dsh": dsh_runtime_identity(dsh_model, dsh_model_provider),
     }
     if not explicit_codex:
         runtime["codex"]["identity_source"] = "grounded_build_default"
@@ -873,14 +938,19 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
     executable = shutil.which(provider)
     if not executable:
         return {"ok": False, "missing": ["executable"]}
-    help_args = [executable, "exec", "--help"] if provider == "codex" else [executable, "--help"]
+    if provider == "codex":
+        help_args = [executable, "exec", "--help"]
+        required = ["--output-schema", "--output-last-message", "--ephemeral", "--sandbox", "--config"]
+    elif provider == "dsh":
+        # Booting the headless profile and printing its help is the honest capability check: it
+        # proves the node runtime, the bundled profile, and the harness home all resolve.
+        help_args = [executable, "--profile", "headless", "--help"]
+        required = ["--profile", "headless"]
+    else:
+        help_args = [executable, "--help"]
+        required = ["--json-schema", "--output-format", "--permission-mode", "--no-session-persistence"]
     result = run(help_args, timeout=30)
     text = (result.stdout or "") + "\n" + (result.stderr or "")
-    required = (
-        ["--output-schema", "--output-last-message", "--ephemeral", "--sandbox", "--config"]
-        if provider == "codex" else
-        ["--json-schema", "--output-format", "--permission-mode", "--no-session-persistence"]
-    )
     missing = [flag for flag in required if flag not in text]
     return {"ok": result.returncode == 0 and not missing, "missing": missing,
             "help_exit": result.returncode}
@@ -889,17 +959,15 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
 def resolve_topology(backend: str) -> dict[str, str]:
     present = {name for name in SUPPORTED_PROVIDERS if available(name)}
     if backend == "auto":
-        if present == set(SUPPORTED_PROVIDERS):
-            return {"A": "claude", "B": "codex"}
-        if "claude" in present:
-            return {"A": "claude", "B": "claude"}
-        if "codex" in present:
-            return {"A": "codex", "B": "codex"}
-        raise WorkflowError("neither claude nor codex is available")
-    if backend == "mixed":
-        if present != set(SUPPORTED_PROVIDERS):
-            raise WorkflowError("mixed topology requires both claude and codex")
-        return {"A": "claude", "B": "codex"}
+        # Take the first two available adapters in preference order; a missing adapter degrades to
+        # the next one, and a lone adapter fills both slots as two isolated instances (same adapter,
+        # not model-diverse). The third entry in AUTO_PREFERENCE is the fallback.
+        ordered = [name for name in AUTO_PREFERENCE if name in present]
+        if len(ordered) >= 2:
+            return {"A": ordered[0], "B": ordered[1]}
+        if len(ordered) == 1:
+            return {"A": ordered[0], "B": ordered[0]}
+        raise WorkflowError("no supported provider is available")
     if backend not in SUPPORTED_PROVIDERS or backend not in present:
         raise WorkflowError(f"requested provider is unavailable: {backend}")
     return {"A": backend, "B": backend}
@@ -1100,6 +1168,18 @@ def agent_command(
     provider: str, worktree: Path, context: Path, schema: dict[str, Any], raw: Path, prompt: str,
     runtime: dict[str, Any] | None = None, allow_web: bool = False,
 ) -> list[str]:
+    if provider == "dsh":
+        # dsh-headless has no structured-output flag, so the schema travels IN the prompt and the
+        # host parses and validates the printed final message (approach (a)). The adapter is told
+        # to emit one bare JSON object and nothing else.
+        schema_text = json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
+        dsh_prompt = (
+            prompt
+            + "\n\nOUTPUT CONTRACT. Reply with ONLY a single JSON object matching this schema "
+            + "exactly: no prose, no markdown code fences, and nothing before or after the object.\n"
+            + schema_text
+        )
+        return ["dsh", "--profile", "headless", dsh_prompt]
     if provider == "codex":
         schema_path = context / "schema.json"
         atomic_json(schema_path, schema)
@@ -1191,6 +1271,13 @@ def provider_trust_store(provider: str, codex_profile: str | None = None) -> lis
         catalog = codex_catalog_path(config)
         if catalog is not None:
             candidates.append(catalog)
+    elif provider == "dsh":
+        # The harness home holds the credentials file and the settings file (model selection). The
+        # `profiles` directory is deliberately NOT mounted: dsh writes its composed profile
+        # (cordis.yml) there during boot, so it must stay a fresh writable directory in the
+        # private home.
+        dsh_home = Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
+        candidates = [dsh_home / ".credentials.yaml", dsh_home / "settings.yaml"]
     else:
         candidates = []
     seen: dict[Path, None] = {}
@@ -1240,7 +1327,7 @@ def isolated_agent_command(
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         destination.touch(mode=0o600, exist_ok=True)
         credential_mounts.append((source, destination))
-    if provider != "codex":
+    if provider == "claude":
         disallowed_index = command.index("--disallowedTools") + 1
         private_root = f"//{str(private_home).lstrip('/')}"
         private_denies = ",".join(
@@ -1252,6 +1339,42 @@ def isolated_agent_command(
     if not common_git.is_absolute():
         common_git = (worktree / common_git).resolve()
     inner_command = ["/opt/grounded-build-agent", *command[1:]]
+    runtime_mounts: list[tuple[Path, Path]] = []
+    extra_setenv: list[str] = []
+    dsh_node_mode = False
+    if provider == "dsh":
+        # Real dsh is a Node script that must resolve its imports against its package tree, so it
+        # needs the node runtime and the @deepseek-ai/dsh package mounted at their ORIGINAL paths
+        # (bwrap creates the ancestor directories) and is invoked through node. A self-contained
+        # replacement (a test fake, for example) is executed directly like claude/codex. The two
+        # shapes are told apart by shebang rather than by path layout.
+        shebang = ""
+        try:
+            with executable.open("rb") as handle:
+                first_line = handle.readline(64).decode("utf-8", "replace")
+            if first_line.startswith("#!"):
+                shebang = first_line[2:].strip()
+        except OSError:
+            pass
+        dsh_node_mode = "node" in shebang
+        if dsh_node_mode:
+            node_executable = shutil.which("node")
+            if not node_executable:
+                raise WorkflowError("dsh requires the node runtime, which is not on PATH")
+            node_binary = Path(node_executable).resolve()
+            if not node_binary.is_file():
+                raise WorkflowError(f"node runtime does not exist: {node_binary}")
+            node_prefix = node_binary.parent.parent
+            dsh_package = executable.parent.parent  # .../@deepseek-ai/dsh
+            inner_command = [str(node_binary), str(executable), *command[1:]]
+            # The harness home's `profiles` directory is deliberately NOT mounted: dsh writes its
+            # COMPOSED profile (cordis.yml) there during boot, so it must be a fresh writable
+            # directory in the private home. Credentials and settings are the read-only inputs and
+            # arrive via the credential mounts above.
+            runtime_mounts = [(node_prefix, node_prefix), (dsh_package, dsh_package)]
+        # read-only tells the agent it cannot modify files; the bwrap ro-binds are the enforcement.
+        # Approval stays "ask" under read-only and fails closed in headless (no answerer).
+        extra_setenv = ["--setenv", "DSH_PERMISSION_MODE", "read-only"]
     wrapper = [
         bwrap, "--die-with-parent", "--new-session", "--unshare-pid",
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
@@ -1259,8 +1382,11 @@ def isolated_agent_command(
         "--dir", str(worktree), "--ro-bind", str(worktree), str(worktree),
         "--ro-bind", str(context), str(context),
         "--dir", str(common_git), "--ro-bind", str(common_git), str(common_git),
-        "--dir", "/opt", "--ro-bind", str(executable), "/opt/grounded-build-agent",
     ]
+    if provider != "dsh" or not dsh_node_mode:
+        wrapper.extend(["--dir", "/opt", "--ro-bind", str(executable), "/opt/grounded-build-agent"])
+    for source, destination in runtime_mounts:
+        wrapper.extend(["--ro-bind", str(source), str(destination)])
     for system_path in ("/usr", "/bin", "/lib", "/lib64"):
         if Path(system_path).exists():
             wrapper.extend(["--ro-bind", system_path, system_path])
@@ -1274,6 +1400,7 @@ def isolated_agent_command(
         wrapper.extend(["--ro-bind", str(source), str(destination)])
     wrapper.extend([
         "--setenv", "HOME", str(private_home), "--setenv", "TMPDIR", str(private_tmp),
+        *extra_setenv,
         "--setenv", "PATH", "/usr/bin:/bin", "--chdir", str(worktree), "--", *inner_command,
     ])
     return wrapper
@@ -1284,11 +1411,42 @@ def agent_environment() -> dict[str, str]:
     return {key: os.environ[key] for key in allowed if key in os.environ}
 
 
+def extract_dsh_object(provider: str, source: str) -> dict[str, Any]:
+    """Parse the free-text final message of a dsh-headless run into its schema object.
+
+    dsh has no structured-output flag (approach (a): prompt + host-side parse), so the final
+    message may arrive as a bare object, a fenced block, or prose surrounding an object. Accept a
+    bare object and a single fenced object, then fall back to the first balanced ``{...}`` span.
+    """
+    text = source.strip()
+    fenced = re.fullmatch(r"```(?:json)?[ \t]*\n?(.*?)\n?```", text, flags=re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    candidates = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start:end + 1])
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise NoFinalAnswer(
+        f"{provider} delivered something that is not the schema object ({len(source)} characters). "
+        f"The verdict may have been reached; it was not emitted as one JSON object in the required shape."
+    )
+
+
 def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw: Path) -> dict[str, Any]:
     source = raw.read_text(encoding="utf-8") if provider == "codex" and raw.is_file() else result.stdout
     if not source.strip():
         raise NoFinalAnswer(f"{provider} ended its turn without a final message"
                             f"{no_answer_detail(result)}")
+    if provider == "dsh":
+        return extract_dsh_object(provider, source)
     try:
         wrapper = json.loads(source)
     except json.JSONDecodeError as exc:
@@ -1855,10 +2013,16 @@ def model_diversity(topology: dict[str, str], runtime: dict[str, dict[str, Any]]
 
 
 def runtime_warnings(runtime: dict[str, dict[str, Any]]) -> list[str]:
-    return [
+    warnings = [
         f"{adapter} model family is unknown; diversity uses the exact provider/model identity"
         for adapter, identity in runtime.items() if identity.get("model_family") == "unknown"
     ]
+    for adapter, identity in runtime.items():
+        if identity.get("adapter") == "dsh" and identity.get("identity_source") == "harness_default":
+            warnings.append(
+                f"{adapter} model is not pinned; the harness default "
+                f"{identity.get('model')!r} (the fast tier) will be used")
+    return warnings
 
 
 def next_action(state: dict[str, Any]) -> dict[str, Any]:
@@ -2846,10 +3010,17 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--claude-model",
             help=f"override the default {DEFAULT_CLAUDE_MODEL!r}; use 'cli-default' to defer to Claude")
+        command.add_argument(
+            "--dsh-model",
+            help="override the dsh model (read from ~/.dsh/settings.yaml when omitted); "
+                 "use 'cli-default' to defer to the harness")
+        command.add_argument(
+            "--dsh-model-provider",
+            help="override the dsh model provider (defaults to deepseek-official)")
 
     preflight = commands.add_parser("preflight")
     preflight.add_argument("--project", required=True)
-    preflight.add_argument("--backend", choices=["auto", "mixed", *SUPPORTED_PROVIDERS], default="auto")
+    preflight.add_argument("--backend", choices=["auto", *SUPPORTED_PROVIDERS], default="auto")
     preflight.add_argument(
         "--probe", action="store_true",
         help="spend one trivial sandboxed call per provider to check it can authenticate and "
@@ -2860,7 +3031,7 @@ def build_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init")
     init.add_argument("--project", required=True)
     init.add_argument("--request", required=True)
-    init.add_argument("--backend", choices=["auto", "mixed", *SUPPORTED_PROVIDERS], default="auto")
+    init.add_argument("--backend", choices=["auto", *SUPPORTED_PROVIDERS], default="auto")
     init.add_argument("--final-reviewer", choices=["both", *SUPPORTED_PROVIDERS], required=True)
     init.add_argument(
         "--planning-depth", choices=["standard", "deep"], default="standard",
