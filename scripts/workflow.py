@@ -1476,15 +1476,25 @@ def reviewer_command(
         schema_text = json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
         dsh_prompt = (
             prompt
-            + "\n\nOUTPUT CONTRACT. The deliverable of this review is the single JSON object "
-            + "matching the schema below. Your task is NOT complete until you have emitted it. "
-            + "Before your final message, you MUST also write that exact JSON object to the file "
-            + "`.review-out/review.json` (relative to the current working directory) using the "
-            + "Bash tool: `mkdir -p .review-out && cat > .review-out/review.json <<'JSON'` then the "
-            + "object, then a line containing exactly `JSON`. Then, as your FINAL assistant message, "
-            + "reply with ONLY the same single JSON object: no prose, no markdown code fences, and "
-            + "nothing before or after the object. Verify the JSON is complete and valid before "
-            + "stopping; a review that ends without emitting it has failed its task.\n"
+            + "\n\nOUTPUT CONTRACT. Working directory for all file writes is the current working "
+            + "directory. PERSIST YOUR REVIEW INCREMENTALLY — never rely on a single final "
+            + "message, which may be lost. Use the Bash tool as you go:\n"
+            + "1. As soon as you FINISH judging one acceptance-contract criterion, APPEND one JSON "
+            + "object per line to `.review-out/criteria.jsonl` with exactly the keys `criterion_id`, "
+            + "`status`, `evidence_ids`, `rationale` (printf '%s\\n' ... >> .review-out/criteria.jsonl, "
+            + "or `cat >>` with one object per line). Never rewrite the file; append only.\n"
+            + "2. As soon as you CONFIRM a finding, append its complete finding object to "
+            + "`.review-out/findings.jsonl`, one per line (append only).\n"
+            + "3. Only after every criterion and finding above is persisted, write "
+            + "`.review-out/meta.json` with `{\"verdict\": ..., \"summary\": ..., "
+            + "\"resolved_finding_ids\": [...], \"verification_requests\": [...]}` (empty arrays "
+            + "when none).\n"
+            + "4. Then write the COMPLETE assembled review object (the full schema below) to "
+            + "`.review-out/review.json`.\n"
+            + "5. Your FINAL assistant message must be ONLY that same complete JSON object — no "
+            + "prose, no fences. If anything stops you before step 5, the files from steps 1-4 "
+            + "already carry the review; the task fails only if neither the files nor the message "
+            + "delivers it. Verify JSON is complete and valid before stopping.\n"
             + schema_text
         )
         return ["env", "DSH_PERMISSION_MODE=workspace-write", "dsh", "--profile", "headless", dsh_prompt]
@@ -1563,20 +1573,69 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
     raise WorkflowError("Claude output did not contain a structured review result")
 
 
-def read_dsh_review_file(reviewer_path: Path) -> dict[str, Any] | None:
-    """Read the review JSON the dsh reviewer is instructed to write via its Bash tool.
+def _read_json_objects(path: Path) -> list[dict[str, Any]]:
+    """Read a file of JSON objects (one per line, or adjacent), tolerantly.
 
-    The dsh (headless) reviewer's final-message delivery has repeatedly been lost to a gateway
-    truncation, a premature stop, or a timeout. The OUTPUT CONTRACT mandates writing the review
-    to ``.review-out/review.json`` under the reviewer worktree BEFORE the final message, so this
-    file channel survives those failures: a completed review must not be lost with its delivery.
+    The reviewer writes incrementally; tolerate pretty-printed or multi-line objects by
+    decoding consecutive JSON values and skipping stray non-JSON fragments.
     """
-    try:
-        path = Path(reviewer_path) / ".review-out" / "review.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    if not path.is_file():
+        return []
+    decoder = json.JSONDecoder()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    items: list[dict[str, Any]] = []
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index] in " \t\r\n,":
+            index += 1
+        if index >= len(text):
+            break
+        try:
+            obj, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            newline = text.find("\n", index)
+            if newline < 0:
+                break
+            index = newline + 1
+            continue
+        if isinstance(obj, dict):
+            items.append(obj)
+        index = end
+    return items
+
+
+def read_dsh_review(reviewer_path: Path) -> dict[str, Any] | None:
+    """Read the review the dsh reviewer wrote to its ``.review-out`` channel.
+
+    The reviewer persists its work INCREMENTALLY (.review-out/criteria.jsonl and
+    findings.jsonl) so a stopped, truncated, or timed-out run does not lose what it had
+    already decided, then writes the assembled ``review.json`` (and ``meta.json``) when
+    complete. The complete object wins when present; otherwise the fragments are assembled
+    into a review payload with whatever was recorded before the run stopped.
+    """
+    out = Path(reviewer_path) / ".review-out"
+    if not out.is_dir():
         return None
-    return payload if isinstance(payload, dict) else None
+    final = out / "review.json"
+    if final.is_file():
+        try:
+            payload = json.loads(final.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+    criteria = _read_json_objects(out / "criteria.jsonl")
+    findings = _read_json_objects(out / "findings.jsonl")
+    if not criteria and not findings:
+        return None
+    try:
+        meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        meta = None
+    payload = dict(meta) if isinstance(meta, dict) else {}
+    payload["criterion_results"] = criteria
+    payload["findings"] = findings
+    return payload
 
 
 def contract_digest(criteria: list[dict[str, Any]]) -> str:
@@ -3024,24 +3083,25 @@ def command_review(args: argparse.Namespace) -> None:
             }
         )
     started = time.monotonic()
-    # dsh reviewer: the OUTPUT CONTRACT delivers the review via the file channel
-    # (read_dsh_review_file) as well as the final message, so a truncated/stopped/timed-out
-    # final stream does not lose a completed review.
-    file_payload = read_dsh_review_file(reviewer_path) if state["reviewer"] == "dsh" else None
     try:
         result = run(command, cwd=reviewer_path, check=False, timeout=args.timeout)
+        timed_out = False
     except WorkflowError as exc:
-        # A timeout after the file channel was written is a delivered review, not infra failure.
-        if file_payload is not None:
-            result = None
-        else:
-            invocation.update({"status": "INFRA_ERROR", "error": str(exc), "completed_at": utc_now()})
-            append_event(state, "INVOCATION_INFRA_ERROR", {"invocation_id": invocation_id, "error": str(exc)})
-            save_state(state)
-            emit({
-                "status": "REVIEWER_ERROR", "reason": str(exc), "run_id": state["run_id"],
-                "batch": args.batch, "round": round_number,
-            }, 4)
+        timed_out = True
+        result = None
+    # dsh reviewer: the OUTPUT CONTRACT persists the review incrementally under
+    # .review-out/ (criteria.jsonl / findings.jsonl / meta.json / review.json), so a truncated,
+    # stopped, or timed-out final stream still yields whatever was already decided. Read the
+    # channel only AFTER the run: a file present before the run would be a stale artifact.
+    file_payload = read_dsh_review(reviewer_path) if state["reviewer"] == "dsh" else None
+    if timed_out and file_payload is None:
+        invocation.update({"status": "INFRA_ERROR", "error": str(exc), "completed_at": utc_now()})
+        append_event(state, "INVOCATION_INFRA_ERROR", {"invocation_id": invocation_id, "error": str(exc)})
+        save_state(state)
+        emit({
+            "status": "REVIEWER_ERROR", "reason": str(exc), "run_id": state["run_id"],
+            "batch": args.batch, "round": round_number,
+        }, 4)
     if result is not None:
         duration = round(time.monotonic() - started, 3)
         stderr_path.write_text(result.stderr, encoding="utf-8")
