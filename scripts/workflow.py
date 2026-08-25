@@ -1563,6 +1563,22 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
     raise WorkflowError("Claude output did not contain a structured review result")
 
 
+def read_dsh_review_file(reviewer_path: Path) -> dict[str, Any] | None:
+    """Read the review JSON the dsh reviewer is instructed to write via its Bash tool.
+
+    The dsh (headless) reviewer's final-message delivery has repeatedly been lost to a gateway
+    truncation, a premature stop, or a timeout. The OUTPUT CONTRACT mandates writing the review
+    to ``.review-out/review.json`` under the reviewer worktree BEFORE the final message, so this
+    file channel survives those failures: a completed review must not be lost with its delivery.
+    """
+    try:
+        path = Path(reviewer_path) / ".review-out" / "review.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def contract_digest(criteria: list[dict[str, Any]]) -> str:
     encoded = json.dumps(criteria, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -2891,6 +2907,17 @@ def command_review(args: argparse.Namespace) -> None:
     if not reviewer_path.is_dir():
         raise WorkflowError(f"reviewer worktree is missing: {reviewer_path}")
     ensure_clean(reviewer_path, "reviewer")
+    if state["reviewer"] == "dsh":
+        # The dsh reviewer writes the review to `.review-out/review.json` via its Bash tool
+        # (workspace-write permission). `core.excludesFile` hides that directory from
+        # `git status`, so the post-review cleanliness check still passes with the file present.
+        dsh_review_out = reviewer_path / ".review-out"
+        shutil.rmtree(dsh_review_out, ignore_errors=True)
+        dsh_review_out.mkdir(exist_ok=True)
+        dsh_exclude = Path(state["run_directory"]) / "reviews" / "dsh_reviewer.exclude"
+        dsh_exclude.write_text(".review-out/\n", encoding="utf-8")
+        run(["git", "-C", str(reviewer_path), "config", "core.excludesFile", str(dsh_exclude)],
+            check=False)
     head = git(implementation, "rev-parse", "HEAD")
     previous = state["accepted_batches"][-1] if state["accepted_batches"] else None
     previous_sha = state["accepted_shas"].get(previous, state["baseline_sha"])
@@ -2997,47 +3024,64 @@ def command_review(args: argparse.Namespace) -> None:
             }
         )
     started = time.monotonic()
+    # dsh reviewer: the OUTPUT CONTRACT delivers the review via the file channel
+    # (read_dsh_review_file) as well as the final message, so a truncated/stopped/timed-out
+    # final stream does not lose a completed review.
+    file_payload = read_dsh_review_file(reviewer_path) if state["reviewer"] == "dsh" else None
     try:
         result = run(command, cwd=reviewer_path, check=False, timeout=args.timeout)
     except WorkflowError as exc:
-        invocation.update({"status": "INFRA_ERROR", "error": str(exc), "completed_at": utc_now()})
-        append_event(state, "INVOCATION_INFRA_ERROR", {"invocation_id": invocation_id, "error": str(exc)})
-        save_state(state)
-        emit({
-            "status": "REVIEWER_ERROR", "reason": str(exc), "run_id": state["run_id"],
-            "batch": args.batch, "round": round_number,
-        }, 4)
-    duration = round(time.monotonic() - started, 3)
-    stderr_path.write_text(result.stderr, encoding="utf-8")
-    stderr_path.chmod(0o600)
-    if state["reviewer"] in {"claude", "dsh"}:
-        raw_path.write_text(result.stdout, encoding="utf-8")
-        raw_path.chmod(0o600)
-    atomic_json(
-        metadata_path,
-        {
-            "reviewer": state["reviewer"], "batch": args.batch, "round": round_number,
-            "base_sha": base, "reviewed_sha": head, "returncode": result.returncode,
-            "duration_seconds": duration, "started_at": utc_now(),
-        },
-    )
-    if result.returncode != 0:
-        invocation.update({"status": "INFRA_ERROR", "returncode": result.returncode, "completed_at": utc_now()})
-        append_event(state, "INVOCATION_INFRA_ERROR", {
-            "invocation_id": invocation_id, "returncode": result.returncode,
-        })
-        save_state(state)
-        emit(
-            {
-                "status": "REVIEWER_ERROR", "reason": "CLI_EXIT_NONZERO",
-                "returncode": result.returncode, "run_id": state["run_id"],
+        # A timeout after the file channel was written is a delivered review, not infra failure.
+        if file_payload is not None:
+            result = None
+        else:
+            invocation.update({"status": "INFRA_ERROR", "error": str(exc), "completed_at": utc_now()})
+            append_event(state, "INVOCATION_INFRA_ERROR", {"invocation_id": invocation_id, "error": str(exc)})
+            save_state(state)
+            emit({
+                "status": "REVIEWER_ERROR", "reason": str(exc), "run_id": state["run_id"],
                 "batch": args.batch, "round": round_number,
-                "stderr_path": str(stderr_path), "raw_output_path": str(raw_path),
+            }, 4)
+    if result is not None:
+        duration = round(time.monotonic() - started, 3)
+        stderr_path.write_text(result.stderr, encoding="utf-8")
+        stderr_path.chmod(0o600)
+        if state["reviewer"] in {"claude", "dsh"}:
+            raw_path.write_text(result.stdout, encoding="utf-8")
+            raw_path.chmod(0o600)
+        atomic_json(
+            metadata_path,
+            {
+                "reviewer": state["reviewer"], "batch": args.batch, "round": round_number,
+                "base_sha": base, "reviewed_sha": head, "returncode": result.returncode,
+                "duration_seconds": duration, "started_at": utc_now(),
             },
-            4,
         )
+        if result.returncode != 0 and file_payload is None:
+            invocation.update({"status": "INFRA_ERROR", "returncode": result.returncode, "completed_at": utc_now()})
+            append_event(state, "INVOCATION_INFRA_ERROR", {
+                "invocation_id": invocation_id, "returncode": result.returncode,
+            })
+            save_state(state)
+            emit(
+                {
+                    "status": "REVIEWER_ERROR", "reason": "CLI_EXIT_NONZERO",
+                    "returncode": result.returncode, "run_id": state["run_id"],
+                    "batch": args.batch, "round": round_number,
+                    "stderr_path": str(stderr_path), "raw_output_path": str(raw_path),
+                },
+                4,
+            )
+    else:
+        atomic_json(metadata_path, {
+            "reviewer": state["reviewer"], "batch": args.batch, "round": round_number,
+            "base_sha": base, "reviewed_sha": head, "returncode": None,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "started_at": utc_now(), "file_channel": True,
+        })
     try:
-        payload = extract_review(state["reviewer"], result.stdout, raw_path)
+        payload = file_payload if file_payload is not None else extract_review(
+            state["reviewer"], result.stdout, raw_path)
         validate_review_payload(payload, state["reviewer"], args.batch, base, head, state)
         ensure_clean(reviewer_path, "reviewer")
         if payload["verdict"] == "NEEDS_VERIFICATION":
