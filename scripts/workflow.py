@@ -1036,7 +1036,10 @@ def validate_plan_unchanged(state: dict[str, Any]) -> None:
     snapshot = Path(state["plan_snapshot"])
     expected = state.get("plan_snapshot_digest") or state.get("plan_digest")
     if not snapshot.is_file() or not isinstance(expected, str) or sha256_file(snapshot) != expected:
-        raise WorkflowError("the authoritative plan snapshot changed or disappeared after initialization")
+        raise WorkflowError(
+            "the authoritative plan snapshot changed or disappeared after initialization: "
+            f"restore {snapshot} to its frozen content, or supersede this run"
+        )
     manifest_value = state.get("batch_manifest_snapshot")
     manifest_digest = state.get("batch_manifest_snapshot_digest")
     if manifest_value is not None:
@@ -3014,7 +3017,12 @@ def command_review(args: argparse.Namespace) -> None:
     validate_plan_unchanged(state)
     if not state.get("acceptance_contract"):
         raise WorkflowError("acceptance contract is not ready; run contract-review first")
-    if state.get("status") not in {"IMPLEMENTING", "CHANGES_REQUESTED"}:
+    # AWAITING_ACCEPTANCE is admitted because a PASS describes one exact SHA, not the batch: a
+    # commit made after that PASS leaves the run with no forward move at all -- `accept` refuses
+    # because the report no longer authorizes HEAD, and `review` used to refuse on status. The
+    # batch is not accepted yet, so new work still belongs to it and earns a review round. The
+    # guard below keeps a PASS that still describes HEAD from buying a second paid review.
+    if state.get("status") not in {"IMPLEMENTING", "CHANGES_REQUESTED", "AWAITING_ACCEPTANCE"}:
         raise WorkflowError(f"review is not allowed from workflow status {state.get('status')}")
     require_target_unchanged(project, state)
     implementation = validate_implementation(state)
@@ -3075,6 +3083,11 @@ def command_review(args: argparse.Namespace) -> None:
         raise WorkflowError(f"batch {args.batch!r} has no committed changes relative to its base")
     if prior and prior[-1]["verdict"] == "FAIL" and prior[-1]["reviewed_sha"] == head:
         raise WorkflowError("review requested changes but implementation HEAD has no new fix commit")
+    if prior and prior[-1]["verdict"] == "PASS" and prior[-1]["reviewed_sha"] == head:
+        raise WorkflowError(
+            f"{head[:12]} already holds a PASS review; run accept for batch {args.batch!r} "
+            "instead of paying for another review"
+        )
     contract_requests = register_missing_contract_verification(
         state, args.batch, round_number, base, head
     )
@@ -3822,8 +3835,16 @@ def command_finalize(args: argparse.Namespace) -> None:
     implementation = validate_implementation(state)
     ensure_clean(implementation, "implementation")
     final_head = git(implementation, "rev-parse", "HEAD")
-    if state["accepted_shas"].get(state["batches"][-1]) != final_head:
-        raise WorkflowError("implementation HEAD is not the final accepted SHA")
+    accepted_final = state["accepted_shas"].get(state["batches"][-1])
+    if accepted_final != final_head:
+        # Commits made after acceptance are outside the batch contract, so refusing is correct --
+        # but the operator still has to be told which two SHAs disagree and what the legal moves are.
+        raise WorkflowError(
+            f"implementation HEAD is {final_head[:12]} but the accepted final SHA is "
+            f"{str(accepted_final)[:12]}; commits made after acceptance are outside this batch's "
+            "contract. Reset the implementation worktree to the accepted SHA to finalize it, or "
+            "supersede this run and review the extra commits in a new one."
+        )
     final_verification = state.get("final_verification")
     if not isinstance(final_verification, dict) or final_verification.get("status") not in {"PASS", "NOT_APPLICABLE"}:
         raise WorkflowError("final fixed-SHA verification has not completed")

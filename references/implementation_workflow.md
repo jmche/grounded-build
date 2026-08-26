@@ -297,6 +297,8 @@ Pause despite `auto` when a fix expands scope, conflicts with the plan, changes 
 
 Fix in `implementation_worktree`, commit, and call `review` again for the same batch. The script requires a new fix commit after `REVIEW_FAIL` and reuses the reviewer worktree at the new SHA.
 
+A PASS describes one exact SHA, not the batch. If you commit again after `REVIEW_PASS` — a deferred finding fixed anyway, say — `accept` will refuse because the report no longer authorizes HEAD; run `review` again instead and the new commit gets its own round. Reviewing the same SHA twice is refused, so a PASS that still describes HEAD cannot buy a second paid review. After acceptance the contract is closed: commits beyond the accepted SHA cannot be finalized, and the choice is to reset the implementation worktree back to that SHA or to supersede the run and review the extra commits in a new one.
+
 Read `warnings` and `decision_reasons` on every review result:
 
 - `CROSS_BATCH_RESOLUTION` / `CROSS_BATCH_FINDING`: the reviewer referenced a finding an earlier batch owns. The observation is recorded, that batch keeps authority over its own status, and only a cross-batch P0 raises `CROSS_BATCH_MATERIAL_FINDING` for adjudication.

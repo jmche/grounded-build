@@ -887,6 +887,106 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(reviewed["status"], "REVIEW_PASS")
 
+    def _pass_then_commit(self) -> tuple[dict, dict, str]:
+        """Reach a PASS, then commit again -- the state B10 wedged in."""
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation, "implemented\n")
+        first = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        self.assertEqual(first["status"], "REVIEW_PASS")
+        later_head = self.commit_batch_change(implementation, "implemented once more\n")
+        return initialized, first, later_head
+
+    def test_a_commit_after_pass_is_reviewable_instead_of_wedging_the_run(self) -> None:
+        initialized, _, later_head = self._pass_then_commit()
+        second = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        self.assertEqual(second["status"], "REVIEW_PASS")
+        self.assertEqual(second["round"], 2)
+        self.assertEqual(second["reviewed_sha"], later_head)
+
+    def test_pass_without_a_new_commit_refuses_a_second_paid_review(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation, "implemented\n")
+        first = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        self.assertEqual(first["status"], "REVIEW_PASS")
+        refused = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=1,
+        )
+        self.assertEqual(refused["status"], "WORKFLOW_ERROR")
+        self.assertIn("already holds a PASS", refused["error"])
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(state["reviews"]), 1)
+        self.assertEqual(len(state["review_invocations"]), 1)
+
+    def test_accept_binds_to_the_head_reviewed_after_the_post_pass_commit(self) -> None:
+        initialized, _, later_head = self._pass_then_commit()
+        second = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        accepted = self.workflow(
+            "accept", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+            "--review-file", str(second["report_path"]),
+        )
+        self.assertTrue(accepted["all_batches_accepted"])
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["accepted_shas"]["1"], later_head)
+
+    def test_the_superseded_pass_report_cannot_authorize_the_new_head(self) -> None:
+        initialized, first, _ = self._pass_then_commit()
+        self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        refused = self.workflow(
+            "accept", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+            "--review-file", str(first["report_path"]), expected=1,
+        )
+        self.assertEqual(refused["status"], "WORKFLOW_ERROR")
+        self.assertIn("does not authorize the current batch and HEAD", refused["error"])
+
+    def test_finalize_names_both_shas_when_head_moved_past_acceptance(self) -> None:
+        initialized = self.initialize("codex")
+        accepted_head, _ = self.review_accept(initialized)
+        implementation = Path(str(initialized["implementation_worktree"]))
+        stray = self.commit_batch_change(implementation, "an extra commit after acceptance\n")
+        refused = self.workflow(
+            "finalize", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=1,
+        )
+        self.assertIn(stray[:12], refused["error"])
+        self.assertIn(accepted_head[:12], refused["error"])
+        self.assertIn("supersede", refused["error"])
+
+    def test_accept_is_still_refused_before_any_passing_review(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation, "implemented\n")
+        refused = self.workflow(
+            "accept", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+            "--review-file", str(Path(str(initialized["run_directory"])) / "workflow.json"),
+            expected=1,
+        )
+        self.assertIn("accept is not allowed from workflow status", refused["error"])
+
     def test_obligation_drift_reaches_a_typed_decision_with_both_exits(self) -> None:
         """A finding restated at a third location stops the batch and offers a real choice."""
         initialized = self.initialize("codex")

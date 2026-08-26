@@ -2,6 +2,18 @@
 
 All notable changes use semantic versioning.
 
+## [0.4.3] - 2026-08-26
+
+- Gave a run a forward move after a commit lands on top of a passing review. A PASS authorizes one
+  exact SHA, so a later commit left `accept` refusing on the SHA binding while `review` refused on
+  status, and the only escapes were resetting the worktree or superseding the run. The batch is not
+  accepted yet, so `review` now runs from `AWAITING_ACCEPTANCE` and the new commit earns its own
+  round; reviewing a SHA that already holds a PASS is refused so the change cannot buy a second paid
+  review. Acceptance still binds to the exact reviewed SHA through every existing check.
+- Made the two remaining head-movement refusals actionable instead of terminal-looking: finalize now
+  names the accepted SHA, the current HEAD, and both legal exits, and the plan-snapshot error names
+  the file to restore. Commits past an accepted SHA stay outside the batch contract by design.
+
 ## [0.4.2] - 2026-08-26
 
 - Stopped one finding ID from silently absorbing a widening class of defects. `required_outcome` and
