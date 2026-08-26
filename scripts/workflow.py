@@ -2099,6 +2099,23 @@ def legacy_recovery_open_ids(state: dict[str, Any], batch: str) -> list[str]:
     return []
 
 
+def _normalized_text(value: Any) -> str:
+    """Whitespace- and case-insensitive form used for deterministic obligation comparison."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _obligation_paths(location: Any) -> frozenset[str]:
+    """File paths named by a finding location, ignoring line numbers.
+
+    Line numbers move with every fix commit, so comparing them would report drift for an
+    obligation that never changed. The set of files a defect lives in is the stable part.
+    """
+    return frozenset(
+        match.group(1)
+        for match in re.finditer(r"([\w./\\-]+\.[A-Za-z0-9_]+)(?::\d+)?", str(location or ""))
+    )
+
+
 def apply_convergence_policy(
     state: dict[str, Any], payload: dict[str, Any], batch: str, round_number: int, head: str
 ) -> dict[str, Any]:
@@ -2109,6 +2126,7 @@ def apply_convergence_policy(
     )
     batch_items = {fp: item for fp, item in ledger.items() if item["batch"] == batch}
     id_to_fp = {item["id"]: fp for fp, item in batch_items.items()}
+    all_id_to_fp = {item["id"]: fp for fp, item in ledger.items()}
     legacy_evidence = legacy_untracked_finding_evidence(state, batch)
     seen: set[str] = set()
     decision_reasons: list[str] = []
@@ -2129,6 +2147,22 @@ def apply_convergence_policy(
     for finding_id in payload["resolved_finding_ids"]:
         fingerprint = id_to_fp.get(finding_id)
         if not fingerprint:
+            other_fingerprint = all_id_to_fp.get(finding_id)
+            if other_fingerprint:
+                # The cumulative final review's base is the run baseline, so it is required to
+                # judge every batch -- and will therefore confirm fixes that an earlier,
+                # already-accepted batch owns. Rejecting the whole payload for that returned no
+                # verdict at all and burned 49.8 minutes across two adapters. Record it and leave
+                # authority with the owning batch: confirming another batch's fix is not this
+                # review's transition to make.
+                warnings.append(
+                    {
+                        "code": "CROSS_BATCH_RESOLUTION",
+                        "finding_id": finding_id,
+                        "owning_batch": ledger[other_fingerprint]["batch"],
+                    }
+                )
+                continue
             sources = legacy_evidence.get(finding_id)
             if sources:
                 warnings.append(
@@ -2170,8 +2204,28 @@ def apply_convergence_policy(
             raise ReviewContractError(
                 f"finding ID {finding['id']} is already bound to fingerprint {id_to_fp[finding['id']]}"
             )
-        if existing and existing["batch"] != batch:
-            raise ReviewContractError(f"finding fingerprint already belongs to another batch: {fingerprint}")
+        owner_fingerprint = fingerprint if existing else all_id_to_fp.get(finding["id"])
+        owner = ledger.get(owner_fingerprint) if owner_fingerprint else None
+        if owner is not None and owner["batch"] != batch:
+            # Same reason as CROSS_BATCH_RESOLUTION: the reviewer re-observed a defect an earlier
+            # batch owns. Record the observation, leave that batch's status, severity and blocking
+            # flag alone, and route only a catastrophic one to the user. P0 always blocks; a P1 or
+            # P2 outside this batch's authority is a warning, not a reason to stall the run.
+            owner["last_seen_round"] = round_number
+            owner["last_seen_sha"] = head
+            owner["occurrences"] = owner.get("occurrences", 1) + 1
+            warnings.append(
+                {
+                    "code": "CROSS_BATCH_FINDING",
+                    "finding_id": finding["id"],
+                    "fingerprint": fingerprint,
+                    "owning_batch": owner["batch"],
+                    "severity": finding["severity"],
+                }
+            )
+            if finding["severity"] == "P0":
+                decision_reasons.append(f"CROSS_BATCH_MATERIAL_FINDING:{finding['id']}")
+            continue
         if existing:
             if existing["id"] != finding["id"]:
                 raise ReviewContractError(
@@ -2190,6 +2244,38 @@ def apply_convergence_policy(
                     )
                 if old_severity == "P2" and new_severity in {"P0", "P1"}:
                     decision_reasons.append(f"SEVERITY_UPGRADE:{finding['id']}")
+            # `required_outcome` is what "fixed" means for this finding, and it used to be
+            # overwritten silently every round. Measured on five stuck findings, one ID absorbed a
+            # whole class of defects: F-B05-002 was restated at five locations across three files
+            # over five rounds, each restatement looking narrow on its own. The host satisfied the
+            # named site, the obligation moved, `occurrences` grew, and the finding never closed --
+            # slipping past the round-2+ rule that would otherwise have deferred a late
+            # INITIAL_REVIEW discovery. Line numbers are excluded from the comparison because they
+            # move with every commit; the files a defect lives in are the stable part.
+            previous_paths = _obligation_paths(existing.get("location"))
+            current_paths = _obligation_paths(finding["location"])
+            obligation_changed = (
+                _normalized_text(existing.get("required_outcome"))
+                != _normalized_text(finding["required_outcome"])
+                or previous_paths != current_paths
+            )
+            revisions = list(existing.get("obligation_revisions", []))
+            if obligation_changed:
+                revisions.append(
+                    {
+                        "round": round_number,
+                        "from_required_outcome": existing.get("required_outcome"),
+                        "to_required_outcome": finding["required_outcome"],
+                        "from_paths": sorted(previous_paths),
+                        "to_paths": sorted(current_paths),
+                    }
+                )
+                # Only a round that moves the obligation again can force the decision. A finding
+                # whose obligation has stabilised must be allowed to converge.
+                if len(revisions) >= 2:
+                    decision_reasons.append(f"OBLIGATION_DRIFT:{finding['id']}")
+            existing.setdefault("original_required_outcome", existing.get("required_outcome"))
+            existing.setdefault("original_location", existing.get("location"))
             existing.update(
                 {
                     "severity": new_severity,
@@ -2197,6 +2283,7 @@ def apply_convergence_policy(
                     "trigger": finding["trigger"],
                     "consequence": finding["consequence"],
                     "required_outcome": finding["required_outcome"],
+                    "obligation_revisions": revisions,
                     "last_seen_round": round_number,
                     "last_seen_sha": head,
                     "occurrences": existing.get("occurrences", 1) + 1,
@@ -3240,11 +3327,16 @@ def command_review(args: argparse.Namespace) -> None:
     if policy["effective_verdict"] == "NEEDS_USER_DECISION":
         allowed = ["ABORT_RUN"]
         if any(
-            reason == "NO_PROGRESS_FOR_TWO_ROUNDS" or reason.startswith("SEVERITY_UPGRADE:")
+            reason == "NO_PROGRESS_FOR_TWO_ROUNDS"
+            or reason.startswith("SEVERITY_UPGRADE:")
+            or reason.startswith("OBLIGATION_DRIFT:")
             for reason in policy["decision_reasons"]
         ):
             allowed.insert(0, "RETURN_TO_FIX")
-        if "REVIEWER_REQUESTED_DECISION" in policy["decision_reasons"]:
+        if "REVIEWER_REQUESTED_DECISION" in policy["decision_reasons"] or any(
+            reason.startswith("CROSS_BATCH_MATERIAL_FINDING:")
+            for reason in policy["decision_reasons"]
+        ):
             allowed.insert(0, "RESUME_WITH_DECISION")
         maximum = state["budgets"]["max_quality_rounds_per_batch"]
         granted = int(state["extra_review_rounds_granted"].get(args.batch, 0))

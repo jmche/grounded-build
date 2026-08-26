@@ -2,6 +2,20 @@
 
 All notable changes use semantic versioning.
 
+## [0.4.2] - 2026-08-26
+
+- Stopped one finding ID from silently absorbing a widening class of defects. `required_outcome` and
+  the files a finding names are now frozen when first stated; each restatement is recorded in
+  `obligation_revisions`, and a second one stops the batch for a typed decision instead of another
+  round. Measured on nine recorded runs, five findings had been restated up to five times across
+  three files each, which is how batches reached round five without converging. Line numbers are
+  excluded from the comparison because they move with every fix commit.
+- Stopped rejecting a whole review because it referenced an earlier batch's finding. The cumulative
+  final review's base is the run baseline, so it is required to judge every batch and will confirm or
+  re-observe findings an accepted batch owns; that rejection returned no verdict at all and cost 49.8
+  minutes across two adapters. Both cases are now warnings, authority stays with the owning batch, and
+  only a cross-batch P0 raises a typed decision.
+
 ## [0.4.1] - 2026-08-25
 
 - Recorded and froze the implementation workflow's controller Python identity so PATH changes cannot

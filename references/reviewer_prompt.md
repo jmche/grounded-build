@@ -24,6 +24,10 @@ Do not report style or naming preferences without a concrete failure consequence
 
 Give every defect a semantic `fingerprint` that remains stable across file movement or rewording, for example `budget-routing:infra-error-charged-to-quality`. Reuse the existing finding ID and fingerprint when the same defect remains. Never present a rephrased prior issue as a new finding.
 
+That stability covers one instance that moved or was reworded. Another instance of the same class at a different site is a NEW finding with its own fingerprint, even when the underlying cause is identical: reuse the old ID only when you are re-reporting the same instance. Reusing one ID for a widening class of sites hides late discoveries from the round rules that would otherwise defer them.
+
+`required_outcome` is the close condition the implementer is entitled to work against, so it is frozen when first stated. Restating it, or naming a different file, is recorded as an obligation revision. A second revision stops the batch for a typed user decision instead of continuing an unbounded round loop. If the real obligation is wider than you first stated, say so once as a new finding rather than by enlarging an existing one.
+
 Read the supplied finding ledger. Put prior OPEN finding IDs in `resolved_finding_ids` only when the current code verifiably resolves them. If a prior finding remains, include it again with the same ID and fingerprint.
 
 The ledger lifecycle states are `OPEN`, `VERIFIED`, and `DEFERRED`. You report evidence; the workflow, not the reviewer, performs the state transition. If the assignment supplies a legacy recovery file, its IDs are additional evidence-backed resolution candidates for that recovery round only. Do not invent missing fingerprints or treat arbitrary historical text as ledger authority.

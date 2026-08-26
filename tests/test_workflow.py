@@ -111,6 +111,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
                     }}
                 else:
                     requests = json.loads(os.environ.get("FAKE_VERIFICATION_REQUESTS", "[]"))
+                    injected_findings = json.loads(os.environ.get("FAKE_FINDINGS", "[]"))
                     needs_review_decision = os.environ.get("FAKE_REVIEW_NEEDS_DECISION") == "1"
                     evidence_ids = []
                     evidence_match = re.search(r"- Fixed-SHA verification evidence: `([^`]+)`", prompt)
@@ -129,9 +130,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
                         "reviewed_sha": field("Head SHA"),
                         "base_sha": field("Base SHA"),
                         "batch": field("Batch"),
-                        "verdict": "NEEDS_VERIFICATION" if requests else ("NEEDS_USER_DECISION" if needs_review_decision else "PASS"),
+                        "verdict": "NEEDS_VERIFICATION" if requests else ("NEEDS_USER_DECISION" if needs_review_decision else ("FAIL" if injected_findings else "PASS")),
                         "summary": "fixture review",
-                        "findings": [],
+                        "findings": injected_findings,
                         "resolved_finding_ids": json.loads(
                             os.environ.get("FAKE_RESOLVED_FINDING_IDS", "[]")
                         ),
@@ -886,6 +887,56 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(reviewed["status"], "REVIEW_PASS")
 
+    def test_obligation_drift_reaches_a_typed_decision_with_both_exits(self) -> None:
+        """A finding restated at a third location stops the batch and offers a real choice."""
+        initialized = self.initialize("codex")
+        run_id = str(initialized["run_id"])
+        implementation = Path(str(initialized["implementation_worktree"]))
+
+        def drifting(location: str, outcome: str) -> str:
+            return json.dumps([{
+                "id": "F-1-001", "fingerprint": "drifting-obligation", "severity": "P1",
+                "novelty": "INITIAL_REVIEW", "why_not_detectable_earlier": "",
+                "introduced_by_sha": "", "severity_change_justification": "",
+                "location": location, "trigger": "the declared input",
+                "consequence": "the declared failure", "required_outcome": outcome,
+            }])
+
+        self.commit_batch_change(implementation, "implemented round 1\n")
+        self.environment["FAKE_FINDINGS"] = drifting("one.py:10", "enforce it at the write boundary")
+        first = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1", expected=2,
+        )
+        self.assertEqual(first["status"], "REVIEW_FAIL")
+
+        self.commit_batch_change(implementation, "implemented round 2\n")
+        self.environment["FAKE_FINDINGS"] = drifting("two.py:20", "reject every produced filename")
+        second = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1", expected=2,
+        )
+        self.assertEqual(second["status"], "REVIEW_FAIL")
+        self.assertNotIn("OBLIGATION_DRIFT:F-1-001", second["decision_reasons"])
+
+        self.commit_batch_change(implementation, "implemented round 3\n")
+        self.environment["FAKE_FINDINGS"] = drifting(
+            "three.py:30", "reject every produced path or directory component"
+        )
+        third = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1", expected=3,
+        )
+        self.assertEqual(third["status"], "NEEDS_USER_DECISION")
+        self.assertIn("OBLIGATION_DRIFT:F-1-001", third["decision_reasons"])
+        status = self.workflow("status", "--project", str(self.project), "--run-id", run_id)
+        allowed = status["pending_decision"]["allowed_choices"]
+        self.assertIn("RETURN_TO_FIX", allowed)
+        self.assertIn("DEFER_ELIGIBLE_P1", allowed)
+        entry = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )["finding_ledger"]["drifting-obligation"]
+        self.assertEqual(entry["original_required_outcome"], "enforce it at the write boundary")
+        self.assertEqual(len(entry["obligation_revisions"]), 2)
+        self.environment.pop("FAKE_FINDINGS")
+
 
 class ConvergencePolicyTests(unittest.TestCase):
     @staticmethod
@@ -1160,6 +1211,310 @@ class ConvergencePolicyTests(unittest.TestCase):
                 WORKFLOW_MODULE.ReviewContractError, "old-blocker"
             ):
                 self.apply(state, self.payload("PASS", []), 5)
+
+
+class ConvergencePolicyFindingBuilder(unittest.TestCase):
+    """Shared construction helpers for the cross-batch and obligation-drift suites."""
+
+    BATCH = "1"
+
+    @staticmethod
+    def state(ledger: dict | None = None) -> dict:
+        return {"finding_ledger": ledger or {}, "batch_convergence": {}}
+
+    @staticmethod
+    def finding(
+        finding_id: str,
+        fingerprint: str,
+        severity: str = "P1",
+        novelty: str = "INITIAL_REVIEW",
+        location: str = "pkg/module.py:10",
+        required_outcome: str = "preserve the required behavior",
+    ) -> dict:
+        return {
+            "id": finding_id,
+            "fingerprint": fingerprint,
+            "severity": severity,
+            "novelty": novelty,
+            "why_not_detectable_earlier": "",
+            "introduced_by_sha": "a" * 40 if novelty == "INTRODUCED_BY_FIX" else "",
+            "severity_change_justification": "",
+            "location": location,
+            "trigger": "specific input",
+            "consequence": "observable failure",
+            "required_outcome": required_outcome,
+        }
+
+    @staticmethod
+    def owned_entry(finding_id: str, batch: str, severity: str = "P1") -> dict:
+        return {
+            "id": finding_id,
+            "fingerprint": "owned-elsewhere",
+            "batch": batch,
+            "severity": severity,
+            "novelty": "INITIAL_REVIEW",
+            "status": "VERIFIED",
+            "blocking": severity != "P2",
+            "deferred_reason": None,
+            "location": "other/module.py:5",
+            "required_outcome": "the other batch's obligation",
+            "first_seen_round": 1,
+            "first_seen_sha": "b" * 40,
+            "last_seen_round": 1,
+            "last_seen_sha": "b" * 40,
+            "occurrences": 1,
+        }
+
+    def apply(self, state: dict, payload: dict, round_number: int) -> dict:
+        return WORKFLOW_MODULE.apply_convergence_policy(
+            state, payload, self.BATCH, round_number, f"{round_number:040x}"
+        )
+
+    @staticmethod
+    def payload(verdict: str, findings: list, resolved: list | None = None) -> dict:
+        return {
+            "verdict": verdict,
+            "findings": findings,
+            "resolved_finding_ids": resolved or [],
+        }
+
+    def runTest(self) -> None:  # pragma: no cover - container only
+        pass
+
+
+class CrossBatchFindingTests(ConvergencePolicyFindingBuilder):
+    """A review may reference an earlier batch's finding without losing the whole payload."""
+
+    def test_cross_batch_resolution_is_warned_not_rejected(self) -> None:
+        ledger = {"owned-elsewhere": self.owned_entry("F-B03-004", "0")}
+        ledger["owned-elsewhere"]["status"] = "OPEN"
+        state = self.state(ledger)
+        result = self.apply(state, self.payload("PASS", [], ["F-B03-004"]), 1)
+        self.assertEqual(result["effective_verdict"], "PASS")
+        codes = [item["code"] for item in result["warnings"]]
+        self.assertIn("CROSS_BATCH_RESOLUTION", codes)
+        # Authority stays with the owning batch: its status is untouched.
+        self.assertEqual(state["finding_ledger"]["owned-elsewhere"]["status"], "OPEN")
+
+    def test_unknown_resolution_outside_any_batch_is_still_rejected(self) -> None:
+        state = self.state()
+        with self.assertRaises(WORKFLOW_MODULE.ReviewContractError):
+            self.apply(state, self.payload("PASS", [], ["F-NOWHERE-001"]), 1)
+
+    def test_cross_batch_p2_finding_is_warned_and_does_not_block(self) -> None:
+        state = self.state({"owned-elsewhere": self.owned_entry("F-B03-004", "0", "P2")})
+        finding = self.finding("F-B03-004", "owned-elsewhere", "P2")
+        result = self.apply(state, self.payload("PASS", [finding]), 1)
+        self.assertEqual(result["effective_verdict"], "PASS")
+        warning = next(w for w in result["warnings"] if w["code"] == "CROSS_BATCH_FINDING")
+        self.assertEqual(warning["owning_batch"], "0")
+        owner = state["finding_ledger"]["owned-elsewhere"]
+        self.assertEqual(owner["occurrences"], 2)
+        self.assertEqual(owner["status"], "VERIFIED")
+        self.assertEqual(owner["batch"], "0")
+
+    def test_cross_batch_p1_finding_records_but_does_not_stall_the_run(self) -> None:
+        state = self.state({"owned-elsewhere": self.owned_entry("F-B03-004", "0")})
+        finding = self.finding("F-B03-004", "owned-elsewhere", "P1")
+        result = self.apply(state, self.payload("PASS", [finding]), 1)
+        self.assertEqual(result["effective_verdict"], "PASS")
+        self.assertEqual(result["decision_reasons"], [])
+
+    def test_cross_batch_p0_finding_requires_a_user_decision(self) -> None:
+        state = self.state({"owned-elsewhere": self.owned_entry("F-B03-004", "0")})
+        finding = self.finding("F-B03-004", "owned-elsewhere", "P0")
+        result = self.apply(state, self.payload("PASS", [finding]), 1)
+        self.assertEqual(result["effective_verdict"], "NEEDS_USER_DECISION")
+        self.assertIn("CROSS_BATCH_MATERIAL_FINDING:F-B03-004", result["decision_reasons"])
+
+    def test_cross_batch_id_reuse_with_new_fingerprint_does_not_duplicate_the_id(self) -> None:
+        state = self.state({"owned-elsewhere": self.owned_entry("F-B03-004", "0")})
+        finding = self.finding("F-B03-004", "a-brand-new-fingerprint", "P2")
+        result = self.apply(state, self.payload("PASS", [finding]), 1)
+        self.assertNotIn("a-brand-new-fingerprint", state["finding_ledger"])
+        self.assertIn("CROSS_BATCH_FINDING", [w["code"] for w in result["warnings"]])
+
+    def test_same_batch_id_rebinding_is_still_rejected(self) -> None:
+        state = self.state()
+        self.apply(state, self.payload("FAIL", [self.finding("F-1", "first-fp")]), 1)
+        with self.assertRaises(WORKFLOW_MODULE.ReviewContractError):
+            self.apply(state, self.payload("FAIL", [self.finding("F-1", "second-fp")]), 2)
+
+
+class ObligationDriftTests(ConvergencePolicyFindingBuilder):
+    """One finding ID may not absorb an expanding class of defects without a bound."""
+
+    def test_unchanged_obligation_records_no_revision(self) -> None:
+        state = self.state()
+        finding = self.finding("F-1", "stable")
+        self.apply(state, self.payload("FAIL", [finding]), 1)
+        result = self.apply(state, self.payload("FAIL", [finding]), 2)
+        entry = state["finding_ledger"]["stable"]
+        self.assertEqual(entry.get("obligation_revisions"), [])
+        self.assertEqual(entry["occurrences"], 2)
+        self.assertNotIn("OBLIGATION_DRIFT:F-1", result["decision_reasons"])
+
+    def test_line_number_movement_is_not_obligation_drift(self) -> None:
+        state = self.state()
+        self.apply(
+            state,
+            self.payload("FAIL", [self.finding("F-1", "stable", location="pkg/module.py:10")]),
+            1,
+        )
+        self.apply(
+            state,
+            self.payload(
+                "FAIL",
+                [self.finding("F-1", "stable", location="pkg/module.py:2200-2260")],
+            ),
+            2,
+        )
+        self.assertEqual(state["finding_ledger"]["stable"]["obligation_revisions"], [])
+
+    def test_changed_required_outcome_records_one_revision_without_a_decision(self) -> None:
+        state = self.state()
+        self.apply(state, self.payload("FAIL", [self.finding("F-1", "drifting")]), 1)
+        result = self.apply(
+            state,
+            self.payload(
+                "FAIL",
+                [self.finding("F-1", "drifting", required_outcome="reject every produced path")],
+            ),
+            2,
+        )
+        entry = state["finding_ledger"]["drifting"]
+        self.assertEqual(len(entry["obligation_revisions"]), 1)
+        self.assertEqual(entry["obligation_revisions"][0]["round"], 2)
+        self.assertNotIn("OBLIGATION_DRIFT:F-1", result["decision_reasons"])
+        self.assertEqual(result["effective_verdict"], "FAIL")
+
+    def test_relocation_to_another_file_counts_as_a_revision(self) -> None:
+        state = self.state()
+        self.apply(
+            state,
+            self.payload("FAIL", [self.finding("F-1", "drifting", location="a/one.py:338")]),
+            1,
+        )
+        self.apply(
+            state,
+            self.payload("FAIL", [self.finding("F-1", "drifting", location="b/two.py:97")]),
+            2,
+        )
+        revisions = state["finding_ledger"]["drifting"]["obligation_revisions"]
+        self.assertEqual(len(revisions), 1)
+        self.assertEqual(revisions[0]["from_paths"], ["a/one.py"])
+        self.assertEqual(revisions[0]["to_paths"], ["b/two.py"])
+
+    def test_second_revision_forces_a_typed_user_decision(self) -> None:
+        state = self.state()
+        for round_number, location in ((1, "a/one.py:1"), (2, "b/two.py:2"), (3, "c/three.py:3")):
+            result = self.apply(
+                state,
+                self.payload("FAIL", [self.finding("F-1", "drifting", location=location)]),
+                round_number,
+            )
+        self.assertEqual(result["effective_verdict"], "NEEDS_USER_DECISION")
+        self.assertIn("OBLIGATION_DRIFT:F-1", result["decision_reasons"])
+
+    def test_original_obligation_is_preserved_for_audit(self) -> None:
+        state = self.state()
+        self.apply(
+            state,
+            self.payload(
+                "FAIL",
+                [self.finding("F-1", "drifting", required_outcome="the first ask")],
+            ),
+            1,
+        )
+        self.apply(
+            state,
+            self.payload(
+                "FAIL",
+                [self.finding("F-1", "drifting", required_outcome="a much wider ask")],
+            ),
+            2,
+        )
+        entry = state["finding_ledger"]["drifting"]
+        self.assertEqual(entry["original_required_outcome"], "the first ask")
+        self.assertEqual(entry["required_outcome"], "a much wider ask")
+        self.assertEqual(entry["original_location"], "pkg/module.py:10")
+
+    def test_a_stabilised_obligation_stops_forcing_decisions(self) -> None:
+        state = self.state()
+        self.apply(state, self.payload("FAIL", [self.finding("F-1", "drifting", location="a/one.py:1")]), 1)
+        self.apply(state, self.payload("FAIL", [self.finding("F-1", "drifting", location="b/two.py:2")]), 2)
+        third = self.apply(
+            state, self.payload("FAIL", [self.finding("F-1", "drifting", location="c/three.py:3")]), 3
+        )
+        self.assertIn("OBLIGATION_DRIFT:F-1", third["decision_reasons"])
+        fourth = self.apply(
+            state, self.payload("FAIL", [self.finding("F-1", "drifting", location="c/three.py:9")]), 4
+        )
+        self.assertNotIn("OBLIGATION_DRIFT:F-1", fourth["decision_reasons"])
+
+    def test_recorded_five_round_drift_is_caught_two_rounds_earlier(self) -> None:
+        """Replays F-B05-002, which was restated at five locations over five rounds."""
+        observed = [
+            ("da-evaluator/scripts/evaluator_synthesizer_agent.py:338", "persist a durable typed park record"),
+            ("scripts/provider_park.py:97", "persist a durable typed park record"),
+            ("da-evaluator/scripts/run_evaluator_fanout.py:1974", "consult the park after the launch that observed the refusal"),
+            ("da-evaluator/scripts/run_evaluator_fanout.py:1606", "every operation recording a park must have a later reader"),
+            ("scripts/run_fanout.py:433", "give run_fanout.run its own park consult and typed return"),
+        ]
+        state = self.state()
+        fired_at = None
+        for index, (location, outcome) in enumerate(observed, start=1):
+            result = self.apply(
+                state,
+                self.payload(
+                    "FAIL",
+                    [
+                        self.finding(
+                            "F-B05-002", "provider-park",
+                            location=location, required_outcome=outcome,
+                        )
+                    ],
+                ),
+                index,
+            )
+            if fired_at is None and "OBLIGATION_DRIFT:F-B05-002" in result["decision_reasons"]:
+                fired_at = index
+        self.assertEqual(fired_at, 3)
+        self.assertEqual(len(state["finding_ledger"]["provider-park"]["obligation_revisions"]), 4)
+
+    def test_ledger_entry_written_before_this_change_still_converges(self) -> None:
+        """A run created without the drift fields must review and converge unchanged."""
+        legacy = {
+            "id": "F-1", "fingerprint": "pre-existing-entry", "batch": self.BATCH,
+            "severity": "P1", "novelty": "INITIAL_REVIEW", "status": "OPEN", "blocking": True,
+            "deferred_reason": None, "location": "pkg/module.py:10",
+            "required_outcome": "preserve the required behavior",
+            "first_seen_round": 1, "first_seen_sha": "c" * 40,
+            "last_seen_round": 1, "last_seen_sha": "c" * 40, "occurrences": 1,
+        }
+        state = self.state({"pre-existing-entry": legacy})
+        state["batch_convergence"] = {self.BATCH: {
+            "last_blocking_count": 1, "no_progress_streak": 0, "history": [],
+        }}
+        result = self.apply(
+            state, self.payload("FAIL", [self.finding("F-1", "pre-existing-entry")]), 2
+        )
+        entry = state["finding_ledger"]["pre-existing-entry"]
+        self.assertEqual(entry["obligation_revisions"], [])
+        self.assertEqual(entry["original_required_outcome"], "preserve the required behavior")
+        self.assertEqual(result["effective_verdict"], "FAIL")
+        resolved = self.apply(state, self.payload("PASS", [], ["F-1"]), 3)
+        self.assertEqual(resolved["effective_verdict"], "PASS")
+
+    def test_cross_batch_ownership_is_decided_before_obligation_drift(self) -> None:
+        state = self.state({"owned-elsewhere": self.owned_entry("F-B03-004", "0")})
+        finding = self.finding(
+            "F-B03-004", "owned-elsewhere", "P2",
+            location="somewhere/else.py:1", required_outcome="a different ask",
+        )
+        result = self.apply(state, self.payload("PASS", [finding]), 2)
+        self.assertIn("CROSS_BATCH_FINDING", [w["code"] for w in result["warnings"]])
+        self.assertNotIn("obligation_revisions", state["finding_ledger"]["owned-elsewhere"])
 
 
 class ReviewerSchemaCompatibilityTests(unittest.TestCase):

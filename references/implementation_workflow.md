@@ -297,6 +297,11 @@ Pause despite `auto` when a fix expands scope, conflicts with the plan, changes 
 
 Fix in `implementation_worktree`, commit, and call `review` again for the same batch. The script requires a new fix commit after `REVIEW_FAIL` and reuses the reviewer worktree at the new SHA.
 
+Read `warnings` and `decision_reasons` on every review result:
+
+- `CROSS_BATCH_RESOLUTION` / `CROSS_BATCH_FINDING`: the reviewer referenced a finding an earlier batch owns. The observation is recorded, that batch keeps authority over its own status, and only a cross-batch P0 raises `CROSS_BATCH_MATERIAL_FINDING` for adjudication.
+- `OBLIGATION_DRIFT:<finding-id>`: the finding's `required_outcome` or the files it names changed for the second time. The ledger keeps `original_required_outcome`, `original_location`, and the full `obligation_revisions` history. Present that history when adjudicating: a requirement restated at three sites is a widening class, not one unfixed defect, and `RETURN_TO_FIX` or `DEFER_ELIGIBLE_P1` are both legitimate answers.
+
 Convergence policy:
 
 - Round 1 is the complete discovery review.

@@ -13,8 +13,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TEXT_SUFFIXES = {"", ".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
+# Mirrors .gitignore: these are local runtime artifacts, not distributed skill sources. `.omc`
+# holds oh-my-claudecode session state, which records prompt text in the operator's own language.
 IGNORED_PARTS = {
-    ".agents", ".codex", ".git", ".pytest_cache", ".ipynb_checkpoints", "__pycache__",
+    ".agents", ".codex", ".git", ".pytest_cache", ".ipynb_checkpoints", "__pycache__", ".omc",
 }
 
 

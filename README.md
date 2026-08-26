@@ -6,7 +6,7 @@ Grounded Build is a local coding-agent skill with two independent modes:
    drafting, integrate each other's evidence without widening scope, and converge on a host-synthesized plan.
 2. **Implement:** execute an approved plan batch by batch in isolated Git worktrees with fixed-SHA review, bounded repair, evidence tracking, and explicit final integration.
 
-Version `v0.4.1` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude`, `codex`, or `dsh` CLI adapters are required.
+Version `v0.4.2` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude`, `codex`, or `dsh` CLI adapters are required.
 
 The sandbox is exercised with Claude Code 2.1.238 and Codex CLI 0.149.0. Codex is treated as an adapter: its configured model may be GPT, DeepSeek through an OpenAI-compatible gateway, or another model. The run freezes and reports the non-secret model identity separately from the adapter.
 
