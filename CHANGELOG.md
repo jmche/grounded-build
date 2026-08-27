@@ -2,6 +2,16 @@
 
 All notable changes use semantic versioning.
 
+## [0.4.5] - 2026-08-27
+
+- Gave the reviewer-invocation budget the same single explicit grant the round budget beside it
+  already had. Exhausting it offered only `ABORT_RUN` and `DEFER_ELIGIBLE_P1`, and `DEFER` refuses
+  outright when the batch holds no eligible OPEN P1 -- so a bounded resource that one decision could
+  release could instead end the run. `GRANT_ONE_REVIEW_INVOCATION` releases one more call, once per
+  batch, and restores the status the run parked from. Both the decision guard and the guard inside
+  `next_invocation` honour the grant; honouring only the first would have handed out a grant that
+  bought nothing.
+
 ## [0.4.4] - 2026-08-26
 
 - Made TARGET_ADVANCED parking resumable instead of terminal-only. `target_staleness` re-reads the

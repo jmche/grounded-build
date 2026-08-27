@@ -757,7 +757,11 @@ def next_invocation(
         counts = state["usage"]["review_invocations_by_batch"]
         counts[batch] = int(counts.get(batch, 0)) + 1
         number = counts[batch]
-        if number > state["budgets"]["max_review_invocations_per_batch"]:
+        # Must honour the same grant the typed decision hands out, or an approved extra
+        # invocation would be refused here and the grant would buy nothing.
+        if number > int(state["budgets"]["max_review_invocations_per_batch"]) + int(
+            state.get("extra_review_invocations_granted", {}).get(batch, 0)
+        ):
             raise WorkflowError(f"reviewer invocation budget exhausted for batch {batch}")
         root = (
             Path(state["run_directory"]) / "reviews" / f"batch_{slug(batch)}"
@@ -892,6 +896,7 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
         state.setdefault("usage", default_usage())
         state.setdefault("pending_decision", None)
         state.setdefault("extra_review_rounds_granted", {})
+        state.setdefault("extra_review_invocations_granted", {})
         state.setdefault("extra_verification_attempts_granted", {})
         state.setdefault("host_network_authorizations", {})
         state.setdefault("final_verification", None)
@@ -1272,6 +1277,7 @@ def command_init(args: argparse.Namespace) -> None:
         "usage": default_usage(),
         "pending_decision": None,
         "extra_review_rounds_granted": {},
+        "extra_review_invocations_granted": {},
         "extra_verification_attempts_granted": {},
         "host_network_authorizations": {},
         "final_verification": None,
@@ -3181,16 +3187,26 @@ def command_review(args: argparse.Namespace) -> None:
     git(reviewer_path, "switch", "--detach", head)
     ensure_clean(reviewer_path, "reviewer")
 
+    # An invocation budget is a bounded resource like the round budget beside it, and running
+    # out of one is a fact that a single grant can change -- yet this decision used to offer only
+    # ABORT_RUN and DEFER_ELIGIBLE_P1, and DEFER refuses outright when the batch holds no eligible
+    # OPEN P1, leaving abandonment as the only move. It now mirrors REVIEW_BUDGET_EXHAUSTED: one
+    # explicit extra invocation, once per batch, restoring the status the run parked from.
     if (
         not args.dry_run
         and int(state["usage"]["review_invocations_by_batch"].get(args.batch, 0))
         >= int(state["budgets"]["max_review_invocations_per_batch"])
+        + int(state["extra_review_invocations_granted"].get(args.batch, 0))
     ):
+        previous_status = state["status"]
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
             "decision_id": f"review-call-budget-{slug(args.batch)}-{len(state['decisions']) + 1:03d}",
             "type": "REVIEW_INVOCATION_BUDGET_EXHAUSTED", "batch": args.batch,
-            "allowed_choices": ["ABORT_RUN", "DEFER_ELIGIBLE_P1"],
+            "allowed_choices": [
+                "GRANT_ONE_REVIEW_INVOCATION", "DEFER_ELIGIBLE_P1", "ABORT_RUN",
+            ],
+            "previous_status": previous_status,
             "created_at": utc_now(),
         }
         append_event(state, "DECISION_REQUIRED", state["pending_decision"])
@@ -3568,6 +3584,13 @@ def command_adjudicate(args: argparse.Namespace) -> None:
             raise WorkflowError("review grant requires a batch-scoped decision")
         if int(state["extra_review_rounds_granted"].get(batch, 0)) >= 1:
             raise WorkflowError("the single extra review grant was already used for this batch")
+    elif args.choice == "GRANT_ONE_REVIEW_INVOCATION":
+        batch = pending.get("batch")
+        if not isinstance(batch, str):
+            raise WorkflowError("invocation grant requires a batch-scoped decision")
+        if int(state.get("extra_review_invocations_granted", {}).get(batch, 0)) >= 1:
+            raise WorkflowError(
+                "the single extra review invocation grant was already used for this batch")
     elif args.choice == "DEFER_ELIGIBLE_P1":
         if not finding_ids:
             raise WorkflowError("DEFER_ELIGIBLE_P1 requires --finding-ids")
@@ -3598,6 +3621,9 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         batch = str(pending["batch"])
         state["extra_review_rounds_granted"][batch] = 1
         state["status"] = "CHANGES_REQUESTED"
+    elif args.choice == "GRANT_ONE_REVIEW_INVOCATION":
+        state.setdefault("extra_review_invocations_granted", {})[str(pending["batch"])] = 1
+        state["status"] = str(pending.get("previous_status", "CHANGES_REQUESTED"))
     elif args.choice == "DEFER_ELIGIBLE_P1":
         ledger_by_id = {item["id"]: item for item in state["finding_ledger"].values()}
         for finding_id in finding_ids:

@@ -1254,6 +1254,82 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertIn("accept is not allowed from workflow status", refused["error"])
 
+    def _exhaust_review_invocations(self, initialized: dict) -> None:
+        """Burn the batch's invocation budget on reviewer errors, which consume no round."""
+        self.environment["FAKE_CODEX_EXIT"] = "1"
+        for _ in range(10):
+            self.workflow(
+                "review", "--project", str(self.project),
+                "--run-id", str(initialized["run_id"]), "--batch", "1", expected=4,
+            )
+        self.environment.pop("FAKE_CODEX_EXIT")
+
+    def test_invocation_budget_exhaustion_offers_one_explicit_grant(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation, "implemented\n")
+        self._exhaust_review_invocations(initialized)
+        parked = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=3,
+        )
+        self.assertEqual(parked["reason"], "REVIEW_INVOCATION_BUDGET_EXHAUSTED")
+        decision = parked["pending_decision"]
+        self.assertIn("GRANT_ONE_REVIEW_INVOCATION", decision["allowed_choices"])
+        self.assertIn("previous_status", decision)
+
+    def test_granted_invocation_restores_the_parked_status_and_is_usable(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation, "implemented\n")
+        self._exhaust_review_invocations(initialized)
+        parked = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=3,
+        )
+        decision_id = parked["pending_decision"]["decision_id"]
+        previous = parked["pending_decision"]["previous_status"]
+        adjudicated = self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--decision-id", decision_id, "--choice", "GRANT_ONE_REVIEW_INVOCATION",
+            "--reason", "one more call to finish the batch", "--actor", "test-user", "--apply",
+        )
+        self.assertEqual(adjudicated["run_status"], previous)
+        # The grant must satisfy both budget guards, so the extra call really runs.
+        review = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        self.assertEqual(review["status"], "REVIEW_PASS")
+
+    def test_only_one_invocation_grant_is_available_per_batch(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation, "implemented\n")
+        self._exhaust_review_invocations(initialized)
+        for expected_choice_available in (True, False):
+            parked = self.workflow(
+                "review", "--project", str(self.project),
+                "--run-id", str(initialized["run_id"]), "--batch", "1", expected=3,
+            )
+            decision_id = parked["pending_decision"]["decision_id"]
+            args = [
+                "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+                "--decision-id", decision_id, "--choice", "GRANT_ONE_REVIEW_INVOCATION",
+                "--reason", "another call", "--actor", "test-user", "--apply",
+            ]
+            if expected_choice_available:
+                self.workflow(*args)
+                self.environment["FAKE_CODEX_EXIT"] = "1"
+                self.workflow(
+                    "review", "--project", str(self.project),
+                    "--run-id", str(initialized["run_id"]), "--batch", "1", expected=4,
+                )
+                self.environment.pop("FAKE_CODEX_EXIT")
+            else:
+                refused = self.workflow(*args, expected=1)
+                self.assertIn("already used for this batch", refused["error"])
+
     def test_obligation_drift_reaches_a_typed_decision_with_both_exits(self) -> None:
         """A finding restated at a third location stops the batch and offers a real choice."""
         initialized = self.initialize("codex")
