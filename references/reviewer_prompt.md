@@ -63,6 +63,13 @@ the workflow from the original project environment, mounted read-only, and execu
 worktree as cwd. Judge the resulting fixed-SHA evidence; do not demand that `.venv` be copied into a
 review worktree or report an environment-only direct rerun failure as a batch finding.
 
+The workflow enforces this mechanically, so do not try to normalize it: a verification request whose
+executable is a bare python/pypy name (`python`, `python3`, `python3.x`, `pypy`) is refused during
+registration, because the sandbox would resolve it to a system interpreter that never sees the project
+environment, and a request that still reaches a non-`.venv/` python interpreter and fails with a
+module-missing error is classified as retryable infrastructure, never a code failure. Keep `.venv/`-
+relative launchers verbatim or name an explicit absolute interpreter path.
+
 Return one `criterion_results` entry for every acceptance-contract criterion assigned to this batch whenever the verdict is not `NEEDS_VERIFICATION`. A `PASS` verdict requires each result to be `PASS`. Cite supplied fixed-SHA evidence IDs for `COMMAND` criteria; do not treat a pathname or implementer claim as evidence. `REPOSITORY_ASSERTION` criteria may be decided from the reviewed SHA with a concrete rationale. The workflow validates coverage and evidence provenance, while you retain responsibility for semantic judgment.
 
 Do not modify files. Do not create commits, branches, or worktrees. Do not merge, rebase, reset, clean, stash, or push. Return only the requested structured result.

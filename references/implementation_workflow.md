@@ -364,6 +364,15 @@ runs it with the fixed-SHA worktree as the current directory. A reviewer manuall
 worktree therefore cannot rerun `.venv/bin/python ...` directly and must not classify that absence as a
 code failure; use the harness evidence instead.
 
+The same rule is enforced as a mechanism, not left to reviewer judgment: a COMMAND criterion or
+verification request whose executable is a bare python/pypy name (`python`, `python3`, `python3.x`,
+`pypy`) is refused at contract and request validation, because the sandbox resolves it to a system
+interpreter that never sees the project environment, so any project-dependency command is guaranteed
+to fail with a module-missing error that is not a code failure. Use `.venv/`-relative launchers or an
+explicit absolute interpreter path. When a non-`.venv/` python interpreter still produces a
+module-missing failure, the verifier records it as a retryable infrastructure error, never a quality
+FAIL, and does not consume a quality-review round.
+
 Preflight reports whether `<project>/.venv/bin/python` exists and whether a uv project is detectable.
 When the environment is absent, the verifier fails with an infrastructure diagnostic before launching
 bubblewrap. It never runs `uv sync` or installs dependencies silently. If the repository uses uv, prepare

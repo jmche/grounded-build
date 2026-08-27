@@ -1659,6 +1659,42 @@ def normalize_contract_criteria(criteria: list[dict[str, Any]]) -> list[dict[str
     return normalized
 
 
+def bare_interpreter_name(executable: str) -> bool:
+    """True when executable is a bare python/pypy name (no path separators).
+
+    The verification sandbox resolves a bare interpreter through its system PATH to an
+    interpreter that never sees the project environment, so a COMMAND criterion relying on a
+    project dependency is guaranteed to fail with a module-missing error. A `.venv/`-relative
+    launcher is the sanctioned bridge (mounted read-only by _sandbox_command) and an explicit
+    absolute interpreter path is the operator's declared choice; only the ambiguous bare form is
+    refused at entry.
+    """
+    return bool(re.fullmatch(r"(?:python|python[23](?:\.[0-9]+)*|pypy[0-9]*)", executable))
+
+
+def non_venv_python(executable: str) -> bool:
+    """True when the executable's basename is a python/pypy interpreter NOT under the project .venv.
+
+    Used by verification to recognize the documented environment trap: a python interpreter with
+    none of the project's dependencies. `.venv/` launchers are exempt because the sandbox mounts
+    that environment read-only.
+    """
+    return not executable.startswith(".venv/") and bool(
+        re.fullmatch(r"(?:python|python[23](?:\.[0-9]+)*|pypy[0-9]*)", Path(executable).name)
+    )
+
+
+def reject_bare_interpreter(executable: str) -> None:
+    if not bare_interpreter_name(executable):
+        return
+    raise ReviewContractError(
+        f"executable {executable!r} is a bare interpreter that the verification sandbox resolves "
+        "to a system interpreter without the project environment. Use `.venv/bin/python ...` "
+        "(resolved from the original project and mounted read-only) or an explicit absolute "
+        "runtime path."
+    )
+
+
 def validate_contract_payload(payload: dict[str, Any], state: dict[str, Any]) -> None:
     if payload.get("reviewer") != state["reviewer"]:
         raise ReviewContractError("contract reviewer identity mismatch")
@@ -1695,6 +1731,8 @@ def validate_contract_payload(payload: dict[str, Any], state: dict[str, Any]) ->
             raise ReviewContractError(f"contract criterion {criterion['id']} has invalid argv")
         if criterion["evidence_kind"] == "COMMAND" and not criterion["argv"]:
             raise ReviewContractError(f"COMMAND criterion {criterion['id']} requires argv")
+        if criterion["evidence_kind"] == "COMMAND":
+            reject_bare_interpreter(criterion["argv"][0])
         if not isinstance(criterion["expected_exit"], int) or not 0 <= criterion["expected_exit"] <= 255:
             raise ReviewContractError(f"contract criterion {criterion['id']} has invalid expected_exit")
     if payload["assessment"] == "READY" and (issues or not criteria):
@@ -1949,6 +1987,7 @@ def validate_review_payload(
         argv = request.get("argv")
         if not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv):
             raise WorkflowError(f"verification request {request['id']} has invalid argv")
+        reject_bare_interpreter(argv[0])
         if (
             request.get("cwd") != "repository"
             or not isinstance(request.get("expected_exit"), int)
@@ -2719,7 +2758,11 @@ def command_verify(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     state = load_state(project, args.run_id)
     validate_active_state(project, state)
-    if state.get("status") not in {"AWAITING_VERIFICATION", "FINAL_VERIFICATION_REQUIRED", "IMPLEMENTING"}:
+    # CHANGES_REQUESTED is admitted like review (see the review guard below) so that after one
+    # request FAILs, the remaining PENDING/APPROVED requests for the same batch/SHA can still be
+    # verified instead of leaving the operator with no executable move. A FAILed request itself
+    # stays non-retryable; this admission is about its siblings, not a FAIL retry.
+    if state.get("status") not in {"AWAITING_VERIFICATION", "FINAL_VERIFICATION_REQUIRED", "IMPLEMENTING", "CHANGES_REQUESTED"}:
         raise WorkflowError(f"verify is not allowed from workflow status {state.get('status')}")
     matches = [item for item in state.get("verification_requests", []) if item.get("request_key") == args.request_id]
     if len(matches) != 1:
@@ -2908,6 +2951,23 @@ def command_verify(args: argparse.Namespace) -> None:
         append_event(state, "VERIFICATION_INFRA_ERROR", attempt)
         save_state(state)
         emit({**preview, "status": "VERIFICATION_ERROR", "reason": attempt["error"], "retryable": True}, 4)
+    # A python interpreter outside the project .venv carries none of the project environment by
+    # contract, so a module-missing failure from one is an environment mismatch, not a code
+    # failure: classify it as retryable infrastructure exactly like a timeout or resource breach.
+    # `.venv/` launchers are the sanctioned environment and keep normal FAIL semantics for a
+    # genuine red test.
+    requested_executable = request.get("argv")[0] if request.get("argv") else ""
+    if (
+        returncode != request["expected_exit"]
+        and non_venv_python(requested_executable)
+        and re.search(r"(No module named|ModuleNotFoundError|ImportError:\s*No module)", stderr_text)
+    ):
+        attempt.update({"status": "INFRA_ERROR", "error": stderr_text.strip(), "completed_at": utc_now()})
+        record["status"] = "PENDING"
+        state["status"] = "AWAITING_VERIFICATION"
+        append_event(state, "VERIFICATION_INFRA_ERROR", attempt)
+        save_state(state)
+        emit({**preview, "status": "VERIFICATION_ERROR", "reason": attempt["error"], "retryable": True}, 4)
     evidence_id = f"ev-{hashlib.sha256((args.request_id + str(attempt_number)).encode()).hexdigest()[:12]}"
     status = "PASS" if returncode == request["expected_exit"] else "FAIL"
     evidence = {
@@ -2994,10 +3054,17 @@ def require_target_unchanged(project: Path, state: dict[str, Any]) -> None:
     stale, target_head = target_staleness(project, state)
     if not stale:
         return
+    previous_status = state["status"]
     state["status"] = "NEEDS_USER_DECISION"
     state["pending_decision"] = {
         "decision_id": f"target-advanced-{len(state['decisions']) + 1:03d}",
-        "type": "TARGET_ADVANCED", "allowed_choices": ["SUPERSEDE_RUN", "ABORT_RUN"],
+        "type": "TARGET_ADVANCED",
+        "allowed_choices": ["RESUME_WITH_DECISION", "SUPERSEDE_RUN", "ABORT_RUN"],
+        # target_staleness re-reads the branch on every call, so a parked run must be resumable
+        # once the target is back on the baseline. RESUME restores previous_status (IMPLEMENTING,
+        # CHANGES_REQUESTED or AWAITING_ACCEPTANCE) and the next review/accept re-observes: a
+        # clean target proceeds, a still-stale one re-parks with a fresh decision.
+        "previous_status": previous_status,
         "baseline_sha": state["baseline_sha"], "current_target_sha": target_head,
         "created_at": utc_now(),
     }
@@ -3571,7 +3638,10 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         if load_active_run_id(project) == state["run_id"]:
             set_active_run(project, None)
     elif args.choice == "RESUME_WITH_DECISION":
-        state["status"] = "IMPLEMENTING"
+        # Restore the status the run parked from (decisions that carry previous_status), falling
+        # back to IMPLEMENTING for decisions that predate it. The next command re-observes the
+        # fact the decision was about (e.g. target staleness) and re-parks if it still holds.
+        state["status"] = str(pending.get("previous_status", "IMPLEMENTING"))
     else:
         raise WorkflowError(f"choice requires its dedicated contract command: {args.choice}")
     state["pending_decision"] = None
@@ -3891,13 +3961,30 @@ def command_finalize(args: argparse.Namespace) -> None:
     }
     if not unchanged or not can_ff:
         reason = "TARGET_ADVANCED" if not unchanged else "INTEGRATION_NOT_FAST_FORWARD"
-        state["status"] = "NEEDS_USER_DECISION"
-        state["pending_decision"] = {
+        # Only the staleness decision is resumable: once the target branch is back on the
+        # baseline the run may return to READY_TO_FINALIZE and finalize again. A non-fast-forward
+        # target is a different conflict with no resume meaning, so it keeps only the terminal
+        # choices. finalize only reaches this branch from READY_TO_FINALIZE/FINALIZING, so a
+        # TARGET_ADVANCED resume restores READY_TO_FINALIZE (restoring IMPLEMENTING would be
+        # refused by the finalize status guard).
+        allowed = (
+            ["RESUME_WITH_DECISION", "SUPERSEDE_RUN", "ABORT_RUN"]
+            if reason == "TARGET_ADVANCED"
+            else ["SUPERSEDE_RUN", "ABORT_RUN"]
+        )
+        pending_decision = {
             "decision_id": f"integration-{len(state['decisions']) + 1:03d}",
-            "type": reason, "allowed_choices": ["SUPERSEDE_RUN", "ABORT_RUN"],
+            "type": reason, "allowed_choices": allowed,
             "baseline_sha": state["baseline_sha"], "current_target_sha": target_sha,
             "created_at": utc_now(),
         }
+        if reason == "TARGET_ADVANCED":
+            pending_decision["previous_status"] = "READY_TO_FINALIZE"
+        if not args.apply:
+            # A preview stays pure: show the decision --apply would park, do not write it.
+            emit({**preview, "pending_decision": pending_decision})
+        state["status"] = "NEEDS_USER_DECISION"
+        state["pending_decision"] = pending_decision
         append_event(state, "DECISION_REQUIRED", state["pending_decision"])
         save_state(state)
         emit({

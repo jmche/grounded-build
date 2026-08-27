@@ -728,6 +728,127 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(request["status"], "PENDING")
         self.assertEqual(state["verification_attempts"][0]["status"], "INFRA_ERROR")
 
+    def test_non_venv_python_module_missing_is_infrastructure_not_quality_fail(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        self.environment["FAKE_VERIFICATION_REQUESTS"] = json.dumps([{
+            "id": "bare", "argv": ["/usr/bin/python3", "-m", "pytest", "tests/"],
+            "cwd": "repository", "reason": "fixture", "expected_exit": 0,
+        }])
+        required = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=3,
+        )
+        request_id = required["requests"][0]["request_key"]
+        fake_bwrap = self.bin_dir / "bwrap"
+        fake_bwrap.write_text(
+            "#!/bin/sh\necho '/usr/bin/python3: No module named pytest' >&2\nexit 1\n",
+            encoding="utf-8",
+        )
+        fake_bwrap.chmod(0o755)
+        failed = self.workflow(
+            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--request-id", request_id, "--network-policy", "host",
+            "--network-reason", "test fixture", "--actor", "test-suite", "--apply", expected=4,
+        )
+        self.assertTrue(failed["retryable"])
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        request = next(item for item in state["verification_requests"] if item["request_key"] == request_id)
+        self.assertEqual(request["status"], "PENDING")
+        self.assertEqual(state["status"], "AWAITING_VERIFICATION")
+        self.assertEqual(state["verification_attempts"][0]["status"], "INFRA_ERROR")
+
+    def test_non_python_command_failure_stays_quality_fail_not_infra(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        self.environment["FAKE_VERIFICATION_REQUESTS"] = json.dumps([{
+            "id": "nonpy", "argv": ["git", "grep", "-n", "state: warn", "HEAD"],
+            "cwd": "repository", "reason": "fixture", "expected_exit": 0,
+        }])
+        required = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=3,
+        )
+        request_id = required["requests"][0]["request_key"]
+        fake_bwrap = self.bin_dir / "bwrap"
+        fake_bwrap.write_text(
+            "#!/bin/sh\necho 'fatal: not a git repository' >&2\nexit 1\n",
+            encoding="utf-8",
+        )
+        fake_bwrap.chmod(0o755)
+        failed = self.workflow(
+            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--request-id", request_id, "--network-policy", "host",
+            "--network-reason", "test fixture", "--actor", "test-suite", "--apply", expected=2,
+        )
+        self.assertEqual(failed["status"], "VERIFICATION_FAIL")
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        request = next(item for item in state["verification_requests"] if item["request_key"] == request_id)
+        self.assertEqual(request["status"], "FAIL")
+        self.assertEqual(state["status"], "CHANGES_REQUESTED")
+
+    def test_verify_from_changes_requested_unblocks_sibling_requests(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        self.environment["FAKE_VERIFICATION_REQUESTS"] = json.dumps([
+            {"id": "r1", "argv": ["git", "grep", "-n", "missing-token", "HEAD"],
+             "cwd": "repository", "reason": "fixture", "expected_exit": 0},
+            {"id": "r2", "argv": ["true"],
+             "cwd": "repository", "reason": "fixture", "expected_exit": 0},
+        ])
+        required = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=3,
+        )
+        keys = [item["request_key"] for item in required["requests"]]
+        fake_bwrap = self.bin_dir / "bwrap"
+        # The sandbox spawn comes from a stripped environment, so the fake bwrap keys its
+        # behavior on the request payload rather than on an environment variable.
+        fake_bwrap.write_text(
+            "#!/bin/sh\ncase \"$*\" in\n  *missing-token*)\n"
+            "    echo 'fixture failure: not a code result' >&2\n    exit 1 ;;\nesac\nexit 0\n",
+            encoding="utf-8",
+        )
+        fake_bwrap.chmod(0o755)
+        first = self.workflow(
+            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--request-id", keys[0], "--network-policy", "host",
+            "--network-reason", "test fixture", "--actor", "test-suite", "--apply", expected=2,
+        )
+        self.assertEqual(first["status"], "VERIFICATION_FAIL")
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["status"], "CHANGES_REQUESTED")
+        second = self.workflow(
+            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--request-id", keys[1], "--network-policy", "host",
+            "--network-reason", "test fixture", "--actor", "test-suite", "--apply",
+        )
+        self.assertEqual(second["status"], "VERIFICATION_PASS")
+
+    def test_reviewer_cannot_smuggle_bare_python_verification_request(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        self.environment["FAKE_VERIFICATION_REQUESTS"] = json.dumps([{
+            "id": "smuggle", "argv": ["python3", "-m", "pytest", "tests/"],
+            "cwd": "repository", "reason": "fixture", "expected_exit": 0,
+        }])
+        refused = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=4,
+        )
+        self.assertEqual(refused["status"], "REVIEWER_ERROR")
+        self.assertIn("bare interpreter", str(refused["reason"]))
+
     def test_host_network_requires_typed_exact_request_authorization(self) -> None:
         initialized = self.initialize("codex")
         implementation = Path(str(initialized["implementation_worktree"]))
@@ -760,7 +881,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(preview["host_network_authorized"])
 
-    def test_target_advance_creates_typed_terminal_decision(self) -> None:
+    def test_target_advance_creates_typed_resumable_decision(self) -> None:
         initialized = self.initialize("codex")
         implementation = Path(str(initialized["implementation_worktree"]))
         self.commit_batch_change(implementation)
@@ -774,8 +895,154 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(blocked["reason"], "TARGET_ADVANCED")
         self.assertEqual(
             set(blocked["pending_decision"]["allowed_choices"]),
-            {"SUPERSEDE_RUN", "ABORT_RUN"},
+            {"RESUME_WITH_DECISION", "SUPERSEDE_RUN", "ABORT_RUN"},
         )
+        self.assertEqual(blocked["pending_decision"]["previous_status"], "IMPLEMENTING")
+
+    def test_review_target_advance_resume_after_revert_continues(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
+        blocked = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=3,
+        )
+        self.assertEqual(blocked["reason"], "TARGET_ADVANCED")
+        decision_id = blocked["pending_decision"]["decision_id"]
+        self.run_command("git", "-C", str(self.project), "reset", "--hard", "-q", "HEAD~1")
+        resumed = self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--decision-id", decision_id, "--choice", "RESUME_WITH_DECISION",
+            "--reason", "target reverted to baseline", "--actor", "test-user", "--apply",
+        )
+        self.assertEqual(resumed["run_status"], "IMPLEMENTING")
+        reviewed = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        )
+        self.assertEqual(reviewed["status"], "REVIEW_PASS")
+
+    def test_review_target_advance_resume_still_stale_reparks(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
+        first = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=3,
+        )
+        first_id = first["pending_decision"]["decision_id"]
+        # Resume WITHOUT reverting the target: the very next command must re-observe the stale
+        # fact and re-park instead of pretending the conflict is gone.
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--decision-id", first_id, "--choice", "RESUME_WITH_DECISION",
+            "--reason", "operator believes the target was fixed", "--actor", "test-user", "--apply",
+        )
+        second = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=3,
+        )
+        self.assertEqual(second["reason"], "TARGET_ADVANCED")
+        self.assertNotEqual(second["pending_decision"]["decision_id"], first_id)
+
+    def test_finalize_target_advance_preview_does_not_park(self) -> None:
+        initialized = self.initialize("codex")
+        self.review_accept(initialized)
+        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
+        preview = self.workflow(
+            "finalize", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(preview["status"], "FINALIZE_PREVIEW")
+        self.assertEqual(preview["pending_decision"]["type"], "TARGET_ADVANCED")
+        self.assertIn("RESUME_WITH_DECISION", preview["pending_decision"]["allowed_choices"])
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["status"], "READY_TO_FINALIZE")
+        self.assertIsNone(state.get("pending_decision"))
+
+    def test_finalize_target_advance_resume_restores_ready_to_finalize(self) -> None:
+        initialized = self.initialize("codex")
+        self.review_accept(initialized)
+        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
+        parked = self.workflow(
+            "finalize", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply", expected=3,
+        )
+        self.assertEqual(parked["reason"], "TARGET_ADVANCED")
+        self.assertEqual(parked["pending_decision"]["previous_status"], "READY_TO_FINALIZE")
+        self.assertIn("RESUME_WITH_DECISION", parked["pending_decision"]["allowed_choices"])
+        self.run_command("git", "-C", str(self.project), "reset", "--hard", "-q", "HEAD~1")
+        resumed = self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--decision-id", parked["pending_decision"]["decision_id"],
+            "--choice", "RESUME_WITH_DECISION",
+            "--reason", "target reverted to baseline", "--actor", "test-user", "--apply",
+        )
+        self.assertEqual(resumed["run_status"], "READY_TO_FINALIZE")
+        done = self.workflow(
+            "finalize", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply",
+        )
+        self.assertEqual(done["status"], "FINALIZED")
+
+    def test_contract_criterion_with_bare_python_argv_is_refused(self) -> None:
+        state = {"reviewer": "codex", "baseline_sha": "a" * 40, "batches": ["B1"]}
+        base = {
+            "id": "c1", "batch": "B1", "source": "REVIEWER_DERIVED",
+            "observation": "run the suite", "expected_result": "exit 0",
+            "scope": ["tests/"], "rationale": "fixture",
+            "evidence_kind": "COMMAND", "expected_exit": 0,
+        }
+        for argv in (
+            ["python3", "-m", "pytest", "tests/"],
+            ["python", "-c", "print(1)"],
+        ):
+            payload = {
+                "reviewer": "codex", "baseline_sha": "a" * 40, "assessment": "READY",
+                "summary": "s", "issues": [], "criteria": [{**base, "argv": argv}],
+            }
+            with self.assertRaises(WORKFLOW_MODULE.ReviewContractError):
+                WORKFLOW_MODULE.validate_contract_payload(payload, state)
+        for argv in (
+            [".venv/bin/python", "-m", "pytest", "tests/"],
+            ["/usr/bin/python3", "-c", "print('ok')"],
+            ["git", "grep", "-n", "state: warn", "HEAD"],
+        ):
+            payload = {
+                "reviewer": "codex", "baseline_sha": "a" * 40, "assessment": "READY",
+                "summary": "s", "issues": [], "criteria": [{**base, "argv": argv}],
+            }
+            WORKFLOW_MODULE.validate_contract_payload(payload, state)
+
+    def test_reviewer_verification_request_with_bare_python_argv_is_refused(self) -> None:
+        payload = {
+            "reviewer": "codex", "reviewed_sha": "b" * 40, "base_sha": "a" * 40,
+            "batch": "B1", "verdict": "NEEDS_VERIFICATION", "summary": "s",
+            "findings": [], "resolved_finding_ids": [],
+            "verification_requests": [{
+                "id": "v1", "argv": ["python3", "-m", "pytest", "tests/"],
+                "cwd": "repository", "reason": "r", "expected_exit": 0,
+            }],
+            "criterion_results": [],
+        }
+        with self.assertRaises(WORKFLOW_MODULE.WorkflowError):
+            WORKFLOW_MODULE.validate_review_payload(payload, "codex", "B1", "a" * 40, "b" * 40)
+        payload["verification_requests"] = [{
+            "id": "v2", "argv": [".venv/bin/python", "-m", "pytest", "tests/"],
+            "cwd": "repository", "reason": "r", "expected_exit": 0,
+        }]
+        WORKFLOW_MODULE.validate_review_payload(payload, "codex", "B1", "a" * 40, "b" * 40)
 
     def test_legacy_run_requires_explicit_migration(self) -> None:
         initialized = self.initialize("codex")

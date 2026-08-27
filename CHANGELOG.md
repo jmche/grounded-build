@@ -2,6 +2,23 @@
 
 All notable changes use semantic versioning.
 
+## [0.4.4] - 2026-08-26
+
+- Made TARGET_ADVANCED parking resumable instead of terminal-only. `target_staleness` re-reads the
+  branch on every call, so once the target is back on the baseline the run may return to the status
+  it parked from (`IMPLEMENTING`, `CHANGES_REQUESTED`, `AWAITING_ACCEPTANCE`, or
+  `READY_TO_FINALIZE`) via the `RESUME_WITH_DECISION` choice; a still-stale target re-parks on the
+  next move instead of being silently bypassed. `INTEGRATION_NOT_FAST_FORWARD` keeps only terminal
+  choices, and a preview finalize no longer writes the park it would apply.
+- Stopped the bare-interpreter verification trap mechanically instead of by reviewer instruction.
+  COMMAND criteria and reviewer verification requests naming a bare python/pypy interpreter
+  (`python`, `python3`, `python3.x`, `pypy`) are refused at validation, because the sandbox would
+  resolve them to a system interpreter that never sees the project environment. A non-`.venv/`
+  python interpreter that still fails with a module-missing error is recorded as retryable
+  infrastructure, never a quality FAIL, so the documented environment trap can no longer consume a
+  quality attempt. `verify` now also admits `CHANGES_REQUESTED`, mirroring the review admission, so
+  the remaining requests of a failed round stay executable.
+
 ## [0.4.3] - 2026-08-26
 
 - Gave a run a forward move after a commit lands on top of a passing review. A PASS authorizes one
