@@ -6,10 +6,13 @@ All notable changes use semantic versioning.
 
 - Added concurrent implementation runs from one frozen baseline, with explicit run selection when more than one run is active.
 - Added run-owned merge reconciliation worktrees whose combined commits pass the normal fixed-SHA verification and independent review loop.
-- Added shared read-only project-environment fingerprints and infrastructure-class drift detection.
+- Added non-executing, content-sensitive project-environment fingerprints, pre/post-verification drift
+  detection, and infrastructure classification without launching `.venv` startup hooks.
 - Reclassified target-branch movement as integration divergence rather than execution staleness.
 - Allowed finalization to atomically advance a target branch that is not checked out without switching the user's checkout.
 - Raised implementation state to schema v6 with explicit, backed-up migration from schema v5.
+- Added crash recovery for reconciliation worktree preparation and for target movement during a
+  prepared finalization transaction.
 
 ## [0.4.5] - 2026-08-27
 

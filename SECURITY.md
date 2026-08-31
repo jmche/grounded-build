@@ -13,6 +13,9 @@ Grounded Build is a local workflow for a trusted operating-system account. The r
 - Secret-like host environment variables are not inherited. The sandbox receives a minimal environment and private HOME/TMP directories.
 - Planning state is HMAC-authenticated and revisions are anchored outside each run directory. This detects subagent writes, accidental edits, stale restoration of a run, and partial artifact corruption.
 - Implementation verification uses the stricter sandbox and resource controls documented in `references/implementation_workflow.md`.
+- Environment fingerprinting reads `.venv` content from the controller process and never launches the
+  project interpreter. Project `.pth` and startup hooks execute only inside an authorized verification
+  sandbox, never as a side effect of preflight, status, review, or state validation.
 
 ## Deliberate limit
 

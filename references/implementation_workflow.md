@@ -377,6 +377,10 @@ module-missing failure, the verifier records it as a retryable infrastructure er
 FAIL, and does not consume a quality-review round.
 
 Preflight reports whether `<project>/.venv/bin/python` exists and whether a uv project is detectable.
+The run fingerprints `.venv` statically: it does not execute that interpreter, so `.pth` startup code
+cannot escape the verification sandbox through a metadata probe. The content digest covers the venv's
+runtime files and external launcher target. The engine checks it before mutations and after every
+verification command because a read-only bind mount is not a content snapshot.
 When the environment is absent, the verifier fails with an infrastructure diagnostic before launching
 bubblewrap. It never runs `uv sync` or installs dependencies silently. If the repository uses uv, prepare
 the environment explicitly with its locked, documented workflow before verification. Any future automated
@@ -435,8 +439,10 @@ For a diverged target, preview and explicitly create a run-owned merge worktree:
   --project <project> --run-id <run-id> --apply
 ```
 
-The command uses `--no-ff --no-commit`. Resolve conflicts in the returned worktree, run appropriate
-tests, and commit the merge. Then register it:
+The command records a `PREPARING` transaction before creating Git resources, then uses
+`--no-ff --no-commit`. If the process stops after worktree creation, rerun the same command: it validates
+and resumes the recorded worktree instead of creating another branch. Resolve conflicts in the returned
+worktree, run appropriate tests, and commit the merge. Then register it:
 
 ```bash
 <controller-python> <skill-root>/scripts/workflow.py submit-reconciliation \
@@ -461,7 +467,10 @@ checkout it must be clean and is fast-forwarded normally. If it is not checked o
 uses an atomic `update-ref` with the expected old SHA. It never switches branches. A target that moves
 again requires another reconciliation attempt; prior attempts remain auditable.
 
-Finalization first persists a `FINALIZING` transaction and only then advances the target branch. If the process stops after Git advances but before the final state checkpoint, rerun `finalize` to preview and apply the audited recovery to `FINALIZED`.
+Finalization first validates checkout preconditions, then persists a `FINALIZING` transaction containing
+the expected target SHA before advancing the branch. If Git advanced before the state checkpoint, rerun
+`finalize` to recover to `FINALIZED`. If the target moved before Git advanced, `finalize --apply`
+auditably aborts the preparation, restores `READY_TO_FINALIZE`, and routes to reconciliation.
 
 ## Cleanup
 

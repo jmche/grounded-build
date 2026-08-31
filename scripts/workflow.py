@@ -999,15 +999,35 @@ def ensure_clean(path: Path, label: str) -> None:
         raise WorkflowError(f"{label} worktree is not clean:\n{dirty}")
 
 
-def ensure_no_git_operation(path: Path) -> None:
+def git_operation_markers(path: Path) -> list[str]:
     git_dir_raw = git(path, "rev-parse", "--git-dir")
     git_dir = Path(git_dir_raw)
     if not git_dir.is_absolute():
         git_dir = path / git_dir
     markers = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
-    active = [name for name in markers if (git_dir / name).exists()]
+    return [name for name in markers if (git_dir / name).exists()]
+
+
+def ensure_no_git_operation(path: Path) -> None:
+    active = git_operation_markers(path)
     if active:
         raise WorkflowError(f"{path} has an in-progress Git operation: {', '.join(active)}")
+
+
+def registered_worktrees(project: Path) -> list[dict[str, str | None]]:
+    """Parse porcelain records exactly; branch-name prefixes must never match each other."""
+    records: list[dict[str, str | None]] = []
+    current: dict[str, str | None] | None = None
+    for line in git(project, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            if current:
+                records.append(current)
+            current = {"path": line[len("worktree "):], "branch": None}
+        elif current is not None and line.startswith("branch "):
+            current["branch"] = line[len("branch "):]
+    if current:
+        records.append(current)
+    return records
 
 
 def parse_batches(value: str) -> list[str]:
@@ -1086,34 +1106,69 @@ def validate_plan_unchanged(state: dict[str, Any]) -> None:
 
 
 def project_environment_contract(project: Path) -> dict[str, Any]:
-    """Fingerprint stable environment metadata while excluding caches and source checkout state."""
+    """Fingerprint the project venv without executing any code from that environment."""
     root = project / ".venv"
     launcher = root / "bin" / "python"
     if not launcher.is_file():
         payload: dict[str, Any] = {"status": "ABSENT", "path": str(root.resolve())}
     else:
-        probe = run((str(launcher), "-c", (
-            "import importlib.metadata as m,json,sys;"
-            "print(json.dumps({'version':sys.version.split()[0],"
-            "'packages':sorted((d.metadata.get('Name',''),d.version) for d in m.distributions())}))"
-        )), check=False)
-        if probe.returncode:
-            raise WorkflowError("project environment fingerprint probe failed")
-        metadata = json.loads(probe.stdout)
-        details = sorted(
-            [root / "pyvenv.cfg"]
-            + list(root.glob("lib/python*/site-packages/*.pth"))
-            + list(root.glob("lib/python*/site-packages/*.dist-info/direct_url.json"))
-        )
+        ignored_directories = {".pytest_cache", ".mypy_cache", ".ruff_cache"}
+        content = hashlib.sha256()
+        file_count = 0
+        byte_count = 0
+        root_resolved = root.resolve()
+        for current_text, directories, files in os.walk(root, followlinks=False):
+            current = Path(current_text)
+            directories[:] = sorted(
+                name for name in directories
+                if name not in ignored_directories and not (current / name).is_symlink()
+            )
+            entries = sorted(set(directories + files + [
+                item.name for item in current.iterdir() if item.is_symlink()
+            ]))
+            for name in entries:
+                path = current / name
+                relative = path.relative_to(root).as_posix()
+                content.update(relative.encode("utf-8", errors="surrogateescape") + b"\0")
+                if path.is_symlink():
+                    target = os.readlink(path)
+                    content.update(b"L\0" + target.encode("utf-8", errors="surrogateescape") + b"\0")
+                    resolved = path.resolve()
+                    if resolved.is_file() and not resolved.is_relative_to(root_resolved):
+                        digest = sha256_file(resolved)
+                        content.update(b"E\0" + str(resolved).encode() + b"\0" + digest.encode())
+                        byte_count += resolved.stat().st_size
+                    file_count += 1
+                elif path.is_file():
+                    digest = sha256_file(path)
+                    size = path.stat().st_size
+                    content.update(b"F\0" + str(size).encode() + b"\0" + digest.encode())
+                    file_count += 1
+                    byte_count += size
+                else:
+                    content.update(b"D\0")
+        packages: list[list[str]] = []
+        for metadata_path in sorted(root.glob("lib/python*/site-packages/*.dist-info/METADATA")):
+            name = ""
+            version = ""
+            for line in metadata_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("Name: ") and not name:
+                    name = line[6:].strip()
+                elif line.startswith("Version: ") and not version:
+                    version = line[9:].strip()
+                if name and version:
+                    break
+            packages.append([name, version])
+        pyvenv = root / "pyvenv.cfg"
         payload = {
             "status": "PRESENT", "path": str(root.resolve()),
-            "launcher": str(launcher.resolve()), "python_version": metadata["version"],
-            "packages": metadata["packages"],
-            "files": {
-                str(path.relative_to(root)): sha256_file(path)
-                for path in details if path.is_file()
-            },
+            "launcher": str(launcher.resolve()),
+            "pyvenv_sha256": sha256_file(pyvenv) if pyvenv.is_file() else None,
+            "packages": sorted(packages), "content_sha256": content.hexdigest(),
+            "file_count": file_count, "byte_count": byte_count,
+            "probe_policy": "STATIC_FILESYSTEM_ONLY",
         }
+    payload["fingerprint_version"] = 2
     payload["digest"] = sha256_bytes(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     )
@@ -1129,6 +1184,20 @@ def validate_environment_contract(project: Path, state: dict[str, Any]) -> None:
                 "shared project environment drifted from the frozen fingerprint; "
                 "restore it or supersede and initialize a new run"
             )
+
+
+def environment_status(project: Path, state: dict[str, Any]) -> dict[str, Any]:
+    recorded = state.get("environment_contract")
+    current = project_environment_contract(project)
+    recorded_digest = recorded.get("digest") if isinstance(recorded, dict) else None
+    return {
+        "recorded_digest": recorded_digest,
+        "current_digest": current.get("digest"),
+        "recorded_status": recorded.get("status") if isinstance(recorded, dict) else None,
+        "current_status": current.get("status"),
+        "drifted": bool(recorded_digest and recorded_digest != current.get("digest")),
+        "probe_policy": current.get("probe_policy", "STATIC_FILESYSTEM_ONLY"),
+    }
 
 
 def validate_batch_manifest(path: Path, batches: list[str]) -> None:
@@ -2996,6 +3065,9 @@ def command_verify(args: argparse.Namespace) -> None:
         returncode, timed_out, resource_error = _run_logged(
             sandboxed_command, stdout_path, stderr_path, args.timeout, temp_dir
         )
+        # A read-only bind is not a snapshot: host-side changes remain visible while the command
+        # runs. Recheck before accepting evidence so mid-verification drift is infrastructure.
+        validate_environment_contract(project, state)
     except (WorkflowError, OSError) as exc:
         attempt.update({"status": "INFRA_ERROR", "error": str(exc), "completed_at": utc_now()})
         record["status"] = "PENDING"
@@ -3751,7 +3823,7 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
     })
     if state.get("finalized"):
         integration["status"] = "INTEGRATED"
-    elif integration.get("status") not in {"RECONCILING", "REVIEW_REQUIRED", "APPROVED"}:
+    elif integration.get("status") not in {"PREPARING", "RECONCILING", "REVIEW_REQUIRED", "APPROVED"}:
         integration["status"] = "DIVERGED" if stale else "FAST_FORWARD_READY"
     source_plan = Path(state.get("plan_original", ""))
     source_plan_changed = (
@@ -3783,6 +3855,7 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "current_controller_runtime": current_controller,
         "controller_runtime_drift": controller_drift,
         "project_runtime_at_start": state.get("project_runtime_at_start"),
+        "environment": environment_status(project, state),
         "reviewer_history": state.get("reviewer_history", []),
         "implementer": state.get("implementer", "legacy-unknown"),
         "fix_policy": state["fix_policy"], "batches": state["batches"],
@@ -4015,6 +4088,8 @@ def command_finalize(args: argparse.Namespace) -> None:
     if final_verification.get("reviewed_sha") != final_head:
         raise WorkflowError("final verification does not belong to the final accepted SHA")
     target_sha = git(project, "rev-parse", state["target_branch"])
+    integration = state.get("integration") or {}
+    expected_target = integration.get("approved_target_sha") or state["baseline_sha"]
     transaction = state.get("integration_transaction")
     if state.get("status") == "FINALIZING":
         if not isinstance(transaction, dict) or transaction.get("final_sha") != final_head:
@@ -4037,12 +4112,34 @@ def command_finalize(args: argparse.Namespace) -> None:
             append_event(state, "INTEGRATION_RECOVERED", transaction)
             save_state(state)
             emit({**recovery, "status": "FINALIZED", "final_report": str(report)})
+        prepared_target = transaction.get("expected_target_sha") or expected_target
+        if target_sha != prepared_target:
+            recovery = {
+                "status": "FINALIZE_DIVERGENCE_RECOVERY_PREVIEW",
+                "run_id": state["run_id"], "target_branch": state["target_branch"],
+                "prepared_target_sha": prepared_target, "current_target_sha": target_sha,
+                "final_sha": final_head,
+            }
+            if not args.apply:
+                emit(recovery, 3)
+            transaction.update({
+                "status": "ABORTED_TARGET_MOVED", "aborted_at": utc_now(),
+                "observed_target_sha": target_sha,
+            })
+            state["status"] = "READY_TO_FINALIZE"
+            state.setdefault("integration", {}).update({
+                "status": "DIVERGED", "observed_target_sha": target_sha,
+            })
+            append_event(state, "INTEGRATION_PREPARATION_ABORTED", transaction)
+            save_state(state)
+            emit({
+                **recovery, "status": "RECONCILIATION_REQUIRED",
+                "next_command": "reconcile",
+            }, 3)
     can_ff = run(
         ("git", "-C", str(project), "merge-base", "--is-ancestor", target_sha, final_head),
         check=False,
     ).returncode == 0
-    integration = state.get("integration") or {}
-    expected_target = integration.get("approved_target_sha") or state["baseline_sha"]
     unchanged = target_sha == expected_target
     report = write_final_report(state, integrated=False)
     preview = {
@@ -4066,26 +4163,32 @@ def command_finalize(args: argparse.Namespace) -> None:
         emit(preview)
     ensure_no_git_operation(project)
     current_branch = git(project, "branch", "--show-current")
+    target_ref = f"refs/heads/{state['target_branch']}"
+    if current_branch == state["target_branch"]:
+        ensure_clean(project, "original project")
+    else:
+        checked_out = {
+            record["branch"] for record in registered_worktrees(project)
+            if Path(str(record["path"])).resolve() != project
+        }
+        if target_ref in checked_out:
+            raise WorkflowError(
+                f"target branch {state['target_branch']!r} is checked out in another worktree"
+            )
     if state.get("status") == "READY_TO_FINALIZE":
         state["status"] = "FINALIZING"
         state["integration_transaction"] = {
             "status": "PREPARED", "target_branch": state["target_branch"],
-            "baseline_sha": state["baseline_sha"], "final_sha": final_head,
+            "baseline_sha": state["baseline_sha"],
+            "expected_target_sha": expected_target, "final_sha": final_head,
             "prepared_at": utc_now(),
         }
         append_event(state, "INTEGRATION_PREPARED", state["integration_transaction"])
         save_state(state)
     if current_branch == state["target_branch"]:
-        ensure_clean(project, "original project")
         git(project, "merge", "--ff-only", state["implementation_branch"])
         merged = git(project, "rev-parse", "HEAD")
     else:
-        target_ref = f"refs/heads/{state['target_branch']}"
-        listing = git(project, "worktree", "list", "--porcelain")
-        if f"branch {target_ref}" in listing:
-            raise WorkflowError(
-                f"target branch {state['target_branch']!r} is checked out in another worktree"
-            )
         git(project, "update-ref", target_ref, final_head, target_sha)
         merged = git(project, "rev-parse", target_ref)
     if merged != final_head:
@@ -4107,19 +4210,41 @@ def command_reconcile(args: argparse.Namespace) -> None:
     validate_active_state(project, state)
     if state.get("status") != "READY_TO_FINALIZE":
         raise WorkflowError(f"reconcile requires READY_TO_FINALIZE, found {state.get('status')}")
-    source = git(Path(state["implementation_worktree"]), "rev-parse", "HEAD")
+    implementation = validate_implementation(state)
+    ensure_clean(implementation, "implementation")
+    source = git(implementation, "rev-parse", "HEAD")
+    accepted = state.get("accepted_shas", {}).get(state["batches"][-1])
+    final_verification = state.get("final_verification") or {}
+    if source != accepted or final_verification.get("reviewed_sha") != source:
+        raise WorkflowError("reconciliation source is not the final accepted and verified SHA")
     target_branch = args.target_branch or state["target_branch"]
     if target_branch != state["target_branch"]:
         raise WorkflowError(
             f"reconciliation target {target_branch!r} does not match the frozen target "
             f"{state['target_branch']!r}"
         )
-    target_sha = git(project, "rev-parse", target_branch)
-    attempts = state.setdefault("integration", {}).setdefault("attempts", [])
-    number = len(attempts) + 1
-    root = Path(state["run_directory"])
-    worktree = root / "worktrees" / f"reconciliation_{number:02d}"
-    branch = f"{state['implementation_branch']}-reconcile-{number:02d}"
+    integration = state.setdefault("integration", {})
+    attempts = integration.setdefault("attempts", [])
+    preparing = attempts[-1] if attempts and attempts[-1].get("status") == "PREPARING" else None
+    new_preparation = preparing is None
+    if preparing:
+        number = int(preparing["number"])
+        target_sha = str(preparing["target_sha"])
+        worktree = Path(str(preparing["worktree"]))
+        branch = str(preparing["branch"])
+        if preparing.get("source_candidate_sha") != source or preparing.get("target_branch") != target_branch:
+            raise WorkflowError("recorded reconciliation preparation does not match current authority")
+    else:
+        target_sha = git(project, "rev-parse", target_branch)
+        number = len(attempts) + 1
+        root = Path(state["run_directory"])
+        worktree = root / "worktrees" / f"reconciliation_{number:02d}"
+        branch = f"{state['implementation_branch']}-reconcile-{number:02d}"
+        preparing = {
+            "number": number, "target_branch": target_branch, "target_sha": target_sha,
+            "source_candidate_sha": source, "worktree": str(worktree), "branch": branch,
+            "status": "PREPARING", "created_at": utc_now(),
+        }
     preview = {
         "status": "RECONCILE_PREVIEW", "run_id": state["run_id"],
         "target_branch": target_branch, "target_sha": target_sha,
@@ -4127,27 +4252,64 @@ def command_reconcile(args: argparse.Namespace) -> None:
     }
     if not args.apply:
         emit(preview)
+    if new_preparation:
+        attempts.append(preparing)
+        integration.update({
+            "status": "PREPARING", "target_branch": target_branch,
+            "observed_target_sha": target_sha, "current_attempt": number,
+        })
+        append_event(state, "RECONCILIATION_PREPARING", preparing)
+        save_state(state)
     secure_directory(worktree.parent)
-    git(project, "worktree", "add", "-b", branch, str(worktree), target_sha)
-    result = run(("git", "-C", str(worktree), "merge", "--no-ff", "--no-commit", source), check=False)
-    attempt = {
-        "number": number, "target_branch": target_branch, "target_sha": target_sha,
-        "source_candidate_sha": source, "worktree": str(worktree), "branch": branch,
-        "status": "CONFLICT" if result.returncode else "READY_FOR_COMMIT",
-        "created_at": utc_now(),
-    }
-    attempts.append(attempt)
+    records = {Path(str(item["path"])).resolve(): item for item in registered_worktrees(project)}
+    registered = records.get(worktree.resolve())
+    if registered:
+        expected_ref = f"refs/heads/{branch}"
+        if registered.get("branch") != expected_ref:
+            raise WorkflowError("reconciliation worktree is registered on an unexpected branch")
+    elif worktree.exists():
+        raise WorkflowError("reconciliation path exists but is not a registered Git worktree")
+    else:
+        branch_exists = run(
+            ("git", "-C", str(project), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"),
+            check=False,
+        ).returncode == 0
+        if branch_exists:
+            branch_head = git(project, "rev-parse", branch)
+            checked_out = {item.get("branch") for item in registered_worktrees(project)}
+            if branch_head != target_sha or f"refs/heads/{branch}" in checked_out:
+                raise WorkflowError("reconciliation branch exists with unexpected authority")
+            git(project, "worktree", "add", str(worktree), branch)
+        else:
+            git(project, "worktree", "add", "-b", branch, str(worktree), target_sha)
+    markers = git_operation_markers(worktree)
+    if "MERGE_HEAD" in markers:
+        unmerged = bool(git(worktree, "diff", "--name-only", "--diff-filter=U"))
+        merge_status = "CONFLICT" if unmerged else "READY_FOR_COMMIT"
+        git_output = "recovered existing merge operation"
+    else:
+        head = git(worktree, "rev-parse", "HEAD")
+        if head != target_sha:
+            raise WorkflowError("reconciliation worktree moved before its merge was recorded")
+        result = run(("git", "-C", str(worktree), "merge", "--no-ff", "--no-commit", source), check=False)
+        unmerged = bool(git(worktree, "diff", "--name-only", "--diff-filter=U"))
+        if result.returncode and not unmerged:
+            raise WorkflowError((result.stdout + result.stderr).strip() or "reconciliation merge failed")
+        merge_status = "CONFLICT" if unmerged else "READY_FOR_COMMIT"
+        git_output = (result.stdout + result.stderr).strip()
+    preparing["status"] = merge_status
+    preparing["prepared_at"] = utc_now()
     state["integration"].update({
         "status": "RECONCILING", "target_branch": target_branch,
         "observed_target_sha": target_sha, "current_attempt": number,
     })
-    append_event(state, "RECONCILIATION_STARTED", attempt)
+    append_event(state, "RECONCILIATION_STARTED", preparing)
     save_state(state)
     emit({
         **preview,
-        "status": "RECONCILIATION_CONFLICT" if result.returncode else "RECONCILIATION_READY_FOR_COMMIT",
-        "git_output": (result.stdout + result.stderr).strip(),
-    }, 3 if result.returncode else 0)
+        "status": "RECONCILIATION_CONFLICT" if merge_status == "CONFLICT" else "RECONCILIATION_READY_FOR_COMMIT",
+        "git_output": git_output,
+    }, 3 if merge_status == "CONFLICT" else 0)
 
 
 def command_submit_reconciliation(args: argparse.Namespace) -> None:

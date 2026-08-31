@@ -465,6 +465,15 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--run-id", str(initialized["run_id"]), expected=3,
         )
         self.assertEqual(blocked["status"], "RECONCILIATION_REQUIRED")
+        preview = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(preview["status"], "RECONCILE_PREVIEW")
+        preview_state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(preview_state["integration"]["attempts"], [])
         reconciled = self.workflow(
             "reconcile", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--apply",
@@ -494,6 +503,48 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--run-id", str(initialized["run_id"]), "--apply",
         )
         self.assertEqual(final["status"], "FINALIZED")
+
+    def test_interrupted_reconciliation_creation_is_resumable(self) -> None:
+        initialized = self.initialize("codex")
+        self.review_accept(initialized)
+        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
+        prior_home = os.environ.get("GROUNDED_BUILD_IMPLEMENT_HOME")
+        os.environ["GROUNDED_BUILD_IMPLEMENT_HOME"] = str(self.state_home)
+        original_run = WORKFLOW_MODULE.run
+        try:
+            def interrupt_before_merge(command: object, **kwargs: object) -> object:
+                if isinstance(command, (tuple, list)) and "merge" in command:
+                    raise RuntimeError("simulated interruption before merge")
+                return original_run(command, **kwargs)
+
+            WORKFLOW_MODULE.run = interrupt_before_merge
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                WORKFLOW_MODULE.command_reconcile(argparse.Namespace(
+                    project=str(self.project), run_id=str(initialized["run_id"]),
+                    target_branch=None, apply=True,
+                ))
+        finally:
+            WORKFLOW_MODULE.run = original_run
+            if prior_home is None:
+                os.environ.pop("GROUNDED_BUILD_IMPLEMENT_HOME", None)
+            else:
+                os.environ["GROUNDED_BUILD_IMPLEMENT_HOME"] = prior_home
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["integration"]["attempts"][-1]["status"], "PREPARING")
+        interrupted_status = self.workflow(
+            "status", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(interrupted_status["integration"]["status"], "PREPARING")
+        resumed = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        self.assertEqual(resumed["status"], "RECONCILIATION_READY_FOR_COMMIT")
 
     def test_reconciliation_conflict_preserves_target_and_reviewed_candidate(self) -> None:
         initialized = self.initialize("codex")
@@ -547,6 +598,66 @@ class WorkflowIntegrationTests(unittest.TestCase):
             final_sha,
         )
 
+    def test_similarly_prefixed_worktree_branch_does_not_block_target_update(self) -> None:
+        initialized = self.initialize("codex")
+        final_sha, _ = self.review_accept(initialized)
+        self.run_command("git", "-C", str(self.project), "switch", "-qc", "ongoing-work")
+        sibling = self.root / "main-extra-worktree"
+        self.run_command(
+            "git", "-C", str(self.project), "worktree", "add", "-qb", "main-extra", str(sibling)
+        )
+        finalized = self.workflow(
+            "finalize", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        self.assertEqual(finalized["status"], "FINALIZED")
+        self.assertEqual(
+            self.run_command("git", "-C", str(self.project), "rev-parse", "main").stdout.strip(),
+            final_sha,
+        )
+
+    def test_finalizing_target_move_recovers_to_reconciliation(self) -> None:
+        initialized = self.initialize("codex")
+        final_sha, _ = self.review_accept(initialized)
+        prior_home = os.environ.get("GROUNDED_BUILD_IMPLEMENT_HOME")
+        os.environ["GROUNDED_BUILD_IMPLEMENT_HOME"] = str(self.state_home)
+        try:
+            state = WORKFLOW_MODULE.load_state(self.project, str(initialized["run_id"]))
+            state["status"] = "FINALIZING"
+            state["integration_transaction"] = {
+                "status": "PREPARED", "target_branch": "main",
+                "baseline_sha": state["baseline_sha"],
+                "expected_target_sha": state["baseline_sha"],
+                "final_sha": final_sha, "prepared_at": WORKFLOW_MODULE.utc_now(),
+            }
+            WORKFLOW_MODULE.append_event(
+                state, "INTEGRATION_PREPARED", state["integration_transaction"]
+            )
+            WORKFLOW_MODULE.save_state(state)
+        finally:
+            if prior_home is None:
+                os.environ.pop("GROUNDED_BUILD_IMPLEMENT_HOME", None)
+            else:
+                os.environ["GROUNDED_BUILD_IMPLEMENT_HOME"] = prior_home
+        (self.project / "late-target.txt").write_text("late\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "late-target.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "late target move")
+        recovered = self.workflow(
+            "finalize", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply", expected=3,
+        )
+        self.assertEqual(recovered["status"], "RECONCILIATION_REQUIRED")
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["status"], "READY_TO_FINALIZE")
+        self.assertEqual(state["integration_transaction"]["status"], "ABORTED_TARGET_MOVED")
+        preview = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(preview["status"], "RECONCILE_PREVIEW")
+
     def test_final_integration_lock_serializes_only_target_updates(self) -> None:
         initialized = self.initialize("codex")
         self.review_accept(initialized)
@@ -585,11 +696,70 @@ class WorkflowIntegrationTests(unittest.TestCase):
         implementation = Path(str(initialized["implementation_worktree"]))
         self.commit_batch_change(implementation)
         cfg.write_text("home = changed\n", encoding="utf-8")
+        status = self.workflow(
+            "status", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        self.assertTrue(status["environment"]["drifted"])
         drift = self.workflow(
             "review", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--batch", "1", expected=2,
         )
         self.assertEqual(drift["status"], "ENVIRONMENT_DRIFT")
+
+    def test_environment_fingerprint_is_static_and_content_sensitive(self) -> None:
+        venv = self.project / ".venv"
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv)],
+            check=True, capture_output=True, text=True,
+        )
+        site_packages = next(venv.glob("lib/python*/site-packages"))
+        marker = self.root / "pth-executed"
+        (site_packages / "unsafe.pth").write_text(
+            f"import pathlib; pathlib.Path({str(marker)!r}).write_text('executed')\n",
+            encoding="utf-8",
+        )
+        package_file = site_packages / "fixture_package.py"
+        package_file.write_text("VALUE = 1\n", encoding="utf-8")
+        first = WORKFLOW_MODULE.project_environment_contract(self.project)
+        self.assertFalse(marker.exists(), "fingerprinting must never execute project environment code")
+        package_file.write_text("VALUE = 2\n", encoding="utf-8")
+        second = WORKFLOW_MODULE.project_environment_contract(self.project)
+        self.assertNotEqual(first["digest"], second["digest"])
+
+    def test_environment_drift_during_verification_invalidates_evidence(self) -> None:
+        venv_bin = self.project / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        os.symlink(sys.executable, venv_bin / "python")
+        cfg = self.project / ".venv" / "pyvenv.cfg"
+        cfg.write_text("home = fixture\n", encoding="utf-8")
+        (self.project / ".git" / "info" / "exclude").write_text(".venv/\n", encoding="utf-8")
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        self.environment["FAKE_VERIFICATION_REQUESTS"] = json.dumps([{
+            "id": "drift-smoke", "argv": ["true"], "cwd": "repository",
+            "reason": "fixture", "expected_exit": 0,
+        }])
+        required = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=3,
+        )
+        fake_bwrap = self.bin_dir / "bwrap"
+        fake_bwrap.write_text(
+            f"#!/bin/sh\nprintf 'home = changed\\n' > {str(cfg)!r}\nexit 0\n",
+            encoding="utf-8",
+        )
+        fake_bwrap.chmod(0o755)
+        failed = self.workflow(
+            "verify", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+            "--request-id", str(required["requests"][0]["request_key"]),
+            "--network-policy", "host", "--network-reason", "fixture",
+            "--actor", "test-suite", "--apply", expected=4,
+        )
+        self.assertEqual(failed["status"], "VERIFICATION_ERROR")
+        self.assertIn("environment drifted", str(failed["reason"]))
 
     def test_claude_adapter_uses_isolated_implementation(self) -> None:
         initialized = self.initialize("claude")
