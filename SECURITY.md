@@ -17,13 +17,14 @@ Grounded Build is a local workflow for a trusted operating-system account. The r
   project interpreter. Project `.pth` and startup hooks execute only inside an authorized verification
   sandbox, never as a side effect of preflight, status, review, or state validation.
 - The `.venv` root must be a real directory. Fingerprinting records symlink text but never resolves or
-  reads a symlink target, and file, byte, and elapsed-time ceilings bound every scan.
+  reads a symlink target, rejects special files and unreadable subtrees, and applies file, byte, and
+  elapsed-time ceilings to every scan. Cache-named directories receive no content exemption.
 - An interpreter reached through a `.venv` launcher symlink is a declared host trust root, not part of
   the venv content digest. Use an immutable toolchain when external-runtime attestation is required.
 
 ## Deliberate limit
 
-The workflow cannot defend itself from the same trusted OS account deliberately modifying the installed Python code, deleting/replacing the integrity key and revision anchors, or bypassing the CLI. No local program running under one account can create that privilege separation by itself. Do not describe the local HMAC as protection against the machine owner. Teams that require an adversarial operator boundary must place signing/attestation in a separately administered service or OS account.
+The workflow cannot defend itself from the same trusted OS account deliberately modifying the installed Python code, deleting/replacing planning integrity keys and revision anchors, or bypassing the CLI. No local program running under one account can create that privilege separation by itself. Planning HMACs and implementation checkpoints detect ordinary corruption and unauthorized sandbox writes; they are not protection against the machine owner. Teams that require an adversarial operator boundary must place signing/attestation in a separately administered service or OS account.
 
 ## Reporting
 

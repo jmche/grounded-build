@@ -193,6 +193,29 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--target-branch", "main",
         )
 
+    def write_authenticated_legacy_state(
+        self, state_path: Path, state: dict[str, object], schema: int,
+    ) -> None:
+        """Reseal a fixture as a genuine checkpointed legacy state."""
+        state["schema_version"] = schema
+        events = state["events"]
+        assert isinstance(events, list) and events
+        reference = events[-1]
+        assert isinstance(reference, dict)
+        event_path = Path(str(reference["path"]))
+        event = json.loads(event_path.read_text(encoding="utf-8"))
+        event["details"]["state_digest"] = WORKFLOW_MODULE.state_authority_digest(state)
+        event.pop("event_hash", None)
+        event_hash = WORKFLOW_MODULE.sha256_bytes(
+            json.dumps(
+                event, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        event["event_hash"] = event_hash
+        reference["event_hash"] = event_hash
+        event_path.write_text(json.dumps(event), encoding="utf-8")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
     def test_preflight_and_init_record_controller_and_project_runtime(self) -> None:
         preflight = self.workflow(
             "preflight", "--project", str(self.project), "--target-branch", "main"
@@ -612,6 +635,26 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(second["attempt_number"], 2)
 
+    def test_reconciliation_does_not_report_ready_for_a_missing_worktree(self) -> None:
+        initialized = self.initialize("codex")
+        self.review_accept(initialized)
+        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
+        reconciled = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        self.run_command(
+            "git", "-C", str(self.project), "worktree", "remove", "--force",
+            str(reconciled["worktree"]),
+        )
+        refused = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply", expected=1,
+        )
+        self.assertIn("recorded reconciliation worktree is missing", str(refused["error"]))
+
     def test_finalize_updates_target_ref_without_switching_original_checkout(self) -> None:
         initialized = self.initialize("codex")
         final_sha, _ = self.review_accept(initialized)
@@ -824,6 +867,38 @@ class WorkflowIntegrationTests(unittest.TestCase):
         finally:
             WORKFLOW_MODULE.MAX_ENVIRONMENT_FILES = original
             WORKFLOW_MODULE.MAX_ENVIRONMENT_BYTES = original_bytes
+
+    def test_environment_fingerprint_covers_cache_named_directories(self) -> None:
+        venv_bin = self.project / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        os.symlink(sys.executable, venv_bin / "python")
+        cache = self.project / ".venv" / ".pytest_cache"
+        cache.mkdir()
+        runtime = cache / "runtime.py"
+        runtime.write_text("VALUE = 1\n", encoding="utf-8")
+        first = WORKFLOW_MODULE.project_environment_contract(self.project)
+        runtime.write_text("VALUE = 2\n", encoding="utf-8")
+        second = WORKFLOW_MODULE.project_environment_contract(self.project)
+        self.assertNotEqual(first["digest"], second["digest"])
+
+    def test_environment_fingerprint_rejects_special_files_and_walk_errors(self) -> None:
+        venv_bin = self.project / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        os.symlink(sys.executable, venv_bin / "python")
+        fifo = self.project / ".venv" / "runtime-input"
+        os.mkfifo(fifo)
+        with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "unsupported special file"):
+            WORKFLOW_MODULE.project_environment_contract(self.project)
+        fifo.unlink()
+        locked = self.project / ".venv" / "locked"
+        locked.mkdir()
+        (locked / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+        locked.chmod(0)
+        try:
+            with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "cannot walk project .venv"):
+                WORKFLOW_MODULE.project_environment_contract(self.project)
+        finally:
+            locked.chmod(0o700)
 
     def test_environment_drift_during_verification_invalidates_evidence(self) -> None:
         venv_bin = self.project / ".venv" / "bin"
@@ -1411,8 +1486,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         initialized = self.initialize("codex")
         state_path = Path(str(initialized["run_directory"])) / "workflow.json"
         state = json.loads(state_path.read_text())
-        state["schema_version"] = 4
-        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.write_authenticated_legacy_state(state_path, state, 4)
         status = self.workflow(
             "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
         )
@@ -1421,18 +1495,21 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"])
         )
         self.assertEqual(preview["status"], "MIGRATION_PREVIEW")
+        interrupted_backup = state_path.with_name("workflow.schema4.json")
+        interrupted_backup.write_bytes(state_path.read_bytes())
+        interrupted_backup.chmod(0o600)
         migrated = self.workflow(
             "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
             "--apply",
         )
         self.assertEqual(migrated["status"], "MIGRATED")
+        self.assertTrue(migrated["backup_reused"])
         self.assertTrue(Path(str(migrated["backup_path"])).is_file())
 
     def test_schema6_environment_fingerprint_requires_explicit_rebase(self) -> None:
         initialized = self.initialize("codex")
         state_path = Path(str(initialized["run_directory"])) / "workflow.json"
         state = json.loads(state_path.read_text())
-        state["schema_version"] = 6
         state["environment_contract"]["fingerprint_version"] = 2
         state["integration"].update({
             "status": "RECONCILING", "current_attempt": 2,
@@ -1441,7 +1518,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 {"number": 2, "status": "READY_FOR_COMMIT"},
             ],
         })
-        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.write_authenticated_legacy_state(state_path, state, 6)
         status = self.workflow(
             "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
         )
@@ -1466,7 +1543,6 @@ class WorkflowIntegrationTests(unittest.TestCase):
         initialized = self.initialize("codex")
         state_path = Path(str(initialized["run_directory"])) / "workflow.json"
         state = json.loads(state_path.read_text())
-        state["schema_version"] = 5
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
             "decision_id": "legacy-target", "type": "TARGET_ADVANCED",
@@ -1474,7 +1550,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         }
         state.pop("integration", None)
         state.pop("environment_contract", None)
-        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.write_authenticated_legacy_state(state_path, state, 5)
         migrated = self.workflow(
             "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
             "--apply",
@@ -1485,6 +1561,34 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status["status"], "IMPLEMENTING")
         self.assertIsNone(status["pending_decision"])
+
+    def test_schema_downgrade_cannot_launder_forged_completion(self) -> None:
+        initialized = self.initialize("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text())
+        state.update({
+            "schema_version": 6, "status": "FINALIZED", "finalized": True,
+            "final_sha": "f" * 40,
+        })
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        refused = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply", expected=1,
+        )
+        self.assertIn("checkpoint digest mismatch", str(refused["error"]))
+
+    def test_migration_refuses_a_symlinked_backup(self) -> None:
+        initialized = self.initialize("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text())
+        self.write_authenticated_legacy_state(state_path, state, 4)
+        backup = state_path.with_name("workflow.schema4.json")
+        os.symlink(state_path, backup)
+        refused = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply", expected=1,
+        )
+        self.assertIn("backup exists but does not match", str(refused["error"]))
 
     def test_event_tampering_is_detected(self) -> None:
         initialized = self.initialize("codex")

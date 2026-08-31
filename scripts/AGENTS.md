@@ -5,7 +5,7 @@
 
 ## Purpose
 The executable core of the skill: two independent, resumable workflow engines plus the deterministic
-release gate. Each engine is a single-file `argparse` CLI over an authenticated JSON state machine —
+release gate. Each engine is a single-file `argparse` CLI over an integrity-checked JSON state machine —
 the host issues one command, reads one JSON object, and asks for the next legal action. There is no
 shared module between the two engines by design: planning state and implementation state must never
 cross.
@@ -55,8 +55,9 @@ without paid calls.
 - `emit(payload, code)` — one JSON object per command on stdout; nothing else is printed.
 - `WorkflowError` (plus `ProviderInfrastructureError` / `NoFinalAnswer` / `ReviewContractError`)
   separates operator error, infrastructure failure, and quality failure.
-- `load_state` / `save_state` with `atomic_json`, an HMAC signature, and an external revision anchor;
-  `run_lock` / `assignment_lock` / `file_lock` use `fcntl` for concurrency.
+- Planning state uses an HMAC signature and external revision anchor. Implementation state uses an
+  immutable event chain and final state checkpoint; legacy migration validates that checkpoint before
+  translating state. `run_lock` / `assignment_lock` / `file_lock` use `fcntl` for concurrency.
 - Parallel A/B rounds freeze a barrier input, run concurrently, and merge atomically
   (`save_parallel_stage`, `freeze_round_barrier`) so a finisher cannot alter its peer's frozen context.
 - Findings get stable `F-*` fingerprints from scope id, problem, and causal chain, so later rounds must

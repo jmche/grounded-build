@@ -446,7 +446,8 @@ For a diverged target, preview and explicitly create a run-owned merge worktree:
 The command records a `PREPARING` transaction before creating Git resources, then uses
 `--no-ff --no-commit`. If the process stops after worktree creation, rerun the same command: it validates
 and resumes the recorded worktree instead of creating another branch. Once an attempt is ready or
-conflicted, every rerun returns that same attempt. Resolve conflicts in the returned
+conflicted, every rerun revalidates its registered worktree, branch, merge authority, and observed Git
+state before returning that same attempt. Resolve conflicts in the returned
 worktree, run appropriate tests, and commit the merge. Then register it:
 
 ```bash
@@ -460,6 +461,11 @@ workflow. This reuses the finding ledger and bounded review policy instead of in
 To discard an active preparation without deleting its evidence, preview and apply
 `abandon-reconciliation --attempt-number <number> --reason <reason> --actor <actor>`. Only then may
 `reconcile` mint a new numbered attempt; the abandoned branch and worktree remain auditable.
+
+Schema migration authenticates the legacy event chain and final checkpoint before translating any
+field. A schema-number downgrade cannot convert edited state into trusted current-schema state. Migration
+backups are reusable only when byte-identical to the still-current legacy state, allowing an interrupted
+migration to resume without accepting an unrelated backup.
 
 After approval:
 

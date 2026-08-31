@@ -892,6 +892,17 @@ def default_usage() -> dict[str, Any]:
     }
 
 
+def validate_legacy_state_integrity(state: dict[str, Any], schema: int) -> None:
+    """Authenticate a checkpointed legacy state before translating its shape."""
+    if not state.get("events"):
+        raise WorkflowError(
+            f"legacy schema {schema} has no verifiable checkpoint; automatic migration is refused"
+        )
+    validate_event_chain(state)
+    validate_state_checkpoint(state)
+    validate_artifact_manifests(state)
+
+
 def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
     run_id = resolve_run_id(project, requested)
     path = state_path(project, run_id)
@@ -903,7 +914,14 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise WorkflowError(f"invalid workflow state: {path}: {exc}") from exc
     loaded_schema = state.get("schema_version")
+    if (
+        Path(state.get("project", "")).resolve() != project
+        or state.get("run_id") != run_id
+        or Path(state.get("run_directory", "")).resolve() != path.parent.resolve()
+    ):
+        raise WorkflowError("workflow state identity does not match the requested project/run")
     if loaded_schema in {2, 3, 4, 5, 6}:
+        validate_legacy_state_integrity(state, int(loaded_schema))
         state["schema_version"] = SCHEMA_VERSION
         state["_requires_migration"] = True
         state.setdefault("finding_ledger", {})
@@ -933,7 +951,8 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
             "status": "PENDING", "target_branch": state.get("target_branch"),
             "baseline_sha": state.get("baseline_sha"), "attempts": [],
         })
-        state.setdefault("environment_contract", project_environment_contract(project))
+        if "environment_contract" not in state:
+            state["environment_contract"] = project_environment_contract(project)
         state.setdefault("implementer", "legacy-unknown")
         state.setdefault("reviewer_history", [{
             "reviewer": state.get("reviewer", "legacy-unknown"),
@@ -959,8 +978,6 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
             f"run {run_id} uses unsupported schema {state.get('schema_version')}; "
             "the previous skill version cannot be resumed automatically"
         )
-    if Path(state.get("project", "")).resolve() != project or state.get("run_id") != run_id:
-        raise WorkflowError("workflow state identity does not match the requested project/run")
     if not state.get("_requires_migration"):
         validate_event_chain(state)
         validate_state_checkpoint(state)
@@ -1160,7 +1177,6 @@ def project_environment_contract(project: Path, *, include_content: bool = True)
             raise WorkflowError(f"cannot inspect project .venv: {exc}") from exc
         if not stat.S_ISDIR(root_stat.st_mode):
             raise WorkflowError("project .venv must be a real directory")
-        ignored_directories = {".pytest_cache", ".mypy_cache", ".ruff_cache"}
         metadata = hashlib.sha256()
         content = hashlib.sha256() if include_content else None
         file_count = 0
@@ -1169,15 +1185,22 @@ def project_environment_contract(project: Path, *, include_content: bool = True)
         started = time.monotonic()
         deadline = started + MAX_ENVIRONMENT_SCAN_SECONDS
         pyvenv_digest: str | None = None
-        for current_text, directories, files in os.walk(root, followlinks=False):
+        def walk_error(exc: OSError) -> None:
+            raise WorkflowError(f"cannot walk project .venv: {exc}") from exc
+
+        for current_text, directories, files in os.walk(
+            root, followlinks=False, onerror=walk_error,
+        ):
             current = Path(current_text)
             directories[:] = sorted(
                 name for name in directories
-                if name not in ignored_directories and not (current / name).is_symlink()
+                if not (current / name).is_symlink()
             )
-            entries = sorted(set(directories + files + [
-                item.name for item in current.iterdir() if item.is_symlink()
-            ]))
+            try:
+                symlinks = [item.name for item in current.iterdir() if item.is_symlink()]
+            except OSError as exc:
+                raise WorkflowError(f"cannot walk project .venv: {exc}") from exc
+            entries = sorted(set(directories + files + symlinks))
             for name in entries:
                 path = current / name
                 relative = path.relative_to(root).as_posix()
@@ -1219,11 +1242,15 @@ def project_environment_contract(project: Path, *, include_content: bool = True)
                             pyvenv_digest = digest
                     file_count += 1
                     byte_count += size
-                else:
+                elif stat.S_ISDIR(observed.st_mode):
                     record = prefix + b"D\0" + str(mode).encode() + b"\0"
                     metadata.update(record)
                     if content is not None:
                         content.update(record)
+                else:
+                    raise WorkflowError(
+                        f"project .venv contains unsupported special file: {relative}"
+                    )
                 if file_count > MAX_ENVIRONMENT_FILES or byte_count > MAX_ENVIRONMENT_BYTES:
                     raise WorkflowError(
                         "project .venv fingerprint exceeded its file or byte budget: "
@@ -4052,13 +4079,22 @@ def command_migrate(args: argparse.Namespace) -> None:
     if not args.apply:
         emit(preview)
     backup: Path | None = None
+    backup_reused = False
     if schema_pending:
         path = state_path(project, state["run_id"])
         backup = path.with_name(f"workflow.schema{migration.get('from_schema', 'legacy')}.json")
         if backup.exists():
-            raise WorkflowError(f"migration backup already exists: {backup}")
-        shutil.copy2(path, backup)
-        backup.chmod(0o600)
+            if (
+                backup.is_symlink()
+                or not stat.S_ISREG(backup.lstat().st_mode)
+                or sha256_file(backup) != sha256_file(path)
+            ):
+                raise WorkflowError(f"migration backup exists but does not match legacy state: {backup}")
+            backup.chmod(0o600)
+            backup_reused = True
+        else:
+            shutil.copy2(path, backup)
+            backup.chmod(0o600)
         state.pop("_requires_migration", None)
         state.pop("_migration_snapshot_mismatch", None)
         state["migration"] = {
@@ -4113,6 +4149,7 @@ def command_migrate(args: argparse.Namespace) -> None:
     emit({
         **preview, "status": "MIGRATED",
         "backup_path": str(backup) if backup else None,
+        "backup_reused": backup_reused,
         "pending_decision_repair": decision_repair,
     })
 
@@ -4328,6 +4365,50 @@ def command_finalize(args: argparse.Namespace) -> None:
     emit({**preview, "status": "FINALIZED", "final_sha": merged, "final_report": str(report)})
 
 
+def observe_reconciliation_attempt(project: Path, attempt: dict[str, Any]) -> str:
+    """Revalidate the Git resources behind an idempotent reconciliation response."""
+    worktree = Path(str(attempt["worktree"]))
+    records = {Path(str(item["path"])).resolve(): item for item in registered_worktrees(project)}
+    registered = records.get(worktree.resolve())
+    if not worktree.is_dir() or registered is None:
+        raise WorkflowError(
+            "recorded reconciliation worktree is missing or no longer registered; "
+            "inspect it, then use abandon-reconciliation before creating another attempt"
+        )
+    expected_ref = f"refs/heads/{attempt['branch']}"
+    if registered.get("branch") != expected_ref:
+        raise WorkflowError("recorded reconciliation worktree is on an unexpected branch")
+    markers = git_operation_markers(worktree)
+    unexpected = [item for item in markers if item != "MERGE_HEAD"]
+    if unexpected:
+        raise WorkflowError(
+            "recorded reconciliation worktree has an unexpected Git operation: "
+            + ", ".join(unexpected)
+        )
+    head = git(worktree, "rev-parse", "HEAD")
+    if "MERGE_HEAD" in markers:
+        if head != attempt["target_sha"]:
+            raise WorkflowError("uncommitted reconciliation no longer starts at its recorded target")
+        merge_head = git(worktree, "rev-parse", "MERGE_HEAD")
+        if merge_head != attempt["source_candidate_sha"]:
+            raise WorkflowError("reconciliation MERGE_HEAD is not the recorded source candidate")
+        unmerged = bool(git(worktree, "diff", "--name-only", "--diff-filter=U"))
+        return "CONFLICT" if unmerged else "READY_FOR_COMMIT"
+    if head == attempt["target_sha"]:
+        raise WorkflowError("recorded reconciliation has neither a merge operation nor a merge commit")
+    ensure_clean(worktree, "reconciliation")
+    for ancestor, label in (
+        (attempt["target_sha"], "target"),
+        (attempt["source_candidate_sha"], "source candidate"),
+    ):
+        if run(
+            ("git", "-C", str(worktree), "merge-base", "--is-ancestor", ancestor, head),
+            check=False,
+        ).returncode:
+            raise WorkflowError(f"recorded reconciliation HEAD does not contain the {label} SHA")
+    return "READY_FOR_COMMIT"
+
+
 def command_reconcile(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     state = load_state(project, args.run_id)
@@ -4362,9 +4443,10 @@ def command_reconcile(args: argparse.Namespace) -> None:
         raise WorkflowError("integration.current_attempt does not identify the active reconciliation attempt")
     existing = active_attempts[0] if active_attempts else None
     if existing and existing.get("status") in {"READY_FOR_COMMIT", "CONFLICT"}:
+        observed_status = observe_reconciliation_attempt(project, existing)
         existing_status = (
             "RECONCILIATION_CONFLICT"
-            if existing["status"] == "CONFLICT"
+            if observed_status == "CONFLICT"
             else "RECONCILIATION_READY_FOR_COMMIT"
         )
         emit({
@@ -4373,7 +4455,7 @@ def command_reconcile(args: argparse.Namespace) -> None:
             "source_candidate_sha": existing["source_candidate_sha"],
             "worktree": existing["worktree"], "branch": existing["branch"],
             "attempt_number": existing["number"],
-        }, 3 if existing["status"] == "CONFLICT" else 0)
+        }, 3 if observed_status == "CONFLICT" else 0)
     preparing = existing if existing and existing.get("status") == "PREPARING" else None
     new_preparation = preparing is None
     if preparing:

@@ -15,6 +15,10 @@ All notable changes use semantic versioning.
   prepared finalization transaction.
 - Made reconciliation attempts idempotent, explicitly selectable at submission, and auditable to abandon
   without deleting their worktree or branch.
+- Authenticated checkpointed legacy state before schema translation, preventing schema downgrades from
+  laundering forged completion, and made byte-identical interrupted migration backups resumable.
+- Removed cache-directory fingerprint exemptions, rejected special files and unreadable venv subtrees,
+  and revalidated recorded reconciliation Git resources before returning an idempotent result.
 
 ## [0.4.5] - 2026-08-27
 
