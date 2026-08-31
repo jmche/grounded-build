@@ -378,9 +378,13 @@ FAIL, and does not consume a quality-review round.
 
 Preflight reports whether `<project>/.venv/bin/python` exists and whether a uv project is detectable.
 The run fingerprints `.venv` statically: it does not execute that interpreter, so `.pth` startup code
-cannot escape the verification sandbox through a metadata probe. The content digest covers the venv's
-runtime files and external launcher target. The engine checks it before mutations and after every
-verification command because a read-only bind mount is not a content snapshot.
+cannot escape the verification sandbox through a metadata probe. The `.venv` root cannot be a symlink;
+all other symlinks contribute only their stored link text, never content from a resolved target. File
+modes are included, and file, byte, and time ceilings bound the scan. Ordinary commands compare bounded
+metadata while evidence-producing verification compares full in-venv file content both before and after
+the command, because a read-only bind mount is not a content snapshot. The interpreter installation
+reached through a launcher symlink remains an explicitly reported host trust root rather than causing
+the controller to read arbitrary external files; use an immutable toolchain when that runtime also needs attestation.
 When the environment is absent, the verifier fails with an infrastructure diagnostic before launching
 bubblewrap. It never runs `uv sync` or installs dependencies silently. If the repository uses uv, prepare
 the environment explicitly with its locked, documented workflow before verification. Any future automated
@@ -441,17 +445,21 @@ For a diverged target, preview and explicitly create a run-owned merge worktree:
 
 The command records a `PREPARING` transaction before creating Git resources, then uses
 `--no-ff --no-commit`. If the process stops after worktree creation, rerun the same command: it validates
-and resumes the recorded worktree instead of creating another branch. Resolve conflicts in the returned
+and resumes the recorded worktree instead of creating another branch. Once an attempt is ready or
+conflicted, every rerun returns that same attempt. Resolve conflicts in the returned
 worktree, run appropriate tests, and commit the merge. Then register it:
 
 ```bash
 <controller-python> <skill-root>/scripts/workflow.py submit-reconciliation \
-  --project <project> --run-id <run-id>
+  --project <project> --run-id <run-id> --attempt-number <number>
 ```
 
 Submission validates that both the observed target and reviewed source are ancestors, then appends a
 synthetic `INTEGRATION_NN` batch. Review, verify, and accept that batch through the ordinary fixed-SHA
 workflow. This reuses the finding ledger and bounded review policy instead of inventing a weaker gate.
+To discard an active preparation without deleting its evidence, preview and apply
+`abandon-reconciliation --attempt-number <number> --reason <reason> --actor <actor>`. Only then may
+`reconcile` mint a new numbered attempt; the abandoned branch and worktree remain auditable.
 
 After approval:
 

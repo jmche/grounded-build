@@ -56,8 +56,9 @@ from silently selecting a different `python3` through PATH.
 Project `.venv` directories are normally ignored and therefore do not follow Git worktrees. Fixed-SHA
 verification deliberately reuses `<project>/.venv` read-only while keeping the reviewed worktree as cwd.
 Each implementation run statically fingerprints that shared environment without launching its Python
-interpreter or executing `.pth` startup code. Package contents are checked before state-changing work
-and again after verification; drift is infrastructure and never silently becomes review evidence.
+interpreter, executing `.pth` startup code, or following symlinks outside `.venv`. Bounded metadata
+checks protect ordinary commands from repeated full scans; full package contents are checked immediately
+before and after evidence-producing verification. Drift is infrastructure and never silently becomes review evidence.
 If it is absent, preflight reports whether uv metadata and the uv executable are available, but Grounded
 Build does not install dependencies automatically. Provisioning remains an explicit operator action so
 network access, lockfile selection, and executed build hooks cannot be hidden inside verification.

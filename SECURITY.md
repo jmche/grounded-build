@@ -16,6 +16,10 @@ Grounded Build is a local workflow for a trusted operating-system account. The r
 - Environment fingerprinting reads `.venv` content from the controller process and never launches the
   project interpreter. Project `.pth` and startup hooks execute only inside an authorized verification
   sandbox, never as a side effect of preflight, status, review, or state validation.
+- The `.venv` root must be a real directory. Fingerprinting records symlink text but never resolves or
+  reads a symlink target, and file, byte, and elapsed-time ceilings bound every scan.
+- An interpreter reached through a `.venv` launcher symlink is a declared host trust root, not part of
+  the venv content digest. Use an immutable toolchain when external-runtime attestation is required.
 
 ## Deliberate limit
 

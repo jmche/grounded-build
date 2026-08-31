@@ -10,9 +10,11 @@ All notable changes use semantic versioning.
   detection, and infrastructure classification without launching `.venv` startup hooks.
 - Reclassified target-branch movement as integration divergence rather than execution staleness.
 - Allowed finalization to atomically advance a target branch that is not checked out without switching the user's checkout.
-- Raised implementation state to schema v6 with explicit, backed-up migration from schema v5.
+- Raised implementation state to schema v7 with explicit, backed-up environment-fingerprint migration from schema v6.
 - Added crash recovery for reconciliation worktree preparation and for target movement during a
   prepared finalization transaction.
+- Made reconciliation attempts idempotent, explicitly selectable at submission, and auditable to abandon
+  without deleting their worktree or branch.
 
 ## [0.4.5] - 2026-08-27
 

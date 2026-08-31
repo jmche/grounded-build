@@ -149,7 +149,8 @@ One repository may have multiple concurrent implementation runs. Every run freez
 branch, worktrees, state, and reviewer; always preserve the returned `run_id`. When several runs are
 active, commands that omit `--run-id` refuse and list the candidates. Target-branch movement never
 invalidates baseline execution: finish the reviewed candidate, then use preview-first `reconcile` and
-`submit-reconciliation` when the target has diverged.
+`submit-reconciliation` when the target has diverged. Re-running `reconcile` returns the active attempt;
+use preview-first `abandon-reconciliation` before intentionally starting another.
 
 The implementation host remains the current host model. Its isolated reviewer defaults to Opus for Claude or `gpt-5.6-sol` for Codex; `--claude-model`, `--codex-model`, `--codex-model-provider`, and `--codex-profile` may override that selection at `init` and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.
 

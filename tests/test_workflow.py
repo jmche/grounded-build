@@ -571,6 +571,47 @@ class WorkflowIntegrationTests(unittest.TestCase):
             candidate_sha,
         )
 
+    def test_reconciliation_is_idempotent_until_explicitly_abandoned(self) -> None:
+        initialized = self.initialize("codex")
+        self.review_accept(initialized)
+        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
+        first = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        repeated = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        self.assertTrue(repeated["existing"])
+        self.assertEqual(repeated["attempt_number"], first["attempt_number"])
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        self.assertEqual(len(json.loads(state_path.read_text())["integration"]["attempts"]), 1)
+        wrong = self.workflow(
+            "submit-reconciliation", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--attempt-number", "99", expected=1,
+        )
+        self.assertIn("attempt not found", str(wrong["error"]))
+        preview = self.workflow(
+            "abandon-reconciliation", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--reason", "retry with a new target merge",
+            "--actor", "test-suite",
+        )
+        self.assertEqual(preview["status"], "ABANDON_RECONCILIATION_PREVIEW")
+        abandoned = self.workflow(
+            "abandon-reconciliation", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--reason", "retry with a new target merge",
+            "--actor", "test-suite", "--apply",
+        )
+        self.assertEqual(abandoned["status"], "RECONCILIATION_ABANDONED")
+        second = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        self.assertEqual(second["attempt_number"], 2)
+
     def test_finalize_updates_target_ref_without_switching_original_checkout(self) -> None:
         initialized = self.initialize("codex")
         final_sha, _ = self.review_accept(initialized)
@@ -726,6 +767,63 @@ class WorkflowIntegrationTests(unittest.TestCase):
         package_file.write_text("VALUE = 2\n", encoding="utf-8")
         second = WORKFLOW_MODULE.project_environment_contract(self.project)
         self.assertNotEqual(first["digest"], second["digest"])
+
+    def test_environment_fingerprint_never_reads_external_symlink_targets(self) -> None:
+        venv_bin = self.project / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        os.symlink(sys.executable, venv_bin / "python")
+        secret = self.root / "external-secret"
+        secret.write_text("first\n", encoding="utf-8")
+        os.symlink(secret, self.project / ".venv" / "external-link")
+        external_packages = self.root / "external-packages"
+        metadata = external_packages / "fixture.dist-info" / "METADATA"
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text("Name: external\nVersion: 1\n", encoding="utf-8")
+        python_lib = self.project / ".venv" / "lib" / "python3"
+        python_lib.mkdir(parents=True)
+        os.symlink(external_packages, python_lib / "site-packages")
+        first = WORKFLOW_MODULE.project_environment_contract(self.project)
+        secret.write_text("different external content\n", encoding="utf-8")
+        metadata.write_text("Name: external\nVersion: 2\n", encoding="utf-8")
+        second = WORKFLOW_MODULE.project_environment_contract(self.project)
+        self.assertEqual(first["digest"], second["digest"])
+        self.assertEqual(first["symlink_count"], 3)
+
+    def test_environment_fingerprint_rejects_symlink_root_and_records_modes(self) -> None:
+        external = self.root / "external-venv"
+        (external / "bin").mkdir(parents=True)
+        os.symlink(sys.executable, external / "bin" / "python")
+        os.symlink(external, self.project / ".venv")
+        with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "must not be a symlink"):
+            WORKFLOW_MODULE.project_environment_contract(self.project)
+        (self.project / ".venv").unlink()
+        (self.project / ".venv" / "bin").mkdir(parents=True)
+        os.symlink(sys.executable, self.project / ".venv" / "bin" / "python")
+        fixture = self.project / ".venv" / "fixture"
+        fixture.write_text("stable\n", encoding="utf-8")
+        first = WORKFLOW_MODULE.project_environment_contract(self.project)
+        fixture.chmod(0o755)
+        second = WORKFLOW_MODULE.project_environment_contract(self.project)
+        self.assertNotEqual(first["metadata_sha256"], second["metadata_sha256"])
+
+    def test_environment_fingerprint_has_a_file_budget(self) -> None:
+        venv_bin = self.project / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        os.symlink(sys.executable, venv_bin / "python")
+        (self.project / ".venv" / "extra").write_text("x", encoding="utf-8")
+        original = WORKFLOW_MODULE.MAX_ENVIRONMENT_FILES
+        original_bytes = WORKFLOW_MODULE.MAX_ENVIRONMENT_BYTES
+        try:
+            WORKFLOW_MODULE.MAX_ENVIRONMENT_FILES = 1
+            with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "file or byte budget"):
+                WORKFLOW_MODULE.project_environment_contract(self.project)
+            WORKFLOW_MODULE.MAX_ENVIRONMENT_FILES = original
+            WORKFLOW_MODULE.MAX_ENVIRONMENT_BYTES = 0
+            with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "file or byte budget"):
+                WORKFLOW_MODULE.project_environment_contract(self.project)
+        finally:
+            WORKFLOW_MODULE.MAX_ENVIRONMENT_FILES = original
+            WORKFLOW_MODULE.MAX_ENVIRONMENT_BYTES = original_bytes
 
     def test_environment_drift_during_verification_invalidates_evidence(self) -> None:
         venv_bin = self.project / ".venv" / "bin"
@@ -1329,6 +1427,40 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(migrated["status"], "MIGRATED")
         self.assertTrue(Path(str(migrated["backup_path"])).is_file())
+
+    def test_schema6_environment_fingerprint_requires_explicit_rebase(self) -> None:
+        initialized = self.initialize("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text())
+        state["schema_version"] = 6
+        state["environment_contract"]["fingerprint_version"] = 2
+        state["integration"].update({
+            "status": "RECONCILING", "current_attempt": 2,
+            "attempts": [
+                {"number": 1, "status": "READY_FOR_COMMIT"},
+                {"number": 2, "status": "READY_FOR_COMMIT"},
+            ],
+        })
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
+        )
+        self.assertEqual(status["status"], "MIGRATION_REQUIRED")
+        preview = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"])
+        )
+        self.assertTrue(preview["environment_fingerprint_migration"])
+        migrated = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply",
+        )
+        self.assertEqual(migrated["status"], "MIGRATED")
+        current = json.loads(state_path.read_text())
+        self.assertEqual(current["schema_version"], 7)
+        self.assertEqual(current["environment_contract"]["fingerprint_version"], 3)
+        self.assertEqual(current["integration"]["attempts"][0]["status"], "LEGACY_SUPERSEDED")
+        self.assertEqual(current["integration"]["current_attempt"], 2)
+        self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema6"))
 
     def test_schema5_target_advance_parking_migrates_to_integration_drift(self) -> None:
         initialized = self.initialize("codex")

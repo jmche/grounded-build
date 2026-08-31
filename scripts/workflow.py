@@ -15,6 +15,7 @@ import re
 import resource
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_TIMEOUT_SECONDS = 1800
 MAX_REVIEW_ROUNDS = 4
 DEFAULT_MAX_REVIEW_INVOCATIONS_PER_BATCH = 10
@@ -46,6 +47,10 @@ MAX_VERIFICATION_TEMP_BYTES = 256 * 1024 * 1024
 MAX_VERIFICATION_TEMP_FILES = 200_000
 MAX_VERIFICATION_PROCESSES = 64
 MAX_VERIFICATION_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
+ENVIRONMENT_FINGERPRINT_VERSION = 3
+MAX_ENVIRONMENT_FILES = 200_000
+MAX_ENVIRONMENT_BYTES = 16 * 1024 * 1024 * 1024
+MAX_ENVIRONMENT_SCAN_SECONDS = 30.0
 SUPPORTED_REVIEWERS = ("claude", "codex", "dsh")
 DEFAULT_CLAUDE_REVIEWER_MODEL = "opus"
 DEFAULT_CODEX_REVIEWER_MODEL = "gpt-5.6-sol"
@@ -898,7 +903,7 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise WorkflowError(f"invalid workflow state: {path}: {exc}") from exc
     loaded_schema = state.get("schema_version")
-    if loaded_schema in {2, 3, 4, 5}:
+    if loaded_schema in {2, 3, 4, 5, 6}:
         state["schema_version"] = SCHEMA_VERSION
         state["_requires_migration"] = True
         state.setdefault("finding_ledger", {})
@@ -1105,18 +1110,65 @@ def validate_plan_unchanged(state: dict[str, Any]) -> None:
             raise WorkflowError("the authoritative batch manifest changed or disappeared after initialization")
 
 
-def project_environment_contract(project: Path) -> dict[str, Any]:
-    """Fingerprint the project venv without executing any code from that environment."""
+def _environment_file_digest(
+    path: Path, observed: os.stat_result, deadline: float, relative: str,
+) -> str:
+    """Hash one already-lstat'd file without following a replacement symlink."""
+    digest = hashlib.sha256()
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise WorkflowError(f"cannot open project .venv entry {relative}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+            raise WorkflowError(f"project .venv entry changed before fingerprint: {relative}")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            while chunk := handle.read(1024 * 1024):
+                if time.monotonic() > deadline:
+                    raise WorkflowError("project .venv fingerprint exceeded its time budget")
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            after.st_size != observed.st_size
+            or after.st_mtime_ns != observed.st_mtime_ns
+            or stat.S_IMODE(after.st_mode) != stat.S_IMODE(observed.st_mode)
+        ):
+            raise WorkflowError(f"project .venv entry changed during fingerprint: {relative}")
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def project_environment_contract(project: Path, *, include_content: bool = True) -> dict[str, Any]:
+    """Fingerprint a project venv without executing code or following symlink targets."""
     root = project / ".venv"
     launcher = root / "bin" / "python"
-    if not launcher.is_file():
-        payload: dict[str, Any] = {"status": "ABSENT", "path": str(root.resolve())}
+    if root.is_symlink():
+        raise WorkflowError("project .venv must not be a symlink")
+    if not os.path.lexists(launcher):
+        payload: dict[str, Any] = {
+            "status": "ABSENT", "path": str(root.absolute()),
+            "metadata_sha256": None, "content_sha256": None,
+            "file_count": 0, "byte_count": 0, "symlink_count": 0,
+            "external_runtime_policy": "HOST_TRUST_ROOT_NOT_FINGERPRINTED",
+        }
     else:
+        try:
+            root_stat = root.lstat()
+        except OSError as exc:
+            raise WorkflowError(f"cannot inspect project .venv: {exc}") from exc
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise WorkflowError("project .venv must be a real directory")
         ignored_directories = {".pytest_cache", ".mypy_cache", ".ruff_cache"}
-        content = hashlib.sha256()
+        metadata = hashlib.sha256()
+        content = hashlib.sha256() if include_content else None
         file_count = 0
         byte_count = 0
-        root_resolved = root.resolve()
+        symlink_count = 0
+        started = time.monotonic()
+        deadline = started + MAX_ENVIRONMENT_SCAN_SECONDS
+        pyvenv_digest: str | None = None
         for current_text, directories, files in os.walk(root, followlinks=False):
             current = Path(current_text)
             directories[:] = sorted(
@@ -1129,57 +1181,84 @@ def project_environment_contract(project: Path) -> dict[str, Any]:
             for name in entries:
                 path = current / name
                 relative = path.relative_to(root).as_posix()
-                content.update(relative.encode("utf-8", errors="surrogateescape") + b"\0")
-                if path.is_symlink():
+                if time.monotonic() - started > MAX_ENVIRONMENT_SCAN_SECONDS:
+                    raise WorkflowError("project .venv fingerprint exceeded its time budget")
+                try:
+                    observed = path.lstat()
+                except OSError as exc:
+                    raise WorkflowError(f"cannot inspect project .venv entry {relative}: {exc}") from exc
+                mode = stat.S_IMODE(observed.st_mode)
+                prefix = relative.encode("utf-8", errors="surrogateescape") + b"\0"
+                if stat.S_ISLNK(observed.st_mode):
                     target = os.readlink(path)
-                    content.update(b"L\0" + target.encode("utf-8", errors="surrogateescape") + b"\0")
-                    resolved = path.resolve()
-                    if resolved.is_file() and not resolved.is_relative_to(root_resolved):
-                        digest = sha256_file(resolved)
-                        content.update(b"E\0" + str(resolved).encode() + b"\0" + digest.encode())
-                        byte_count += resolved.stat().st_size
+                    record = (
+                        prefix + b"L\0" + str(mode).encode() + b"\0"
+                        + target.encode("utf-8", errors="surrogateescape") + b"\0"
+                    )
+                    metadata.update(record)
+                    if content is not None:
+                        content.update(record)
                     file_count += 1
-                elif path.is_file():
-                    digest = sha256_file(path)
-                    size = path.stat().st_size
-                    content.update(b"F\0" + str(size).encode() + b"\0" + digest.encode())
+                    symlink_count += 1
+                elif stat.S_ISREG(observed.st_mode):
+                    size = observed.st_size
+                    if file_count + 1 > MAX_ENVIRONMENT_FILES or byte_count + size > MAX_ENVIRONMENT_BYTES:
+                        raise WorkflowError(
+                            "project .venv fingerprint exceeded its file or byte budget: "
+                            f"{file_count + 1} files, {byte_count + size} bytes"
+                        )
+                    record = (
+                        prefix + b"F\0" + str(mode).encode() + b"\0"
+                        + str(size).encode() + b"\0" + str(observed.st_mtime_ns).encode() + b"\0"
+                    )
+                    metadata.update(record)
+                    if content is not None:
+                        digest = _environment_file_digest(path, observed, deadline, relative)
+                        content.update(record + digest.encode() + b"\0")
+                        if relative == "pyvenv.cfg":
+                            pyvenv_digest = digest
                     file_count += 1
                     byte_count += size
                 else:
-                    content.update(b"D\0")
-        packages: list[list[str]] = []
-        for metadata_path in sorted(root.glob("lib/python*/site-packages/*.dist-info/METADATA")):
-            name = ""
-            version = ""
-            for line in metadata_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if line.startswith("Name: ") and not name:
-                    name = line[6:].strip()
-                elif line.startswith("Version: ") and not version:
-                    version = line[9:].strip()
-                if name and version:
-                    break
-            packages.append([name, version])
-        pyvenv = root / "pyvenv.cfg"
+                    record = prefix + b"D\0" + str(mode).encode() + b"\0"
+                    metadata.update(record)
+                    if content is not None:
+                        content.update(record)
+                if file_count > MAX_ENVIRONMENT_FILES or byte_count > MAX_ENVIRONMENT_BYTES:
+                    raise WorkflowError(
+                        "project .venv fingerprint exceeded its file or byte budget: "
+                        f"{file_count} files, {byte_count} bytes"
+                    )
         payload = {
-            "status": "PRESENT", "path": str(root.resolve()),
-            "launcher": str(launcher.resolve()),
-            "pyvenv_sha256": sha256_file(pyvenv) if pyvenv.is_file() else None,
-            "packages": sorted(packages), "content_sha256": content.hexdigest(),
-            "file_count": file_count, "byte_count": byte_count,
+            "status": "PRESENT", "path": str(root.absolute()),
+            "launcher": str(launcher.absolute()),
+            "pyvenv_sha256": pyvenv_digest,
+            # Package metadata is already covered as ordinary in-root content. Do not perform a
+            # second glob pass: a symlinked parent could make globbing cross the venv boundary.
+            "packages": [], "metadata_sha256": metadata.hexdigest(),
+            "content_sha256": content.hexdigest() if content is not None else None,
+            "file_count": file_count, "byte_count": byte_count, "symlink_count": symlink_count,
             "probe_policy": "STATIC_FILESYSTEM_ONLY",
+            "external_runtime_policy": "HOST_TRUST_ROOT_NOT_FINGERPRINTED",
         }
-    payload["fingerprint_version"] = 2
+    payload["fingerprint_version"] = ENVIRONMENT_FINGERPRINT_VERSION
+    payload["validation_level"] = "FULL_CONTENT" if include_content else "METADATA_ONLY"
     payload["digest"] = sha256_bytes(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     )
     return payload
 
 
-def validate_environment_contract(project: Path, state: dict[str, Any]) -> None:
+def validate_environment_contract(
+    project: Path, state: dict[str, Any], *, full: bool = False,
+) -> None:
     expected = state.get("environment_contract")
     if isinstance(expected, dict):
-        current = project_environment_contract(project)
-        if current.get("digest") != expected.get("digest"):
+        if expected.get("fingerprint_version") != ENVIRONMENT_FINGERPRINT_VERSION:
+            raise WorkflowError("environment fingerprint requires explicit schema migration")
+        current = project_environment_contract(project, include_content=full)
+        key = "digest" if full else "metadata_sha256"
+        if current.get(key) != expected.get(key):
             raise EnvironmentDriftError(
                 "shared project environment drifted from the frozen fingerprint; "
                 "restore it or supersede and initialize a new run"
@@ -1188,15 +1267,23 @@ def validate_environment_contract(project: Path, state: dict[str, Any]) -> None:
 
 def environment_status(project: Path, state: dict[str, Any]) -> dict[str, Any]:
     recorded = state.get("environment_contract")
-    current = project_environment_contract(project)
-    recorded_digest = recorded.get("digest") if isinstance(recorded, dict) else None
+    current = project_environment_contract(project, include_content=False)
+    recorded_digest = recorded.get("metadata_sha256") if isinstance(recorded, dict) else None
     return {
         "recorded_digest": recorded_digest,
-        "current_digest": current.get("digest"),
+        "current_digest": current.get("metadata_sha256"),
         "recorded_status": recorded.get("status") if isinstance(recorded, dict) else None,
         "current_status": current.get("status"),
-        "drifted": bool(recorded_digest and recorded_digest != current.get("digest")),
+        "drifted": bool(
+            isinstance(recorded, dict)
+            and (
+                recorded.get("status") != current.get("status")
+                or recorded_digest != current.get("metadata_sha256")
+            )
+        ),
         "probe_policy": current.get("probe_policy", "STATIC_FILESYSTEM_ONLY"),
+        "validation_level": "METADATA_ONLY",
+        "full_content_required_before_evidence": True,
     }
 
 
@@ -2908,6 +2995,9 @@ def command_verify(args: argparse.Namespace) -> None:
     # stays non-retryable; this admission is about its siblings, not a FAIL retry.
     if state.get("status") not in {"AWAITING_VERIFICATION", "FINAL_VERIFICATION_REQUIRED", "IMPLEMENTING", "CHANGES_REQUESTED"}:
         raise WorkflowError(f"verify is not allowed from workflow status {state.get('status')}")
+    # Status and ordinary transitions use a bounded metadata observation. Evidence-producing
+    # verification additionally proves all in-venv regular-file content before and after execution.
+    validate_environment_contract(project, state, full=True)
     matches = [item for item in state.get("verification_requests", []) if item.get("request_key") == args.request_id]
     if len(matches) != 1:
         raise WorkflowError(f"verification request not found: {args.request_id}")
@@ -3067,7 +3157,7 @@ def command_verify(args: argparse.Namespace) -> None:
         )
         # A read-only bind is not a snapshot: host-side changes remain visible while the command
         # runs. Recheck before accepting evidence so mid-verification drift is infrastructure.
-        validate_environment_contract(project, state)
+        validate_environment_contract(project, state, full=True)
     except (WorkflowError, OSError) as exc:
         attempt.update({"status": "INFRA_ERROR", "error": str(exc), "completed_at": utc_now()})
         record["status"] = "PENDING"
@@ -3953,6 +4043,11 @@ def command_migrate(args: argparse.Namespace) -> None:
         "legacy_acceptance_contract": state.get("acceptance_contract", {}).get("status"),
         "plan_snapshot_digest": state.get("plan_snapshot_digest"),
         "pending_decision_repair": decision_repair,
+        "environment_fingerprint_migration": (
+            isinstance(state.get("environment_contract"), dict)
+            and state["environment_contract"].get("fingerprint_version")
+            != ENVIRONMENT_FINGERPRINT_VERSION
+        ),
     }
     if not args.apply:
         emit(preview)
@@ -3971,6 +4066,35 @@ def command_migrate(args: argparse.Namespace) -> None:
             "backup_path": str(backup), "backup_sha256": sha256_file(backup),
         }
         append_event(state, "SCHEMA_MIGRATED", state["migration"])
+        old_environment = state.get("environment_contract")
+        if (
+            not isinstance(old_environment, dict)
+            or old_environment.get("fingerprint_version") != ENVIRONMENT_FINGERPRINT_VERSION
+        ):
+            old_version = old_environment.get("fingerprint_version") if isinstance(old_environment, dict) else None
+            state["environment_contract"] = project_environment_contract(project, include_content=True)
+            append_event(state, "ENVIRONMENT_FINGERPRINT_MIGRATED", {
+                "from_version": old_version,
+                "to_version": ENVIRONMENT_FINGERPRINT_VERSION,
+                "basis": "MIGRATION_TIME_STATIC_FILESYSTEM_OBSERVATION",
+            })
+        integration = state.setdefault("integration", {})
+        attempts = integration.setdefault("attempts", [])
+        active_attempts = [
+            item for item in attempts
+            if item.get("status") in {"PREPARING", "READY_FOR_COMMIT", "CONFLICT"}
+        ]
+        if len(active_attempts) > 1:
+            current = active_attempts[-1]
+            for item in active_attempts[:-1]:
+                item["status"] = "LEGACY_SUPERSEDED"
+                item["superseded_at"] = utc_now()
+                item["superseded_by_attempt"] = current.get("number")
+            integration["current_attempt"] = current.get("number")
+            append_event(state, "LEGACY_RECONCILIATION_ATTEMPTS_NORMALIZED", {
+                "preserved_attempts": [item.get("number") for item in active_attempts],
+                "current_attempt": current.get("number"),
+            })
         pending = state.get("pending_decision")
         if isinstance(pending, dict) and pending.get("type") == "TARGET_ADVANCED":
             state["status"] = str(pending.get("previous_status", "IMPLEMENTING"))
@@ -4225,7 +4349,32 @@ def command_reconcile(args: argparse.Namespace) -> None:
         )
     integration = state.setdefault("integration", {})
     attempts = integration.setdefault("attempts", [])
-    preparing = attempts[-1] if attempts and attempts[-1].get("status") == "PREPARING" else None
+    active_attempts = [
+        item for item in attempts
+        if item.get("status") in {"PREPARING", "READY_FOR_COMMIT", "CONFLICT"}
+    ]
+    if len(active_attempts) > 1:
+        raise WorkflowError(
+            "multiple active reconciliation attempts require explicit schema migration or abandonment"
+        )
+    current_number = integration.get("current_attempt")
+    if active_attempts and current_number != active_attempts[0].get("number"):
+        raise WorkflowError("integration.current_attempt does not identify the active reconciliation attempt")
+    existing = active_attempts[0] if active_attempts else None
+    if existing and existing.get("status") in {"READY_FOR_COMMIT", "CONFLICT"}:
+        existing_status = (
+            "RECONCILIATION_CONFLICT"
+            if existing["status"] == "CONFLICT"
+            else "RECONCILIATION_READY_FOR_COMMIT"
+        )
+        emit({
+            "status": existing_status, "run_id": state["run_id"], "existing": True,
+            "target_branch": existing["target_branch"], "target_sha": existing["target_sha"],
+            "source_candidate_sha": existing["source_candidate_sha"],
+            "worktree": existing["worktree"], "branch": existing["branch"],
+            "attempt_number": existing["number"],
+        }, 3 if existing["status"] == "CONFLICT" else 0)
+    preparing = existing if existing and existing.get("status") == "PREPARING" else None
     new_preparation = preparing is None
     if preparing:
         number = int(preparing["number"])
@@ -4249,6 +4398,7 @@ def command_reconcile(args: argparse.Namespace) -> None:
         "status": "RECONCILE_PREVIEW", "run_id": state["run_id"],
         "target_branch": target_branch, "target_sha": target_sha,
         "source_candidate_sha": source, "worktree": str(worktree), "branch": branch,
+        "attempt_number": number,
     }
     if not args.apply:
         emit(preview)
@@ -4320,7 +4470,15 @@ def command_submit_reconciliation(args: argparse.Namespace) -> None:
     attempts = integration.get("attempts") or []
     if integration.get("status") != "RECONCILING" or not attempts:
         raise WorkflowError("no reconciliation attempt is ready for submission")
-    attempt = attempts[-1]
+    requested_number = args.attempt_number or integration.get("current_attempt")
+    matching = [item for item in attempts if item.get("number") == requested_number]
+    if len(matching) != 1:
+        raise WorkflowError(f"reconciliation attempt not found: {requested_number}")
+    attempt = matching[0]
+    if attempt.get("number") != integration.get("current_attempt"):
+        raise WorkflowError("only integration.current_attempt may be submitted")
+    if attempt.get("status") not in {"READY_FOR_COMMIT", "CONFLICT"}:
+        raise WorkflowError(f"reconciliation attempt is not submittable: {attempt.get('status')}")
     worktree = Path(attempt["worktree"])
     ensure_clean(worktree, "reconciliation")
     head = git(worktree, "rev-parse", "HEAD")
@@ -4359,6 +4517,46 @@ def command_submit_reconciliation(args: argparse.Namespace) -> None:
         "batch": batch, "reviewed_sha": head,
         "next_command": f"review --batch {batch}",
     })
+
+
+def command_abandon_reconciliation(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id)
+    validate_active_state(project, state)
+    if state.get("status") != "READY_TO_FINALIZE":
+        raise WorkflowError(
+            f"abandon-reconciliation requires READY_TO_FINALIZE, found {state.get('status')}"
+        )
+    integration = state.get("integration") or {}
+    attempts = integration.get("attempts") or []
+    requested_number = args.attempt_number or integration.get("current_attempt")
+    matching = [item for item in attempts if item.get("number") == requested_number]
+    if len(matching) != 1:
+        raise WorkflowError(f"reconciliation attempt not found: {requested_number}")
+    attempt = matching[0]
+    if attempt.get("number") != integration.get("current_attempt"):
+        raise WorkflowError("only integration.current_attempt may be abandoned")
+    if attempt.get("status") not in {"PREPARING", "READY_FOR_COMMIT", "CONFLICT"}:
+        raise WorkflowError(f"reconciliation attempt is not active: {attempt.get('status')}")
+    preview = {
+        "status": "ABANDON_RECONCILIATION_PREVIEW", "run_id": state["run_id"],
+        "attempt_number": attempt["number"], "worktree": attempt["worktree"],
+        "branch": attempt["branch"], "reason": args.reason, "actor": args.actor,
+        "resources_preserved": True,
+    }
+    if not args.apply:
+        emit(preview)
+    attempt.update({
+        "status": "ABANDONED", "abandoned_at": utc_now(),
+        "abandon_reason": args.reason, "abandoned_by": args.actor,
+    })
+    integration.update({"status": "DIVERGED", "current_attempt": None})
+    append_event(state, "RECONCILIATION_ABANDONED", {
+        "attempt_number": attempt["number"], "reason": args.reason,
+        "actor": args.actor, "resources_preserved": True,
+    })
+    save_state(state)
+    emit({**preview, "status": "RECONCILIATION_ABANDONED"})
 
 
 def command_supersede(args: argparse.Namespace) -> None:
@@ -4732,7 +4930,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_project_argument(submit_reconciliation)
     add_run_argument(submit_reconciliation)
+    submit_reconciliation.add_argument("--attempt-number", type=int)
     submit_reconciliation.set_defaults(func=command_submit_reconciliation)
+
+    abandon_reconciliation = commands.add_parser(
+        "abandon-reconciliation", help="preserve and deactivate the current reconciliation attempt",
+    )
+    add_project_argument(abandon_reconciliation)
+    add_run_argument(abandon_reconciliation)
+    abandon_reconciliation.add_argument("--attempt-number", type=int)
+    abandon_reconciliation.add_argument("--reason", required=True)
+    abandon_reconciliation.add_argument("--actor", required=True)
+    abandon_reconciliation.add_argument("--apply", action="store_true")
+    abandon_reconciliation.set_defaults(func=command_abandon_reconciliation)
 
     supersede = commands.add_parser("supersede", help="preserve but deactivate an obsolete run")
     add_project_argument(supersede)
