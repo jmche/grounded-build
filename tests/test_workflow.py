@@ -397,23 +397,199 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(recovered["status"], "FINALIZED")
         self.assertEqual(recovered["final_sha"], final_head)
 
-    def test_target_advance_marks_run_stale_and_blocks_review(self) -> None:
+    def test_two_runs_can_progress_independently_from_one_baseline(self) -> None:
+        first = self.initialize("codex", "codex-host")
+        second = self.initialize("claude", "claude-host")
+        self.assertNotEqual(first["run_id"], second["run_id"])
+        self.assertEqual(first["baseline_sha"], second["baseline_sha"])
+        listing = self.workflow("list", "--project", str(self.project))
+        self.assertEqual(
+            set(listing["active_runs"]), {first["run_id"], second["run_id"]}
+        )
+        ambiguous = self.workflow(
+            "status", "--project", str(self.project), expected=1,
+        )
+        self.assertEqual(ambiguous["status"], "WORKFLOW_ERROR")
+        self.assertIn("multiple active runs", str(ambiguous["error"]))
+        for initialized in (first, second):
+            implementation = Path(str(initialized["implementation_worktree"]))
+            self.commit_batch_change(implementation)
+            reviewed = self.workflow(
+                "review", "--project", str(self.project),
+                "--run-id", str(initialized["run_id"]), "--batch", "1",
+            )
+            self.assertEqual(reviewed["status"], "REVIEW_PASS")
+
+    def test_a_busy_run_lock_does_not_block_another_run(self) -> None:
+        first = self.initialize("codex", "codex-host")
+        second = self.initialize("claude", "claude-host")
+        first_lock = Path(str(first["run_directory"])) / "workflow.lock"
+        with WORKFLOW_MODULE.file_lock(first_lock):
+            available = self.workflow(
+                "status", "--project", str(self.project),
+                "--run-id", str(second["run_id"]),
+            )
+            self.assertEqual(available["run_id"], second["run_id"])
+            busy = self.workflow(
+                "status", "--project", str(self.project),
+                "--run-id", str(first["run_id"]), expected=1,
+            )
+            self.assertIn("another workflow command is active", str(busy["error"]))
+
+    def test_target_advance_is_integration_drift_not_execution_staleness(self) -> None:
         initialized = self.initialize("codex")
         implementation = Path(str(initialized["implementation_worktree"]))
         self.commit_batch_change(implementation)
-        (self.project / "external.txt").write_text("new target work\n", encoding="utf-8")
-        self.run_command("git", "-C", str(self.project), "add", "external.txt")
+        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
         self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
         status = self.workflow(
             "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
         )
-        self.assertEqual(status["status"], "STALE")
-        blocked = self.workflow(
+        self.assertEqual(status["status"], "IMPLEMENTING")
+        self.assertEqual(status["integration"]["status"], "DIVERGED")
+        reviewed = self.workflow(
             "review", "--project", str(self.project),
-            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=3,
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
         )
-        self.assertEqual(blocked["status"], "NEEDS_USER_DECISION")
-        self.assertEqual(blocked["reason"], "TARGET_ADVANCED")
+        self.assertEqual(reviewed["status"], "REVIEW_PASS")
+
+    def test_diverged_target_reconciles_as_reviewed_synthetic_batch(self) -> None:
+        initialized = self.initialize("codex")
+        self.review_accept(initialized)
+        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
+        blocked = self.workflow(
+            "finalize", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=3,
+        )
+        self.assertEqual(blocked["status"], "RECONCILIATION_REQUIRED")
+        reconciled = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        self.assertEqual(reconciled["status"], "RECONCILIATION_READY_FOR_COMMIT")
+        worktree = Path(str(reconciled["worktree"]))
+        self.run_command("git", "-C", str(worktree), "commit", "-qm", "merge reviewed candidate")
+        submitted = self.workflow(
+            "submit-reconciliation", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        batch = str(submitted["batch"])
+        self.assertEqual(batch, "INTEGRATION_01")
+        review = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", batch,
+        )
+        self.assertEqual(review["status"], "REVIEW_PASS")
+        accepted = self.workflow(
+            "accept", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", batch,
+            "--review-file", str(review["report_path"]),
+        )
+        self.assertTrue(accepted["all_batches_accepted"])
+        final = self.workflow(
+            "finalize", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        self.assertEqual(final["status"], "FINALIZED")
+
+    def test_reconciliation_conflict_preserves_target_and_reviewed_candidate(self) -> None:
+        initialized = self.initialize("codex")
+        candidate_sha, _ = self.review_accept(initialized)
+        (self.project / "tracked.txt").write_text("conflicting target\n", encoding="utf-8")
+        self.run_command("git", "-C", str(self.project), "add", "tracked.txt")
+        self.run_command("git", "-C", str(self.project), "commit", "-qm", "conflicting target")
+        target_sha = self.run_command(
+            "git", "-C", str(self.project), "rev-parse", "main"
+        ).stdout.strip()
+        conflict = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply", expected=3,
+        )
+        self.assertEqual(conflict["status"], "RECONCILIATION_CONFLICT")
+        self.assertEqual(
+            self.run_command("git", "-C", str(self.project), "rev-parse", "main").stdout.strip(),
+            target_sha,
+        )
+        self.assertEqual(
+            self.run_command(
+                "git", "-C", str(initialized["implementation_worktree"]), "rev-parse", "HEAD"
+            ).stdout.strip(),
+            candidate_sha,
+        )
+
+    def test_finalize_updates_target_ref_without_switching_original_checkout(self) -> None:
+        initialized = self.initialize("codex")
+        final_sha, _ = self.review_accept(initialized)
+        self.run_command("git", "-C", str(self.project), "switch", "-qc", "ongoing-work")
+        original_head = self.run_command(
+            "git", "-C", str(self.project), "rev-parse", "HEAD"
+        ).stdout.strip()
+        finalized = self.workflow(
+            "finalize", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        self.assertEqual(finalized["status"], "FINALIZED")
+        self.assertEqual(
+            self.run_command(
+                "git", "-C", str(self.project), "branch", "--show-current"
+            ).stdout.strip(),
+            "ongoing-work",
+        )
+        self.assertEqual(
+            self.run_command("git", "-C", str(self.project), "rev-parse", "HEAD").stdout.strip(),
+            original_head,
+        )
+        self.assertEqual(
+            self.run_command("git", "-C", str(self.project), "rev-parse", "main").stdout.strip(),
+            final_sha,
+        )
+
+    def test_final_integration_lock_serializes_only_target_updates(self) -> None:
+        initialized = self.initialize("codex")
+        self.review_accept(initialized)
+        project_state_root = Path(str(initialized["run_directory"])).parents[1]
+        with WORKFLOW_MODULE.file_lock(project_state_root / "integration.lock"):
+            blocked = self.workflow(
+                "finalize", "--project", str(self.project),
+                "--run-id", str(initialized["run_id"]), "--apply", expected=1,
+            )
+            self.assertIn("another workflow command is active", str(blocked["error"]))
+            status = self.workflow(
+                "status", "--project", str(self.project),
+                "--run-id", str(initialized["run_id"]),
+            )
+            self.assertEqual(status["status"], "READY_TO_FINALIZE")
+
+    def test_reconciliation_cannot_change_the_frozen_target_branch(self) -> None:
+        initialized = self.initialize("codex")
+        self.review_accept(initialized)
+        self.run_command("git", "-C", str(self.project), "branch", "other-target")
+        refused = self.workflow(
+            "reconcile", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--target-branch", "other-target",
+            expected=1,
+        )
+        self.assertIn("does not match the frozen target", str(refused["error"]))
+
+    def test_shared_environment_drift_is_infrastructure_not_quality_failure(self) -> None:
+        venv_bin = self.project / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        os.symlink(sys.executable, venv_bin / "python")
+        cfg = self.project / ".venv" / "pyvenv.cfg"
+        cfg.write_text("home = fixture\n", encoding="utf-8")
+        (self.project / ".git" / "info" / "exclude").write_text(".venv/\n", encoding="utf-8")
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        cfg.write_text("home = changed\n", encoding="utf-8")
+        drift = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=2,
+        )
+        self.assertEqual(drift["status"], "ENVIRONMENT_DRIFT")
 
     def test_claude_adapter_uses_isolated_implementation(self) -> None:
         initialized = self.initialize("claude")
@@ -881,76 +1057,6 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(preview["host_network_authorized"])
 
-    def test_target_advance_creates_typed_resumable_decision(self) -> None:
-        initialized = self.initialize("codex")
-        implementation = Path(str(initialized["implementation_worktree"]))
-        self.commit_batch_change(implementation)
-        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
-        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
-        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
-        blocked = self.workflow(
-            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--batch", "1", expected=3,
-        )
-        self.assertEqual(blocked["reason"], "TARGET_ADVANCED")
-        self.assertEqual(
-            set(blocked["pending_decision"]["allowed_choices"]),
-            {"RESUME_WITH_DECISION", "SUPERSEDE_RUN", "ABORT_RUN"},
-        )
-        self.assertEqual(blocked["pending_decision"]["previous_status"], "IMPLEMENTING")
-
-    def test_review_target_advance_resume_after_revert_continues(self) -> None:
-        initialized = self.initialize("codex")
-        implementation = Path(str(initialized["implementation_worktree"]))
-        self.commit_batch_change(implementation)
-        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
-        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
-        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
-        blocked = self.workflow(
-            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--batch", "1", expected=3,
-        )
-        self.assertEqual(blocked["reason"], "TARGET_ADVANCED")
-        decision_id = blocked["pending_decision"]["decision_id"]
-        self.run_command("git", "-C", str(self.project), "reset", "--hard", "-q", "HEAD~1")
-        resumed = self.workflow(
-            "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--decision-id", decision_id, "--choice", "RESUME_WITH_DECISION",
-            "--reason", "target reverted to baseline", "--actor", "test-user", "--apply",
-        )
-        self.assertEqual(resumed["run_status"], "IMPLEMENTING")
-        reviewed = self.workflow(
-            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--batch", "1",
-        )
-        self.assertEqual(reviewed["status"], "REVIEW_PASS")
-
-    def test_review_target_advance_resume_still_stale_reparks(self) -> None:
-        initialized = self.initialize("codex")
-        implementation = Path(str(initialized["implementation_worktree"]))
-        self.commit_batch_change(implementation)
-        (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
-        self.run_command("git", "-C", str(self.project), "add", "target-change.txt")
-        self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
-        first = self.workflow(
-            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--batch", "1", expected=3,
-        )
-        first_id = first["pending_decision"]["decision_id"]
-        # Resume WITHOUT reverting the target: the very next command must re-observe the stale
-        # fact and re-park instead of pretending the conflict is gone.
-        self.workflow(
-            "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--decision-id", first_id, "--choice", "RESUME_WITH_DECISION",
-            "--reason", "operator believes the target was fixed", "--actor", "test-user", "--apply",
-        )
-        second = self.workflow(
-            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--batch", "1", expected=3,
-        )
-        self.assertEqual(second["reason"], "TARGET_ADVANCED")
-        self.assertNotEqual(second["pending_decision"]["decision_id"], first_id)
-
     def test_finalize_target_advance_preview_does_not_park(self) -> None:
         initialized = self.initialize("codex")
         self.review_accept(initialized)
@@ -959,17 +1065,16 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.run_command("git", "-C", str(self.project), "commit", "-qm", "advance target")
         preview = self.workflow(
             "finalize", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            expected=3,
         )
-        self.assertEqual(preview["status"], "FINALIZE_PREVIEW")
-        self.assertEqual(preview["pending_decision"]["type"], "TARGET_ADVANCED")
-        self.assertIn("RESUME_WITH_DECISION", preview["pending_decision"]["allowed_choices"])
+        self.assertEqual(preview["status"], "RECONCILIATION_REQUIRED")
         state = json.loads(
             (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
         )
         self.assertEqual(state["status"], "READY_TO_FINALIZE")
         self.assertIsNone(state.get("pending_decision"))
 
-    def test_finalize_target_advance_resume_restores_ready_to_finalize(self) -> None:
+    def test_finalize_target_advance_apply_does_not_park_execution(self) -> None:
         initialized = self.initialize("codex")
         self.review_accept(initialized)
         (self.project / "target-change.txt").write_text("advanced\n", encoding="utf-8")
@@ -979,22 +1084,12 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "finalize", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
             "--apply", expected=3,
         )
-        self.assertEqual(parked["reason"], "TARGET_ADVANCED")
-        self.assertEqual(parked["pending_decision"]["previous_status"], "READY_TO_FINALIZE")
-        self.assertIn("RESUME_WITH_DECISION", parked["pending_decision"]["allowed_choices"])
-        self.run_command("git", "-C", str(self.project), "reset", "--hard", "-q", "HEAD~1")
-        resumed = self.workflow(
-            "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--decision-id", parked["pending_decision"]["decision_id"],
-            "--choice", "RESUME_WITH_DECISION",
-            "--reason", "target reverted to baseline", "--actor", "test-user", "--apply",
+        self.assertEqual(parked["status"], "RECONCILIATION_REQUIRED")
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(resumed["run_status"], "READY_TO_FINALIZE")
-        done = self.workflow(
-            "finalize", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--apply",
-        )
-        self.assertEqual(done["status"], "FINALIZED")
+        self.assertEqual(state["status"], "READY_TO_FINALIZE")
+        self.assertIsNone(state.get("pending_decision"))
 
     def test_contract_criterion_with_bare_python_argv_is_refused(self) -> None:
         state = {"reviewer": "codex", "baseline_sha": "a" * 40, "batches": ["B1"]}
@@ -1064,6 +1159,30 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(migrated["status"], "MIGRATED")
         self.assertTrue(Path(str(migrated["backup_path"])).is_file())
+
+    def test_schema5_target_advance_parking_migrates_to_integration_drift(self) -> None:
+        initialized = self.initialize("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text())
+        state["schema_version"] = 5
+        state["status"] = "NEEDS_USER_DECISION"
+        state["pending_decision"] = {
+            "decision_id": "legacy-target", "type": "TARGET_ADVANCED",
+            "previous_status": "IMPLEMENTING", "allowed_choices": ["ABORT_RUN"],
+        }
+        state.pop("integration", None)
+        state.pop("environment_contract", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        migrated = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply",
+        )
+        self.assertEqual(migrated["status"], "MIGRATED")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["status"], "IMPLEMENTING")
+        self.assertIsNone(status["pending_decision"])
 
     def test_event_tampering_is_detected(self) -> None:
         initialized = self.initialize("codex")

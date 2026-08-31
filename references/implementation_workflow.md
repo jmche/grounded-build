@@ -41,7 +41,6 @@ Store all workflow data below:
 ~/.grounded-build/implementation/
 └── projects/<project-slug>-<identity-hash>/
     ├── project.json
-    ├── active_run.json
     └── runs/<run-id>/
         ├── workflow.json
         ├── plan/original.md
@@ -60,7 +59,9 @@ Store all workflow data below:
 
 The identity hash distinguishes repositories with the same directory name. Every new plan execution receives a new run directory and new worktrees. Never reuse an old run as the baseline of a new plan.
 
-The original project must remain on its existing branch and SHA throughout initialization, implementation, review, and repair. This protects running tasks that may continue reading scripts, skills, templates, or configuration from the original project.
+Initialization freezes committed source at one baseline SHA. After its run-owned worktrees exist, the
+original checkout may change branches, advance, or become dirty without changing implementation or
+review. Target movement is integration divergence, not execution staleness.
 
 ## Safety boundary
 
@@ -70,7 +71,7 @@ The original project must remain on its existing branch and SHA throughout initi
 - Do not claim a batch passed until the reviewer returns `PASS` for the exact implementation HEAD and required verification passes.
 - Do not use `git reset --hard`, `git clean`, automatic stash, silent rebase, or automatic conflict resolution.
 - Do not delete worktree directories directly; use the script's cleanup operation.
-- Pause if the target branch advances after a run begins. Previously issued review approvals do not authorize code combined with a newer target.
+- Continue fixed-baseline execution if the target advances. Previously issued review approvals do not authorize the combined code; use reviewed reconciliation before integration.
 - Use at most four valid review rounds per batch: one full discovery review and three bounded re-reviews. Reviewer infrastructure errors do not consume a round.
 - Count every real reviewer invocation separately from valid quality rounds. Infrastructure failures consume invocation budget and remain auditable even though they do not consume repair budget.
 - Treat `plan/original.md` and `plan/batches.md` with their recorded digests as the run authority. The manifest defines this run's total included/excluded scope and batch mapping. A later edit or move of either source is informational; a changed snapshot is corruption.
@@ -140,7 +141,10 @@ Check existing runs:
   --project <absolute-project-root>
 ```
 
-If a nonterminal active run exists, resume it or ask whether to supersede it. Never overwrite it.
+Any number of nonterminal runs may coexist. Preserve the returned `run_id`; when more than one run is
+active every later command must name it explicitly. Each run owns its command lock, so a busy run
+does not serialize or block commands for another run. Only final integration takes the narrow shared
+repository lock needed to serialize target-ref updates.
 
 Initialize a new run:
 
@@ -203,7 +207,7 @@ Read the returned `run_id` and `implementation_worktree`. Perform every implemen
 
 ## Resume a run
 
-Inspect the active run:
+Inspect the only active run (omission is refused when several are active):
 
 ```bash
 <controller-python> <skill-root>/scripts/workflow.py status \
@@ -218,12 +222,10 @@ Inspect a historical run explicitly:
   --run-id <run-id>
 ```
 
-Resume only from its recorded phase, batch, round, and SHAs. If status reports `STALE`, the target branch has advanced since initialization. Ask the user to choose:
-
-- supersede the old run and start a new run from the latest target; recommended for a new or substantially changed plan;
-- leave the run unchanged for audit.
-
-The current script deliberately does not merge or rebase a stale run. Reconciliation changes the review base and invalidates earlier authority, so it is represented by superseding the old run and initializing a new one from the current target rather than mutating history in place.
+Resume only from the run's recorded phase, batch, round, and SHAs. `integration.status=DIVERGED`
+means the target moved; implementation, review, verification, and acceptance continue against the
+frozen baseline. After the candidate is complete, create an explicit merge reconciliation rather than
+rebasing or silently combining code.
 
 If status reports `MIGRATION_REQUIRED`, preview and explicitly apply the migration before any mutation:
 
@@ -399,7 +401,7 @@ Only the latest registered `PASS` report for the current clean implementation HE
 
 ## Supersede an obsolete run
 
-When the user chooses to abandon an active or stale run in favor of the latest project code:
+When the user chooses to abandon an obsolete run:
 
 ```bash
 <controller-python> <skill-root>/scripts/workflow.py supersede \
@@ -408,7 +410,7 @@ When the user chooses to abandon an active or stale run in favor of the latest p
   --apply
 ```
 
-This preserves its branch, worktrees, reports, and state for audit but releases the active-run slot. Initialize a new run afterward; it will use the then-current target SHA rather than any old worktree SHA.
+This preserves its branch, worktrees, reports, and state for audit. It does not affect any sibling run.
 
 ## Final verification and integration
 
@@ -420,7 +422,30 @@ After the last batch is accepted, the workflow automatically schedules every COM
   --run-id <run-id>
 ```
 
-The preview must confirm that the original target branch still equals the recorded baseline and that fast-forward integration is possible. Ask for explicit user approval and confirm that changing the original project is safe for any running tasks.
+The preview compares the target ref with the candidate's expected target SHA. An unchanged target may
+fast-forward directly. A changed target returns `RECONCILIATION_REQUIRED` without changing execution
+state or invalidating the reviewed candidate.
+
+For a diverged target, preview and explicitly create a run-owned merge worktree:
+
+```bash
+<controller-python> <skill-root>/scripts/workflow.py reconcile \
+  --project <project> --run-id <run-id>
+<controller-python> <skill-root>/scripts/workflow.py reconcile \
+  --project <project> --run-id <run-id> --apply
+```
+
+The command uses `--no-ff --no-commit`. Resolve conflicts in the returned worktree, run appropriate
+tests, and commit the merge. Then register it:
+
+```bash
+<controller-python> <skill-root>/scripts/workflow.py submit-reconciliation \
+  --project <project> --run-id <run-id>
+```
+
+Submission validates that both the observed target and reviewed source are ancestors, then appends a
+synthetic `INTEGRATION_NN` batch. Review, verify, and accept that batch through the ordinary fixed-SHA
+workflow. This reuses the finding ledger and bounded review policy instead of inventing a weaker gate.
 
 After approval:
 
@@ -431,7 +456,10 @@ After approval:
   --apply
 ```
 
-Finalization requires the original project to be clean and checked out on the recorded target branch, the final verification record to belong to the final accepted SHA, and then performs `git merge --ff-only`. It never switches branches automatically. Divergence stops the operation; supersede this run and initialize a new run from the new target so the changed base receives a fresh cumulative review.
+Finalization requires final verification and review for the accepted SHA. If the target is the current
+checkout it must be clean and is fast-forwarded normally. If it is not checked out anywhere, the engine
+uses an atomic `update-ref` with the expected old SHA. It never switches branches. A target that moves
+again requires another reconciliation attempt; prior attempts remain auditable.
 
 Finalization first persists a `FINALIZING` transaction and only then advances the target branch. If the process stops after Git advances but before the final state checkpoint, rerun `finalize` to preview and apply the audited recovery to `FINALIZED`.
 

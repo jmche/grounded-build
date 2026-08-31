@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.4.5
+  version: 0.5.0
   compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude or Codex CLI adapter
 ---
 
@@ -21,7 +21,7 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
 
 - Work from the absolute Git repository root and freeze its exact SHA.
 - Planning requires a clean checkout. Never stash, reset, clean, or commit user work to satisfy this.
-- Preserve the original branch, index, checkout, and files until explicitly approved final integration.
+- Freeze each run at its baseline SHA; after initialization the original checkout may move independently until explicit final integration.
 - A CLI adapter is not a model identity. Record `agent_runtime`, `provider_diversity`, and `model_diversity` exactly as reported. Every run freezes the workflow engine, model selection, and invocation argv; reject silent engine drift.
 - Agreement is not evidence. Bind claims to files, symbols, tests, commands, or authoritative sources.
 - Freeze scope before investigation. Divergence may widen evidence, causal analysis, failure-path coverage,
@@ -144,6 +144,12 @@ At either `READY` or `ABANDONED`, use `audit-export` to retrieve the terminal au
 ## Implement workflow
 
 Implementation state lives separately under `~/.grounded-build/implementation/`. For a Plan handoff, initialize with the exported plan and batch manifest. For a user-provided plan without a manifest, derive a finite, observable batch manifest and obtain confirmation before freezing it.
+
+One repository may have multiple concurrent implementation runs. Every run freezes its own baseline,
+branch, worktrees, state, and reviewer; always preserve the returned `run_id`. When several runs are
+active, commands that omit `--run-id` refuse and list the candidates. Target-branch movement never
+invalidates baseline execution: finish the reviewed candidate, then use preview-first `reconcile` and
+`submit-reconciliation` when the target has diverged.
 
 The implementation host remains the current host model. Its isolated reviewer defaults to Opus for Claude or `gpt-5.6-sol` for Codex; `--claude-model`, `--codex-model`, `--codex-model-provider`, and `--codex-profile` may override that selection at `init` and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.
 

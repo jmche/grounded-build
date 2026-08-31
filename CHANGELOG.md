@@ -2,6 +2,15 @@
 
 All notable changes use semantic versioning.
 
+## [0.5.0] - 2026-08-31
+
+- Added concurrent implementation runs from one frozen baseline, with explicit run selection when more than one run is active.
+- Added run-owned merge reconciliation worktrees whose combined commits pass the normal fixed-SHA verification and independent review loop.
+- Added shared read-only project-environment fingerprints and infrastructure-class drift detection.
+- Reclassified target-branch movement as integration divergence rather than execution staleness.
+- Allowed finalization to atomically advance a target branch that is not checked out without switching the user's checkout.
+- Raised implementation state to schema v6 with explicit, backed-up migration from schema v5.
+
 ## [0.4.5] - 2026-08-27
 
 - Gave the reviewer-invocation budget the same single explicit grant the round budget beside it

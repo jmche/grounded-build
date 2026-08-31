@@ -13,8 +13,8 @@ cross.
 ## Key Files
 | File | Description |
 |------|-------------|
-| `plan_workflow.py` | Planning engine (~3.2k lines, `VERSION = "0.4.1"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
-| `workflow.py` | Implementation engine (~4.2k lines, `SCHEMA_VERSION = 5`). Centralized run registry, worktree isolation, acceptance-contract review, fixed-SHA reviewer dispatch, resource-capped verification sandbox, convergence policy, fast-forward finalization, cleanup. |
+| `plan_workflow.py` | Planning engine (~3.2k lines, `VERSION = "0.5.0"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
+| `workflow.py` | Implementation engine (`SCHEMA_VERSION = 6`). Concurrent run discovery, worktree isolation, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
 | `release_check.py` | No-network release gate: validates `evals/evals.json` shape, required public-release files, LICENSE/SECURITY content, cross-file version synchronization, and the English-only rule; then compiles both engines and runs the unit suites. Optional `--quick-validator <path>` chains an external skill validator. |
 
 ## For AI Agents
@@ -70,7 +70,7 @@ without paid calls.
 `adjudicate`, `status`, `next`, `export`, `audit-export`, `abandon`, `cleanup`, `migrate-engine`.
 
 `workflow.py`: `preflight`, `list`, `init`, `contract-review`, `contract-adjudicate`, `review`,
-`verify`, `adjudicate`, `accept`, `status`, `migrate`, `finalize`, `supersede`, `change-reviewer`,
+`verify`, `adjudicate`, `accept`, `status`, `migrate`, `finalize`, `reconcile`, `submit-reconciliation`, `supersede`, `change-reviewer`,
 `cleanup`.
 
 ## Dependencies

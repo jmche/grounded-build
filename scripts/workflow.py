@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_TIMEOUT_SECONDS = 1800
 MAX_REVIEW_ROUNDS = 4
 DEFAULT_MAX_REVIEW_INVOCATIONS_PER_BATCH = 10
@@ -211,6 +211,10 @@ CONTRACT_SCHEMA: dict[str, Any] = {
 
 class WorkflowError(RuntimeError):
     """A state, Git, or infrastructure error—not a code-quality verdict."""
+
+
+class EnvironmentDriftError(WorkflowError):
+    """The shared read-only project environment changed after run initialization."""
 
 
 class ReviewContractError(WorkflowError):
@@ -564,10 +568,6 @@ def runs_directory(project: Path) -> Path:
     return project_directory(project) / "runs"
 
 
-def active_pointer(project: Path) -> Path:
-    return project_directory(project) / "active_run.json"
-
-
 def run_directory(project: Path, run_id: str) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
         raise WorkflowError(f"unsafe run identifier: {run_id!r}")
@@ -708,7 +708,7 @@ def state_authority_digest(state: dict[str, Any]) -> str:
 def validate_state_checkpoint(state: dict[str, Any]) -> None:
     events = state.get("events", [])
     if not events:
-        raise WorkflowError("schema v5 state has no checkpoint event")
+        raise WorkflowError("current-schema state has no checkpoint event")
     last_path = Path(events[-1]["path"])
     last_event = read_json_object(last_path, "state checkpoint event")
     if last_event.get("type") != "STATE_CHECKPOINT":
@@ -822,27 +822,50 @@ def write_registry(project: Path) -> None:
         atomic_json(registry_path, registry)
 
 
-def load_active_run_id(project: Path) -> str | None:
-    pointer = active_pointer(project)
-    if not pointer.is_file():
-        return None
-    try:
-        payload = json.loads(pointer.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise WorkflowError(f"invalid active-run pointer: {pointer}: {exc}") from exc
-    value = payload.get("run_id")
-    return str(value) if value else None
-
-
-def set_active_run(project: Path, run_id: str | None) -> None:
-    atomic_json(active_pointer(project), {"run_id": run_id, "updated_at": utc_now()})
+def active_run_ids(project: Path) -> list[str]:
+    """Return every nonterminal run; no mutable pointer owns project execution."""
+    root = runs_directory(project)
+    active: list[str] = []
+    if not root.is_dir():
+        return active
+    for child in sorted(root.iterdir()):
+        path = child / "workflow.json"
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("status") not in TERMINAL_STATUSES:
+            active.append(str(payload.get("run_id") or child.name))
+    return active
 
 
 def resolve_run_id(project: Path, requested: str | None) -> str:
-    run_id = requested or load_active_run_id(project)
-    if not run_id:
+    if requested:
+        return requested
+    active = active_run_ids(project)
+    if not active:
         raise WorkflowError("no active run; provide --run-id or initialize a workflow")
-    return run_id
+    if len(active) > 1:
+        raise WorkflowError(
+            "multiple active runs; provide --run-id. Candidates: " + ", ".join(active)
+        )
+    return active[0]
+
+
+def command_lock_path(
+    project: Path, project_root: Path, args: argparse.Namespace,
+) -> Path:
+    """Select the narrowest lock that protects the command's mutable authority."""
+    if args.command in {"init", "preflight", "list"}:
+        return project_root / "coordination.lock"
+    run_id = resolve_run_id(project, getattr(args, "run_id", None))
+    run_root = run_directory(project, run_id)
+    if not state_path(project, run_id).is_file():
+        raise WorkflowError(f"workflow state not found: {state_path(project, run_id)}")
+    args.run_id = run_id
+    return run_root / "workflow.lock"
 
 
 def default_budgets() -> dict[str, int]:
@@ -875,7 +898,7 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise WorkflowError(f"invalid workflow state: {path}: {exc}") from exc
     loaded_schema = state.get("schema_version")
-    if loaded_schema in {2, 3, 4}:
+    if loaded_schema in {2, 3, 4, 5}:
         state["schema_version"] = SCHEMA_VERSION
         state["_requires_migration"] = True
         state.setdefault("finding_ledger", {})
@@ -901,6 +924,11 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
         state.setdefault("host_network_authorizations", {})
         state.setdefault("final_verification", None)
         state.setdefault("integration_transaction", None)
+        state.setdefault("integration", {
+            "status": "PENDING", "target_branch": state.get("target_branch"),
+            "baseline_sha": state.get("baseline_sha"), "attempts": [],
+        })
+        state.setdefault("environment_contract", project_environment_contract(project))
         state.setdefault("implementer", "legacy-unknown")
         state.setdefault("reviewer_history", [{
             "reviewer": state.get("reviewer", "legacy-unknown"),
@@ -1057,6 +1085,52 @@ def validate_plan_unchanged(state: dict[str, Any]) -> None:
             raise WorkflowError("the authoritative batch manifest changed or disappeared after initialization")
 
 
+def project_environment_contract(project: Path) -> dict[str, Any]:
+    """Fingerprint stable environment metadata while excluding caches and source checkout state."""
+    root = project / ".venv"
+    launcher = root / "bin" / "python"
+    if not launcher.is_file():
+        payload: dict[str, Any] = {"status": "ABSENT", "path": str(root.resolve())}
+    else:
+        probe = run((str(launcher), "-c", (
+            "import importlib.metadata as m,json,sys;"
+            "print(json.dumps({'version':sys.version.split()[0],"
+            "'packages':sorted((d.metadata.get('Name',''),d.version) for d in m.distributions())}))"
+        )), check=False)
+        if probe.returncode:
+            raise WorkflowError("project environment fingerprint probe failed")
+        metadata = json.loads(probe.stdout)
+        details = sorted(
+            [root / "pyvenv.cfg"]
+            + list(root.glob("lib/python*/site-packages/*.pth"))
+            + list(root.glob("lib/python*/site-packages/*.dist-info/direct_url.json"))
+        )
+        payload = {
+            "status": "PRESENT", "path": str(root.resolve()),
+            "launcher": str(launcher.resolve()), "python_version": metadata["version"],
+            "packages": metadata["packages"],
+            "files": {
+                str(path.relative_to(root)): sha256_file(path)
+                for path in details if path.is_file()
+            },
+        }
+    payload["digest"] = sha256_bytes(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    )
+    return payload
+
+
+def validate_environment_contract(project: Path, state: dict[str, Any]) -> None:
+    expected = state.get("environment_contract")
+    if isinstance(expected, dict):
+        current = project_environment_contract(project)
+        if current.get("digest") != expected.get("digest"):
+            raise EnvironmentDriftError(
+                "shared project environment drifted from the frozen fingerprint; "
+                "restore it or supersede and initialize a new run"
+            )
+
+
 def validate_batch_manifest(path: Path, batches: list[str]) -> None:
     if not path.is_file():
         raise WorkflowError(f"batch manifest does not exist: {path}")
@@ -1096,12 +1170,10 @@ def target_staleness(project: Path, state: dict[str, Any]) -> tuple[bool, str]:
 def validate_active_state(project: Path, state: dict[str, Any]) -> None:
     if state.get("_requires_migration"):
         raise WorkflowError("legacy run requires explicit migrate --apply before mutation")
-    active = load_active_run_id(project)
-    if active != state["run_id"]:
-        raise WorkflowError(f"run {state['run_id']} is not the active run")
     if state["status"] in TERMINAL_STATUSES:
         raise WorkflowError(f"run is terminal: {state['status']}")
     validate_controller_runtime(state)
+    validate_environment_contract(project, state)
 
 
 def validate_implementation(state: dict[str, Any]) -> Path:
@@ -1148,12 +1220,14 @@ def command_list(args: argparse.Namespace) -> None:
                 )
             except json.JSONDecodeError:
                 entries.append({"run_id": child.name, "status": "CORRUPT"})
+    active = active_run_ids(project)
     emit(
         {
             "status": "RUN_LIST",
             "project": str(project),
             "project_key": project_identity(project)[0],
-            "active_run": load_active_run_id(project),
+            "active_run": active[0] if len(active) == 1 else None,
+            "active_runs": active,
             "runs": entries,
         }
     )
@@ -1174,15 +1248,6 @@ def command_init(args: argparse.Namespace) -> None:
     if not target:
         raise WorkflowError("detached HEAD requires --target-branch")
     baseline = git(project, "rev-parse", target)
-
-    active_id = load_active_run_id(project)
-    if active_id:
-        active_state = load_state(project, active_id)
-        if active_state["status"] not in TERMINAL_STATUSES:
-            raise WorkflowError(
-                f"nonterminal active run exists: {active_id} ({active_state['status']}); "
-                "resume or explicitly supersede it"
-            )
 
     batches = parse_batches(args.batches)
     validate_batch_manifest(batch_manifest, batches)
@@ -1244,6 +1309,7 @@ def command_init(args: argparse.Namespace) -> None:
         "reviewer_runtime": runtime,
         "controller_runtime": controller_runtime(),
         "project_runtime_at_start": before["project_runtime"],
+        "environment_contract": project_environment_contract(project),
         "reviewer_history": [{
             "reviewer": args.reviewer, "selected_at": utc_now(), "source": "RUN_INITIALIZED",
             "actor": args.implementer,
@@ -1282,6 +1348,10 @@ def command_init(args: argparse.Namespace) -> None:
         "host_network_authorizations": {},
         "final_verification": None,
         "integration_transaction": None,
+        "integration": {
+            "status": "PENDING", "target_branch": target,
+            "baseline_sha": baseline, "attempts": [],
+        },
         "final_sha": None,
         "finalized": False,
         "worktrees_removed": False,
@@ -1305,7 +1375,6 @@ def command_init(args: argparse.Namespace) -> None:
         "updated_at": utc_now(),
     }
     atomic_json(project_directory(project) / "project.json", project_meta)
-    set_active_run(project, run_id)
     write_registry(project)
     emit(
         {
@@ -3057,30 +3126,15 @@ def command_verify(args: argparse.Namespace) -> None:
 
 
 def require_target_unchanged(project: Path, state: dict[str, Any]) -> None:
+    """Observe integration drift without invalidating fixed-baseline execution."""
     stale, target_head = target_staleness(project, state)
-    if not stale:
-        return
-    previous_status = state["status"]
-    state["status"] = "NEEDS_USER_DECISION"
-    state["pending_decision"] = {
-        "decision_id": f"target-advanced-{len(state['decisions']) + 1:03d}",
-        "type": "TARGET_ADVANCED",
-        "allowed_choices": ["RESUME_WITH_DECISION", "SUPERSEDE_RUN", "ABORT_RUN"],
-        # target_staleness re-reads the branch on every call, so a parked run must be resumable
-        # once the target is back on the baseline. RESUME restores previous_status (IMPLEMENTING,
-        # CHANGES_REQUESTED or AWAITING_ACCEPTANCE) and the next review/accept re-observes: a
-        # clean target proceeds, a still-stale one re-parks with a fresh decision.
-        "previous_status": previous_status,
-        "baseline_sha": state["baseline_sha"], "current_target_sha": target_head,
-        "created_at": utc_now(),
-    }
-    append_event(state, "DECISION_REQUIRED", state["pending_decision"])
-    save_state(state)
-    emit({
-        "status": "NEEDS_USER_DECISION", "reason": "TARGET_ADVANCED",
-        "run_id": state["run_id"], "baseline_sha": state["baseline_sha"],
-        "current_target_sha": target_head, "pending_decision": state["pending_decision"],
-    }, 3)
+    integration = state.setdefault("integration", {
+        "target_branch": state["target_branch"], "baseline_sha": state["baseline_sha"],
+        "attempts": [],
+    })
+    integration["observed_target_sha"] = target_head
+    if not state.get("finalized"):
+        integration["status"] = "DIVERGED" if stale else "FAST_FORWARD_READY"
 
 
 def command_review(args: argparse.Namespace) -> None:
@@ -3152,6 +3206,8 @@ def command_review(args: argparse.Namespace) -> None:
         raise WorkflowError("current implementation HEAD no longer descends from the previously accepted SHA")
     cumulative_final_review = args.batch == state["batches"][-1]
     base = state["baseline_sha"] if cumulative_final_review else previous_sha
+    if args.batch.startswith("INTEGRATION_"):
+        base = str((state.get("integration") or {}).get("approved_target_sha") or base)
     if head == base:
         raise WorkflowError(f"batch {args.batch!r} has no committed changes relative to its base")
     if prior and prior[-1]["verdict"] == "FAIL" and prior[-1]["reviewed_sha"] == head:
@@ -3656,13 +3712,9 @@ def command_adjudicate(args: argparse.Namespace) -> None:
     elif args.choice == "SUPERSEDE_RUN":
         state["status"] = "SUPERSEDED"
         state["superseded_at"] = utc_now()
-        if load_active_run_id(project) == state["run_id"]:
-            set_active_run(project, None)
     elif args.choice == "ABORT_RUN":
         state["status"] = "ABANDONED"
         state["abandoned_at"] = utc_now()
-        if load_active_run_id(project) == state["run_id"]:
-            set_active_run(project, None)
     elif args.choice == "RESUME_WITH_DECISION":
         # Restore the status the run parked from (decisions that carry previous_status), falling
         # back to IMPLEMENTING for decisions that predate it. The next command re-observes the
@@ -3691,10 +3743,16 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
     stale = not state["finalized"] and target_sha != state["baseline_sha"]
     implementation = Path(state["implementation_worktree"])
     implementation_head = git(implementation, "rev-parse", "HEAD") if implementation.is_dir() else None
-    effective_status = (
-        "MIGRATION_REQUIRED" if state.get("_requires_migration") else
-        ("STALE" if stale and state["status"] not in TERMINAL_STATUSES else state["status"])
-    )
+    effective_status = "MIGRATION_REQUIRED" if state.get("_requires_migration") else state["status"]
+    integration = copy.deepcopy(state.get("integration") or {})
+    integration.update({
+        "target_branch": state["target_branch"], "baseline_sha": state["baseline_sha"],
+        "observed_target_sha": target_sha,
+    })
+    if state.get("finalized"):
+        integration["status"] = "INTEGRATED"
+    elif integration.get("status") not in {"RECONCILING", "REVIEW_REQUIRED", "APPROVED"}:
+        integration["status"] = "DIVERGED" if stale else "FAST_FORWARD_READY"
     source_plan = Path(state.get("plan_original", ""))
     source_plan_changed = (
         not source_plan.is_file()
@@ -3715,6 +3773,7 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "run_id": state["run_id"], "run_directory": state["run_directory"],
         "target_branch": state["target_branch"], "target_sha": target_sha,
         "baseline_sha": state["baseline_sha"], "target_advanced": stale,
+        "integration": integration,
         "implementation_branch": state["implementation_branch"],
         "implementation_worktree": state["implementation_worktree"],
         "implementation_sha": implementation_head,
@@ -3839,6 +3898,15 @@ def command_migrate(args: argparse.Namespace) -> None:
             "backup_path": str(backup), "backup_sha256": sha256_file(backup),
         }
         append_event(state, "SCHEMA_MIGRATED", state["migration"])
+        pending = state.get("pending_decision")
+        if isinstance(pending, dict) and pending.get("type") == "TARGET_ADVANCED":
+            state["status"] = str(pending.get("previous_status", "IMPLEMENTING"))
+            state["pending_decision"] = None
+            state.setdefault("integration", {})["status"] = "DIVERGED"
+            append_event(state, "TARGET_DECOUPLED", {
+                "legacy_decision_id": pending.get("decision_id"),
+                "restored_status": state["status"],
+            })
     # Re-derived after the schema step so one invocation can repair a run that needed both.
     decision_repair = legacy_pending_decision(state)
     if decision_repair:
@@ -3973,12 +4041,15 @@ def command_finalize(args: argparse.Namespace) -> None:
         ("git", "-C", str(project), "merge-base", "--is-ancestor", target_sha, final_head),
         check=False,
     ).returncode == 0
-    unchanged = target_sha == state["baseline_sha"]
+    integration = state.get("integration") or {}
+    expected_target = integration.get("approved_target_sha") or state["baseline_sha"]
+    unchanged = target_sha == expected_target
     report = write_final_report(state, integrated=False)
     preview = {
         "status": "FINALIZE_PREVIEW", "run_id": state["run_id"],
         "target_branch": state["target_branch"], "target_sha": target_sha,
-        "baseline_sha": state["baseline_sha"], "target_unchanged": unchanged,
+        "baseline_sha": state["baseline_sha"], "expected_target_sha": expected_target,
+        "target_unchanged": unchanged,
         "implementation_branch": state["implementation_branch"],
         "final_reviewed_sha": final_head, "fast_forward_possible": can_ff,
         "original_project_untouched_until_apply": True,
@@ -3986,47 +4057,15 @@ def command_finalize(args: argparse.Namespace) -> None:
         "final_report": str(report),
     }
     if not unchanged or not can_ff:
-        reason = "TARGET_ADVANCED" if not unchanged else "INTEGRATION_NOT_FAST_FORWARD"
-        # Only the staleness decision is resumable: once the target branch is back on the
-        # baseline the run may return to READY_TO_FINALIZE and finalize again. A non-fast-forward
-        # target is a different conflict with no resume meaning, so it keeps only the terminal
-        # choices. finalize only reaches this branch from READY_TO_FINALIZE/FINALIZING, so a
-        # TARGET_ADVANCED resume restores READY_TO_FINALIZE (restoring IMPLEMENTING would be
-        # refused by the finalize status guard).
-        allowed = (
-            ["RESUME_WITH_DECISION", "SUPERSEDE_RUN", "ABORT_RUN"]
-            if reason == "TARGET_ADVANCED"
-            else ["SUPERSEDE_RUN", "ABORT_RUN"]
-        )
-        pending_decision = {
-            "decision_id": f"integration-{len(state['decisions']) + 1:03d}",
-            "type": reason, "allowed_choices": allowed,
-            "baseline_sha": state["baseline_sha"], "current_target_sha": target_sha,
-            "created_at": utc_now(),
-        }
-        if reason == "TARGET_ADVANCED":
-            pending_decision["previous_status"] = "READY_TO_FINALIZE"
-        if not args.apply:
-            # A preview stays pure: show the decision --apply would park, do not write it.
-            emit({**preview, "pending_decision": pending_decision})
-        state["status"] = "NEEDS_USER_DECISION"
-        state["pending_decision"] = pending_decision
-        append_event(state, "DECISION_REQUIRED", state["pending_decision"])
-        save_state(state)
         emit({
-            **preview, "status": "NEEDS_USER_DECISION", "reason": reason,
-            "pending_decision": state["pending_decision"],
+            **preview, "status": "RECONCILIATION_REQUIRED",
+            "reason": "TARGET_ADVANCED" if not unchanged else "INTEGRATION_NOT_FAST_FORWARD",
+            "next_command": "reconcile",
         }, 3)
     if not args.apply:
         emit(preview)
     ensure_no_git_operation(project)
-    ensure_clean(project, "original project")
     current_branch = git(project, "branch", "--show-current")
-    if current_branch != state["target_branch"]:
-        raise WorkflowError(
-            f"original project must be on target branch {state['target_branch']!r}; "
-            f"found {current_branch!r}"
-        )
     if state.get("status") == "READY_TO_FINALIZE":
         state["status"] = "FINALIZING"
         state["integration_transaction"] = {
@@ -4036,8 +4075,19 @@ def command_finalize(args: argparse.Namespace) -> None:
         }
         append_event(state, "INTEGRATION_PREPARED", state["integration_transaction"])
         save_state(state)
-    git(project, "merge", "--ff-only", state["implementation_branch"])
-    merged = git(project, "rev-parse", "HEAD")
+    if current_branch == state["target_branch"]:
+        ensure_clean(project, "original project")
+        git(project, "merge", "--ff-only", state["implementation_branch"])
+        merged = git(project, "rev-parse", "HEAD")
+    else:
+        target_ref = f"refs/heads/{state['target_branch']}"
+        listing = git(project, "worktree", "list", "--porcelain")
+        if f"branch {target_ref}" in listing:
+            raise WorkflowError(
+                f"target branch {state['target_branch']!r} is checked out in another worktree"
+            )
+        git(project, "update-ref", target_ref, final_head, target_sha)
+        merged = git(project, "rev-parse", target_ref)
     if merged != final_head:
         raise WorkflowError("merged SHA does not match the reviewed SHA")
     state["status"] = "FINALIZED"
@@ -4049,6 +4099,104 @@ def command_finalize(args: argparse.Namespace) -> None:
     append_event(state, "INTEGRATION_COMMITTED", state["integration_transaction"])
     save_state(state)
     emit({**preview, "status": "FINALIZED", "final_sha": merged, "final_report": str(report)})
+
+
+def command_reconcile(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id)
+    validate_active_state(project, state)
+    if state.get("status") != "READY_TO_FINALIZE":
+        raise WorkflowError(f"reconcile requires READY_TO_FINALIZE, found {state.get('status')}")
+    source = git(Path(state["implementation_worktree"]), "rev-parse", "HEAD")
+    target_branch = args.target_branch or state["target_branch"]
+    if target_branch != state["target_branch"]:
+        raise WorkflowError(
+            f"reconciliation target {target_branch!r} does not match the frozen target "
+            f"{state['target_branch']!r}"
+        )
+    target_sha = git(project, "rev-parse", target_branch)
+    attempts = state.setdefault("integration", {}).setdefault("attempts", [])
+    number = len(attempts) + 1
+    root = Path(state["run_directory"])
+    worktree = root / "worktrees" / f"reconciliation_{number:02d}"
+    branch = f"{state['implementation_branch']}-reconcile-{number:02d}"
+    preview = {
+        "status": "RECONCILE_PREVIEW", "run_id": state["run_id"],
+        "target_branch": target_branch, "target_sha": target_sha,
+        "source_candidate_sha": source, "worktree": str(worktree), "branch": branch,
+    }
+    if not args.apply:
+        emit(preview)
+    secure_directory(worktree.parent)
+    git(project, "worktree", "add", "-b", branch, str(worktree), target_sha)
+    result = run(("git", "-C", str(worktree), "merge", "--no-ff", "--no-commit", source), check=False)
+    attempt = {
+        "number": number, "target_branch": target_branch, "target_sha": target_sha,
+        "source_candidate_sha": source, "worktree": str(worktree), "branch": branch,
+        "status": "CONFLICT" if result.returncode else "READY_FOR_COMMIT",
+        "created_at": utc_now(),
+    }
+    attempts.append(attempt)
+    state["integration"].update({
+        "status": "RECONCILING", "target_branch": target_branch,
+        "observed_target_sha": target_sha, "current_attempt": number,
+    })
+    append_event(state, "RECONCILIATION_STARTED", attempt)
+    save_state(state)
+    emit({
+        **preview,
+        "status": "RECONCILIATION_CONFLICT" if result.returncode else "RECONCILIATION_READY_FOR_COMMIT",
+        "git_output": (result.stdout + result.stderr).strip(),
+    }, 3 if result.returncode else 0)
+
+
+def command_submit_reconciliation(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id)
+    validate_active_state(project, state)
+    integration = state.get("integration") or {}
+    attempts = integration.get("attempts") or []
+    if integration.get("status") != "RECONCILING" or not attempts:
+        raise WorkflowError("no reconciliation attempt is ready for submission")
+    attempt = attempts[-1]
+    worktree = Path(attempt["worktree"])
+    ensure_clean(worktree, "reconciliation")
+    head = git(worktree, "rev-parse", "HEAD")
+    if head == attempt["target_sha"]:
+        raise WorkflowError("reconciliation has no committed merge result")
+    for ancestor, label in (
+        (attempt["target_sha"], "target"), (attempt["source_candidate_sha"], "source candidate"),
+    ):
+        if run(("git", "-C", str(worktree), "merge-base", "--is-ancestor", ancestor, head), check=False).returncode:
+            raise WorkflowError(f"reconciliation HEAD does not contain the {label} SHA")
+    batch = f"INTEGRATION_{attempt['number']:02d}"
+    state["integration"].update({
+        "status": "REVIEW_REQUIRED", "approved_target_sha": attempt["target_sha"],
+        "candidate_sha": head, "source_implementation_worktree": state["implementation_worktree"],
+        "source_implementation_branch": state["implementation_branch"],
+    })
+    state["implementation_worktree"] = str(worktree)
+    state["implementation_branch"] = attempt["branch"]
+    state["batches"].append(batch)
+    contract = state["acceptance_contract"]
+    contract["criteria"].append({
+        "id": f"{batch}-combined-behavior", "batch": batch,
+        "source": "WORKFLOW_DERIVED", "observation": "combined target and candidate behavior",
+        "expected_result": "the merge preserves accepted plan behavior without integration regressions",
+        "scope": ["."], "rationale": "reconciliation changes the reviewed base",
+        "evidence_kind": "REPOSITORY_ASSERTION", "argv": [], "expected_exit": 0,
+    })
+    contract["digest"] = contract_digest(contract["criteria"])
+    state["final_verification"] = None
+    state["status"] = "IMPLEMENTING"
+    attempt.update({"status": "SUBMITTED", "submitted_sha": head, "batch": batch})
+    append_event(state, "RECONCILIATION_SUBMITTED", attempt)
+    save_state(state)
+    emit({
+        "status": "RECONCILIATION_REVIEW_REQUIRED", "run_id": state["run_id"],
+        "batch": batch, "reviewed_sha": head,
+        "next_command": f"review --batch {batch}",
+    })
 
 
 def command_supersede(args: argparse.Namespace) -> None:
@@ -4069,8 +4217,6 @@ def command_supersede(args: argparse.Namespace) -> None:
     state["status"] = "SUPERSEDED"
     state["superseded_at"] = utc_now()
     save_state(state)
-    if load_active_run_id(project) == state["run_id"]:
-        set_active_run(project, None)
     emit({"status": "SUPERSEDED", "run_id": state["run_id"], "artifacts_preserved": True})
 
 
@@ -4410,6 +4556,22 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--apply", action="store_true")
     finalize.set_defaults(func=command_finalize)
 
+    reconcile = commands.add_parser(
+        "reconcile", help="preview or create an isolated merge reconciliation worktree",
+    )
+    add_project_argument(reconcile)
+    add_run_argument(reconcile)
+    reconcile.add_argument("--target-branch")
+    reconcile.add_argument("--apply", action="store_true")
+    reconcile.set_defaults(func=command_reconcile)
+
+    submit_reconciliation = commands.add_parser(
+        "submit-reconciliation", help="freeze a committed reconciliation for normal review",
+    )
+    add_project_argument(submit_reconciliation)
+    add_run_argument(submit_reconciliation)
+    submit_reconciliation.set_defaults(func=command_submit_reconciliation)
+
     supersede = commands.add_parser("supersede", help="preserve but deactivate an obsolete run")
     add_project_argument(supersede)
     add_run_argument(supersede)
@@ -4432,8 +4594,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         secure_directory(state_home())
         secure_directory(state_home() / "projects")
         secure_directory(project_root)
-        with file_lock(project_root / "workflow.lock"):
-            args.func(args)
+        with file_lock(command_lock_path(project, project_root, args)):
+            if args.command == "finalize" and args.apply:
+                # Runs execute independently, but advancing repository refs is shared authority.
+                with file_lock(project_root / "integration.lock"):
+                    args.func(args)
+            else:
+                args.func(args)
+    except EnvironmentDriftError as exc:
+        print(json.dumps({"status": "ENVIRONMENT_DRIFT", "error": str(exc)}, ensure_ascii=False, indent=2))
+        return 2
     except WorkflowError as exc:
         print(json.dumps({"status": "WORKFLOW_ERROR", "error": str(exc)}, ensure_ascii=False, indent=2))
         return 1

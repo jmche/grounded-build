@@ -4,9 +4,9 @@ Grounded Build is a local coding-agent skill with two independent modes:
 
 1. **Plan:** two isolated Claude/Codex instances investigate the same Git snapshot independently before
    drafting, integrate each other's evidence without widening scope, and converge on a host-synthesized plan.
-2. **Implement:** execute an approved plan batch by batch in isolated Git worktrees with fixed-SHA review, bounded repair, evidence tracking, and explicit final integration.
+2. **Implement:** execute approved plans concurrently in run-owned Git worktrees with fixed-SHA review, bounded repair, environment drift detection, PR-style reconciliation, and explicit final integration.
 
-Version `v0.4.5` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude`, `codex`, or `dsh` CLI adapters are required.
+Version `v0.5.0` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude`, `codex`, or `dsh` CLI adapters are required.
 
 The sandbox is exercised with Claude Code 2.1.238 and Codex CLI 0.149.0. Codex is treated as an adapter: its configured model may be GPT, DeepSeek through an OpenAI-compatible gateway, or another model. The run freezes and reports the non-secret model identity separately from the adapter.
 
@@ -55,6 +55,8 @@ from silently selecting a different `python3` through PATH.
 
 Project `.venv` directories are normally ignored and therefore do not follow Git worktrees. Fixed-SHA
 verification deliberately reuses `<project>/.venv` read-only while keeping the reviewed worktree as cwd.
+Each implementation run fingerprints that shared environment; drift is reported as infrastructure and
+never silently changes the evidence behind a review.
 If it is absent, preflight reports whether uv metadata and the uv executable are available, but Grounded
 Build does not install dependencies automatically. Provisioning remains an explicit operator action so
 network access, lockfile selection, and executed build hooks cannot be hidden inside verification.
