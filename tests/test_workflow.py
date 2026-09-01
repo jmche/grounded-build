@@ -2850,6 +2850,26 @@ class SharedVerificationWorktreeTests(unittest.TestCase):
                 "offline",
             )
 
+    def test_absolute_non_system_python_mounts_only_its_runtime_prefix(self) -> None:
+        prefix = self.root / "hostedtoolcache" / "Python" / "3.13.0" / "x64"
+        launcher = prefix / "bin" / "python3"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(0o755)
+
+        sandboxed, executed = WORKFLOW_MODULE._sandbox_command(
+            "bwrap", [str(launcher), "-V"], self.project, self.project,
+            self.root / "tmp", "offline",
+        )
+
+        self.assertEqual(executed[0], str(launcher.resolve()))
+        bind_sources = [
+            sandboxed[index + 1] for index, value in enumerate(sandboxed[:-2])
+            if value == "--ro-bind"
+        ]
+        self.assertIn(str(prefix.resolve()), bind_sources)
+        self.assertNotIn("/opt", bind_sources)
+
     def test_the_second_verification_reuses_the_checkout_instead_of_failing(self) -> None:
         """`git worktree add` refuses an existing path, so reuse has to be a decision, not luck."""
         target = WORKFLOW_MODULE._shared_verification_worktree(self.run_root, self.first)

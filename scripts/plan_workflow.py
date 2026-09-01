@@ -870,25 +870,8 @@ def dsh_runtime_identity(
     composition default), so the non-secret selection is read from ``settings.yaml`` rather than
     invented here. Explicit ``--dsh-model`` / ``--dsh-model-provider`` win, matching codex/claude.
     """
-    configured: dict[str, Any] = {}
     dsh_home = Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
-    settings = dsh_home / "settings.yaml"
-    if settings.is_file():
-        try:
-            import yaml  # dsh identity is the only YAML consumer; guarded to stay optional
-        except ImportError:
-            yaml = None
-        if yaml is not None:
-            try:
-                document = yaml.safe_load(settings.read_text(encoding="utf-8")) or {}
-            except (OSError, UnicodeDecodeError):
-                document = {}
-            selection = document.get("agent-default-model") or {}
-            if isinstance(selection, dict):
-                if isinstance(selection.get("provider"), str):
-                    configured["provider"] = selection["provider"].strip()
-                if isinstance(selection.get("model"), str):
-                    configured["model"] = selection["model"].strip()
+    configured = dsh_settings_selection(dsh_home / "settings.yaml")
     # The harness composition default (dsh-base/cordis.patch.yml `agent-default-model`) is
     # deepseek-v4-flash; report it honestly so an unpinned run does not claim "no model" while the
     # fast tier actually serves it.
@@ -908,6 +891,41 @@ def dsh_runtime_identity(
         "identity_source": "explicit_override" if any((model, model_provider)) else (
             "dsh_settings" if configured else "harness_default"),
     }
+
+
+def dsh_settings_selection(settings: Path) -> dict[str, str]:
+    """Read dsh's two non-secret selection scalars without adding a YAML dependency.
+
+    The runtime is deliberately standard-library only.  dsh owns the complete YAML document;
+    Grounded Build needs only the generated top-level ``agent-default-model`` mapping and ignores
+    every other key, including credentials and endpoint URLs.
+    """
+    try:
+        lines = settings.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    configured: dict[str, str] = {}
+    in_selection = False
+    for raw_line in lines:
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        content = raw_line.strip()
+        if not in_selection:
+            if indent == 0 and re.fullmatch(r"agent-default-model:\s*(?:#.*)?", content):
+                in_selection = True
+            continue
+        if indent == 0:
+            break
+        match = re.fullmatch(r"(provider|model):\s*(.*?)\s*", content)
+        if not match or not match.group(2):
+            continue
+        value = match.group(2).split(" #", 1)[0].rstrip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if value:
+            configured[match.group(1)] = value
+    return configured
 
 
 def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str, Any]]:

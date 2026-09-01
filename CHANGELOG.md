@@ -21,6 +21,8 @@ All notable changes use semantic versioning.
 - Pinned every GitHub Action to a full commit SHA and configured monthly reviewed update proposals.
 - Enabled bubblewrap's user-namespace prerequisite explicitly on ephemeral Ubuntu 24.04 runners and
   pinned the Node 24 generations of the official checkout and Python setup actions.
+- Removed the accidental PyYAML dependency from dsh identity discovery and taught verification to
+  mount a declared absolute Python runtime by its narrow, read-only installation prefix.
 
 ## [0.5.0] - 2026-08-31
 

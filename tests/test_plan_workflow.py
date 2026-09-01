@@ -1325,6 +1325,15 @@ class DshAdapterTest(unittest.TestCase):
         self.assertNotIn("secret.invalid", serialized)
         self.assertNotIn("never-record-this", serialized)
 
+    def test_identity_parser_needs_no_optional_yaml_package(self) -> None:
+        (self.dsh_home / "settings.yaml").write_text(
+            "agent-default-model:\n  provider: deepseek-official # generated\n"
+            "  model: 'ap/deepseek-v4-pro' # pinned\n", encoding="utf-8")
+        self.assertEqual(
+            self.module.dsh_settings_selection(self.dsh_home / "settings.yaml"),
+            {"provider": "deepseek-official", "model": "ap/deepseek-v4-pro"},
+        )
+
     def test_identity_falls_back_to_the_harness_default_when_unpinned(self) -> None:
         identity = self.module.dsh_runtime_identity()
         self.assertEqual(identity["model"], "deepseek-v4-flash")

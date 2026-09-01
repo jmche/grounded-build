@@ -407,25 +407,8 @@ def dsh_reviewer_identity(model: str | None = None, model_provider: str | None =
     come from ``settings.yaml`` (the user's saved selection layered over the profile default), so
     the selection is read rather than invented. Explicit overrides win, matching claude/codex.
     """
-    configured: dict[str, Any] = {}
     dsh_home = Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
-    settings = dsh_home / "settings.yaml"
-    if settings.is_file():
-        try:
-            import yaml  # dsh identity is the only YAML consumer; guarded to stay optional
-        except ImportError:
-            yaml = None
-        if yaml is not None:
-            try:
-                document = yaml.safe_load(settings.read_text(encoding="utf-8")) or {}
-            except (OSError, UnicodeDecodeError):
-                document = {}
-            selection = document.get("agent-default-model") or {}
-            if isinstance(selection, dict):
-                if isinstance(selection.get("provider"), str):
-                    configured["provider"] = selection["provider"].strip()
-                if isinstance(selection.get("model"), str):
-                    configured["model"] = selection["model"].strip()
+    configured = dsh_settings_selection(dsh_home / "settings.yaml")
     # The harness composition default (dsh-base/cordis.patch.yml `agent-default-model`) is
     # deepseek-v4-flash; report it honestly so an unpinned run does not claim "no model" while the
     # fast tier actually serves it.
@@ -440,6 +423,36 @@ def dsh_reviewer_identity(model: str | None = None, model_provider: str | None =
             "model_family": family, "identity_source": (
                 "explicit_override" if any((model, model_provider)) else
                 "dsh_settings" if configured else "harness_default")}
+
+
+def dsh_settings_selection(settings: Path) -> dict[str, str]:
+    """Read only dsh's generated model-selection mapping with the standard library."""
+    try:
+        lines = settings.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    configured: dict[str, str] = {}
+    in_selection = False
+    for raw_line in lines:
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        content = raw_line.strip()
+        if not in_selection:
+            if indent == 0 and re.fullmatch(r"agent-default-model:\s*(?:#.*)?", content):
+                in_selection = True
+            continue
+        if indent == 0:
+            break
+        match = re.fullmatch(r"(provider|model):\s*(.*?)\s*", content)
+        if not match or not match.group(2):
+            continue
+        value = match.group(2).split(" #", 1)[0].rstrip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if value:
+            configured[match.group(1)] = value
+    return configured
 
 
 def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
@@ -2821,6 +2834,7 @@ def _sandbox_command(
         resolved = shutil.which(executable, path="/usr/local/bin:/usr/bin:/bin")
         executable_path = Path(resolved).resolve() if resolved else Path(executable)
     home = Path.home().resolve()
+    system_roots = (Path("/usr"), Path("/bin"), Path("/lib"), Path("/lib64"))
     if relative_venv_executable:
         # A virtualenv launcher must NOT be followed to its target. `.venv/bin/python` is a
         # symlink to the interpreter the venv was built from, so resolving it hands the sandbox a
@@ -2854,7 +2868,6 @@ def _sandbox_command(
             target = Path(os.path.abspath(target))
             prefix = target.parent.parent
             resolved_prefix = prefix.resolve()
-            system_roots = (Path("/usr"), Path("/bin"), Path("/lib"), Path("/lib64"))
             resolved_target = target.resolve()
             if any(
                 resolved_target == root or resolved_target.is_relative_to(root)
@@ -2899,6 +2912,27 @@ def _sandbox_command(
             raise WorkflowError("refusing to expose a broad or sensitive home runtime to verification")
         runtime_mounts.extend(["--ro-bind", str(prefix), "/opt"])
         command[0] = str(Path("/opt") / executable_path.relative_to(prefix))
+    elif executable_path.is_absolute() and not any(
+        executable_path == root or executable_path.is_relative_to(root) for root in system_roots
+    ):
+        if not non_venv_python(str(executable_path)):
+            raise WorkflowError(
+                "only explicit Python runtimes may be mounted from outside system paths"
+            )
+        if not executable_path.is_file() or not os.access(executable_path, os.X_OK):
+            raise WorkflowError(f"verification executable does not exist: {executable_path}")
+        if executable_path.parent.name != "bin":
+            raise WorkflowError(
+                "absolute verification executables outside system paths must live in a dedicated bin directory"
+            )
+        prefix = executable_path.parent.parent.resolve()
+        if prefix in {
+            Path("/"), Path("/etc"), Path("/home"), Path("/opt"), Path("/run"), Path("/tmp"),
+            Path("/var"),
+        }:
+            raise WorkflowError(f"refusing to expose broad runtime prefix {prefix} to verification")
+        runtime_mounts.extend(["--ro-bind", str(prefix), str(prefix)])
+        command[0] = str(executable_path)
     git_dir_raw = git(worktree, "rev-parse", "--git-dir")
     git_dir = Path(git_dir_raw)
     if not git_dir.is_absolute():
