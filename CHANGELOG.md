@@ -13,6 +13,9 @@ All notable changes use semantic versioning.
 - Established a pre-1.0 release policy: compatible refinements remain on the current patch line,
   substantial capabilities may advance the 0.x minor line, and 1.0 requires an explicit maintainer
   product-readiness decision plus a reviewed release-gate change.
+- Froze both implementation reviewer templates inside each run, bound them by SHA-256, and raised
+  implementation state to schema v8 so older runs must explicitly migrate before adopting newly
+  installed review semantics.
 
 ## [0.6.0] - 2026-09-01
 

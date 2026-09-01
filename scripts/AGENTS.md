@@ -14,7 +14,7 @@ cross.
 | File | Description |
 |------|-------------|
 | `plan_workflow.py` | Planning engine (~3.2k lines, `VERSION = "0.6.1"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
-| `workflow.py` | Implementation engine (`SCHEMA_VERSION = 7`). Concurrent run discovery, worktree isolation, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
+| `workflow.py` | Implementation engine (`SCHEMA_VERSION = 8`). Concurrent run discovery, worktree isolation, frozen reviewer contracts, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
 | `release_check.py` | No-network release gate: validates `evals/evals.json` shape, required public-release files, LICENSE/SECURITY content, cross-file version synchronization, and the English-only rule; then compiles both engines and runs the unit suites. Optional `--quick-validator <path>` chains an external skill validator. |
 | `package_release.py` | Deterministic standard-library packager for versioned `.tar.gz` release archives and SHA-256 checksum files. |
 
@@ -78,8 +78,8 @@ without paid calls.
 ## Dependencies
 
 ### Internal
-- `../references/reviewer_prompt.md` and `../references/contract_reviewer_prompt.md` — loaded by
-  `workflow.py` as `PROMPT_TEMPLATE` / `CONTRACT_PROMPT_TEMPLATE`.
+- `../references/reviewer_prompt.md` and `../references/contract_reviewer_prompt.md` — installed
+  sources that `workflow.py` freezes into each run before dispatch.
 - `../SKILL.md` and `../references/planning_workflow.md` — hashed by `plan_workflow.engine_contract()`.
 - `../evals/evals.json`, `../LICENSE`, `../SECURITY.md`, `../VERSION`, `../README.md`,
   `../CHANGELOG.md`, `../.github/workflows/ci.yml` — read by `release_check.py`.

@@ -84,8 +84,9 @@ No paid model calls occur: the suites install fake `claude`/`codex`/`dsh` execut
 ## Dependencies
 
 ### Internal
-Self-contained. `scripts/` reads `references/reviewer_prompt.md` and
-`references/contract_reviewer_prompt.md` at runtime through `SKILL_ROOT`.
+Self-contained. `scripts/` resolves `references/reviewer_prompt.md` and
+`references/contract_reviewer_prompt.md` through `SKILL_ROOT`, then freezes them into each
+implementation run; later reviews consume only the digest-bound run snapshots.
 
 ### External
 - Python 3.11+ standard library only (`tomllib` requires 3.11) — no third-party runtime packages.

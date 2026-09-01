@@ -1533,6 +1533,65 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertTrue(migrated["backup_reused"])
         self.assertTrue(Path(str(migrated["backup_path"])).is_file())
 
+    def test_review_contract_snapshot_is_stable_when_installed_source_changes(self) -> None:
+        run_root = self.root / "snapshot-run"
+        source = self.root / "reviewer-source.md"
+        source.write_text("frozen semantics\n", encoding="utf-8")
+        original_sources = WORKFLOW_MODULE.REVIEW_CONTRACT_SOURCES
+        try:
+            WORKFLOW_MODULE.REVIEW_CONTRACT_SOURCES = {"batch_review": source}
+            contract = WORKFLOW_MODULE.snapshot_review_contract(run_root)
+            state = {"run_directory": str(run_root), "review_contract": contract}
+            source.write_text("new installed semantics\n", encoding="utf-8")
+            self.assertEqual(
+                WORKFLOW_MODULE.read_review_contract(state, "batch_review"),
+                "frozen semantics\n",
+            )
+        finally:
+            WORKFLOW_MODULE.REVIEW_CONTRACT_SOURCES = original_sources
+
+    def test_tampered_review_contract_snapshot_fails_closed(self) -> None:
+        initialized = self.initialize_raw("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        prompt_path = Path(state["review_contract"]["contract_review"]["path"])
+        prompt_path.write_text("tampered\n", encoding="utf-8")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertIn("digest mismatch", str(status["review_contract_error"]))
+        result = subprocess.run(
+            [
+                sys.executable, str(WORKFLOW), "contract-review",
+                "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            ],
+            text=True, capture_output=True, env=self.environment, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "WORKFLOW_ERROR")
+        self.assertIn("frozen reviewer contract digest mismatch", payload["error"])
+
+    def test_schema7_run_requires_explicit_review_contract_migration(self) -> None:
+        initialized = self.initialize_raw("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.pop("review_contract")
+        self.write_authenticated_legacy_state(state_path, state, 7)
+        preview = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertTrue(preview["review_contract_migration"])
+        migrated = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply",
+        )
+        self.assertEqual(migrated["status"], "MIGRATED")
+        current = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["schema_version"], 8)
+        WORKFLOW_MODULE.validate_review_contract(current)
+        self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema7"))
+
     def test_schema6_environment_fingerprint_requires_explicit_rebase(self) -> None:
         initialized = self.initialize("codex")
         state_path = Path(str(initialized["run_directory"])) / "workflow.json"
@@ -1560,7 +1619,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(migrated["status"], "MIGRATED")
         current = json.loads(state_path.read_text())
-        self.assertEqual(current["schema_version"], 7)
+        self.assertEqual(current["schema_version"], 8)
         self.assertEqual(current["environment_contract"]["fingerprint_version"], 3)
         self.assertEqual(current["integration"]["attempts"][0]["status"], "LEGACY_SUPERSEDED")
         self.assertEqual(current["integration"]["current_attempt"], 2)

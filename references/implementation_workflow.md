@@ -91,7 +91,11 @@ review. Target movement is integration divergence, not execution staleness.
 
 ## Shared review contract
 
-Read `references/reviewer_prompt.md` before initializing or reviewing a run. It is the canonical detailed contract shared with the independent reviewer; the host must reason with the same lifecycle rather than treating reviewer output as an opaque PASS/FAIL gate.
+Read `references/reviewer_prompt.md` before initializing a run. It is the installed canonical
+detailed contract shared with the independent reviewer; initialization freezes both reviewer
+templates into the run and records their SHA-256 digests. Every later contract and batch review reads
+those snapshots, so installing a newer skill cannot silently change an in-flight run. The host must
+reason with the same lifecycle rather than treating reviewer output as an opaque PASS/FAIL gate.
 
 - Every finding has a stable semantic `fingerprint` and an ID that is reused while the same defect remains.
 - `novelty` is exactly one of `INITIAL_REVIEW`, `INTRODUCED_BY_FIX`, `PREVIOUSLY_MASKED`, `PRE_EXISTING`, or `UNRELATED`. `INTRODUCED_BY_FIX` requires `introduced_by_sha`; `PREVIOUSLY_MASKED` requires an explanation of why earlier detection was impossible.
@@ -242,7 +246,10 @@ If status reports `MIGRATION_REQUIRED`, preview and explicitly apply the migrati
 <controller-python> <skill-root>/scripts/workflow.py migrate --project <project> --run-id <run-id> --apply
 ```
 
-Migration preserves a mode-0600 backup of the prior state, records its digest, labels unverifiable legacy information, and appends a migration event. It never silently invents missing evidence.
+Migration preserves a mode-0600 backup of the prior state, records its digest, labels unverifiable
+legacy information, and appends migration events. Schema v7 and earlier runs explicitly snapshot the
+currently installed reviewer templates during this operation; the audit record identifies that
+migration-time basis. Migration never silently invents missing evidence.
 
 ## Implement each batch
 
@@ -483,6 +490,9 @@ Schema migration authenticates the legacy event chain and final checkpoint befor
 field. A schema-number downgrade cannot convert edited state into trusted current-schema state. Migration
 backups are reusable only when byte-identical to the still-current legacy state, allowing an interrupted
 migration to resume without accepting an unrelated backup.
+Schema v8 also validates the exact run-local paths, regular-file type, and SHA-256 digests of both
+reviewer-template snapshots before any active transition. Missing, redirected, or edited snapshots
+fail closed.
 
 After approval:
 

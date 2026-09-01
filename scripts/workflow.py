@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_TIMEOUT_SECONDS = 1800
 MAX_REVIEW_ROUNDS = 4
 DEFAULT_MAX_REVIEW_INVOCATIONS_PER_BATCH = 10
@@ -58,6 +58,10 @@ TERMINAL_STATUSES = {"FINALIZED", "SUPERSEDED", "ABANDONED"}
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_TEMPLATE = SKILL_ROOT / "references" / "reviewer_prompt.md"
 CONTRACT_PROMPT_TEMPLATE = SKILL_ROOT / "references" / "contract_reviewer_prompt.md"
+REVIEW_CONTRACT_SOURCES = {
+    "batch_review": PROMPT_TEMPLATE,
+    "contract_review": CONTRACT_PROMPT_TEMPLATE,
+}
 
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -933,7 +937,7 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
         or Path(state.get("run_directory", "")).resolve() != path.parent.resolve()
     ):
         raise WorkflowError("workflow state identity does not match the requested project/run")
-    if loaded_schema in {2, 3, 4, 5, 6}:
+    if loaded_schema in {2, 3, 4, 5, 6, 7}:
         validate_legacy_state_integrity(state, int(loaded_schema))
         state["schema_version"] = SCHEMA_VERSION
         state["_requires_migration"] = True
@@ -1026,6 +1030,73 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def snapshot_review_contract(run_root: Path) -> dict[str, dict[str, str]]:
+    """Freeze the installed reviewer semantics for one implementation run."""
+    contract_root = run_root / "contracts" / "review_contract"
+    if contract_root.exists() or contract_root.is_symlink():
+        metadata = contract_root.lstat()
+        if contract_root.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            raise WorkflowError(f"reviewer contract root must be a real directory: {contract_root}")
+    secure_directory(contract_root)
+    snapshot: dict[str, dict[str, str]] = {}
+    for name, source in REVIEW_CONTRACT_SOURCES.items():
+        destination = contract_root / source.name
+        fd, temporary = tempfile.mkstemp(prefix=f".{source.name}.", dir=str(contract_root))
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(source.read_bytes())
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        snapshot[name] = {
+            "path": str(destination),
+            "sha256": sha256_file(destination),
+            "source": str(source),
+        }
+    return snapshot
+
+
+def validate_review_contract(state: dict[str, Any]) -> None:
+    contract = state.get("review_contract")
+    if not isinstance(contract, dict):
+        raise WorkflowError("run has no frozen reviewer contract; explicit migration is required")
+    contract_root = Path(state["run_directory"]) / "contracts" / "review_contract"
+    for name, source in REVIEW_CONTRACT_SOURCES.items():
+        entry = contract.get(name)
+        if not isinstance(entry, dict):
+            raise WorkflowError(f"frozen reviewer contract is missing {name!r}")
+        path = Path(str(entry.get("path", "")))
+        expected = contract_root / source.name
+        if path != expected:
+            raise WorkflowError(f"frozen reviewer contract path is invalid for {name!r}")
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as exc:
+            raise WorkflowError(f"frozen reviewer contract is missing: {path}") from exc
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise WorkflowError(f"frozen reviewer contract must be a regular file: {path}")
+        expected_digest = entry.get("sha256")
+        if not isinstance(expected_digest, str) or sha256_file(path) != expected_digest:
+            raise WorkflowError(f"frozen reviewer contract digest mismatch: {path}")
+
+
+def read_review_contract(state: dict[str, Any], name: str) -> str:
+    validate_review_contract(state)
+    entry = state["review_contract"][name]
+    path = Path(entry["path"])
+    content = path.read_bytes()
+    if sha256_bytes(content) != entry["sha256"]:
+        raise WorkflowError(f"frozen reviewer contract changed while being read: {path}")
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WorkflowError(f"frozen reviewer contract is not UTF-8: {path}") from exc
 
 
 def ensure_clean(path: Path, label: str) -> None:
@@ -1370,6 +1441,7 @@ def validate_active_state(project: Path, state: dict[str, Any]) -> None:
         raise WorkflowError(f"run is terminal: {state['status']}")
     validate_controller_runtime(state)
     validate_environment_contract(project, state)
+    validate_review_contract(state)
 
 
 def validate_implementation(state: dict[str, Any]) -> Path:
@@ -1470,6 +1542,7 @@ def command_init(args: argparse.Namespace) -> None:
     shutil.copy2(batch_manifest, manifest_snapshot)
     snapshot.chmod(0o600)
     manifest_snapshot.chmod(0o600)
+    review_contract = snapshot_review_contract(run_root)
     branch = f"workflow/{slug(plan.stem, 28)}-{timestamp}-{secrets.token_hex(2)}"
 
     try:
@@ -1506,6 +1579,7 @@ def command_init(args: argparse.Namespace) -> None:
         "controller_runtime": controller_runtime(),
         "project_runtime_at_start": before["project_runtime"],
         "environment_contract": project_environment_contract(project),
+        "review_contract": review_contract,
         "reviewer_history": [{
             "reviewer": args.reviewer, "selected_at": utc_now(), "source": "RUN_INITIALIZED",
             "actor": args.implementer,
@@ -1560,6 +1634,7 @@ def command_init(args: argparse.Namespace) -> None:
         "budgets": state["budgets"],
         "controller_runtime": state["controller_runtime"],
         "project_runtime_at_start": state["project_runtime_at_start"],
+        "review_contract": state["review_contract"],
     })
     save_state(state)
     project_meta = {
@@ -1610,7 +1685,7 @@ def build_prompt(
     evidence_path: Path | None,
     contract_path: Path,
 ) -> str:
-    contract = PROMPT_TEMPLATE.read_text(encoding="utf-8")
+    contract = read_review_contract(state, "batch_review")
     cumulative_final_review = batch == state["batches"][-1]
     round_scope = (
         "This is round 1: perform the complete discovery review for this batch."
@@ -2097,7 +2172,7 @@ def command_contract_review(args: argparse.Namespace) -> None:
     plan_copy.chmod(0o600)
     copy_batch_manifest_context(state, batch_manifest_copy)
     prompt = (
-        CONTRACT_PROMPT_TEMPLATE.read_text(encoding="utf-8")
+        read_review_contract(state, "contract_review")
         + "\n\n## Contract review assignment\n\n"
         + f"- Plan snapshot: `{plan_copy}`\n- Baseline SHA: `{state['baseline_sha']}`\n"
         + f"- Authoritative run scope and batch manifest: `{batch_manifest_copy}`\n"
@@ -4046,6 +4121,12 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
             or sha256_file(source_manifest) != state.get("batch_manifest_digest")
         )
     )
+    review_contract_error: str | None = None
+    if not state.get("_requires_migration"):
+        try:
+            validate_review_contract(state)
+        except WorkflowError as exc:
+            review_contract_error = str(exc)
     return {
         "status": effective_status, "recorded_status": state["status"],
         "project": str(project), "project_key": state["project_key"],
@@ -4063,6 +4144,8 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "controller_runtime_drift": controller_drift,
         "project_runtime_at_start": state.get("project_runtime_at_start"),
         "environment": environment_status(project, state),
+        "review_contract": state.get("review_contract"),
+        "review_contract_error": review_contract_error,
         "reviewer_history": state.get("reviewer_history", []),
         "implementer": state.get("implementer", "legacy-unknown"),
         "fix_policy": state["fix_policy"], "batches": state["batches"],
@@ -4148,6 +4231,7 @@ def command_migrate(args: argparse.Namespace) -> None:
     if not schema_pending and not decision_repair:
         emit({"status": "MIGRATION_NOT_REQUIRED", "run_id": state["run_id"], "schema_version": SCHEMA_VERSION})
     migration = state.get("migration", {})
+    acceptance_contract = state.get("acceptance_contract")
     if state.get("_migration_snapshot_mismatch"):
         raise WorkflowError(
             "legacy plan snapshot digest does not match the recorded plan digest; migration is blocked"
@@ -4157,7 +4241,11 @@ def command_migrate(args: argparse.Namespace) -> None:
         "from_schema": migration.get("from_schema") if schema_pending else SCHEMA_VERSION,
         "to_schema": SCHEMA_VERSION,
         "mode": migration.get("mode") if schema_pending else "PARKED_DECISION_REPAIR",
-        "legacy_acceptance_contract": state.get("acceptance_contract", {}).get("status"),
+        "legacy_acceptance_contract": (
+            acceptance_contract.get("status")
+            if isinstance(acceptance_contract, dict)
+            else None
+        ),
         "plan_snapshot_digest": state.get("plan_snapshot_digest"),
         "pending_decision_repair": decision_repair,
         "environment_fingerprint_migration": (
@@ -4165,6 +4253,7 @@ def command_migrate(args: argparse.Namespace) -> None:
             and state["environment_contract"].get("fingerprint_version")
             != ENVIRONMENT_FINGERPRINT_VERSION
         ),
+        "review_contract_migration": schema_pending,
     }
     if not args.apply:
         emit(preview)
@@ -4192,6 +4281,11 @@ def command_migrate(args: argparse.Namespace) -> None:
             "backup_path": str(backup), "backup_sha256": sha256_file(backup),
         }
         append_event(state, "SCHEMA_MIGRATED", state["migration"])
+        state["review_contract"] = snapshot_review_contract(Path(state["run_directory"]))
+        append_event(state, "REVIEW_CONTRACT_MIGRATED", {
+            "basis": "MIGRATION_TIME_INSTALLED_TEMPLATES",
+            "review_contract": state["review_contract"],
+        })
         old_environment = state.get("environment_contract")
         if (
             not isinstance(old_environment, dict)
