@@ -975,11 +975,21 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
             "reviewer": state.get("reviewer", "legacy-unknown"),
             "selected_at": state.get("created_at"), "source": "LEGACY_STATE",
         }])
-        state.setdefault("migration", {
+        prior_migration = state.get("migration")
+        migration_history = state.setdefault("migration_history", [])
+        if (
+            isinstance(prior_migration, dict)
+            and prior_migration.get("status") == "APPLIED"
+            and prior_migration not in migration_history
+        ):
+            migration_history.append(copy.deepcopy(prior_migration))
+        # This record describes the transition being applied now. Reusing an older transition's
+        # from_schema would collide with its backup and strand a twice-migrated run.
+        state["migration"] = {
             "from_schema": loaded_schema,
             "mode": "LEGACY_COMPATIBILITY",
             "loaded_at": utc_now(),
-        })
+        }
         snapshot_value = state.get("plan_snapshot")
         if isinstance(snapshot_value, str) and Path(snapshot_value).is_file():
             observed_snapshot_digest = sha256_file(Path(snapshot_value))
@@ -1034,6 +1044,13 @@ def sha256_file(path: Path) -> str:
 
 def snapshot_review_contract(run_root: Path) -> dict[str, dict[str, str]]:
     """Freeze the installed reviewer semantics for one implementation run."""
+    contracts_root = run_root / "contracts"
+    try:
+        contracts_metadata = contracts_root.lstat()
+    except FileNotFoundError as exc:
+        raise WorkflowError(f"reviewer contract parent is missing: {contracts_root}") from exc
+    if contracts_root.is_symlink() or not stat.S_ISDIR(contracts_metadata.st_mode):
+        raise WorkflowError(f"reviewer contract parent must be a real directory: {contracts_root}")
     contract_root = run_root / "contracts" / "review_contract"
     if contract_root.exists() or contract_root.is_symlink():
         metadata = contract_root.lstat()
@@ -1043,16 +1060,20 @@ def snapshot_review_contract(run_root: Path) -> dict[str, dict[str, str]]:
     snapshot: dict[str, dict[str, str]] = {}
     for name, source in REVIEW_CONTRACT_SOURCES.items():
         destination = contract_root / source.name
-        fd, temporary = tempfile.mkstemp(prefix=f".{source.name}.", dir=str(contract_root))
+        temporary: str | None = None
         try:
+            content = source.read_bytes()
+            fd, temporary = tempfile.mkstemp(prefix=f".{source.name}.", dir=str(contract_root))
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as handle:
-                handle.write(source.read_bytes())
+                handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)
+        except OSError as exc:
+            raise WorkflowError(f"cannot freeze reviewer contract {source}: {exc}") from exc
         finally:
-            if os.path.exists(temporary):
+            if temporary is not None and os.path.exists(temporary):
                 os.unlink(temporary)
         snapshot[name] = {
             "path": str(destination),
@@ -1065,8 +1086,17 @@ def snapshot_review_contract(run_root: Path) -> dict[str, dict[str, str]]:
 def validate_review_contract(state: dict[str, Any]) -> None:
     contract = state.get("review_contract")
     if not isinstance(contract, dict):
-        raise WorkflowError("run has no frozen reviewer contract; explicit migration is required")
-    contract_root = Path(state["run_directory"]) / "contracts" / "review_contract"
+        raise WorkflowError(
+            "run has no frozen reviewer contract; restore its recorded snapshot or supersede the run"
+        )
+    contracts_root = Path(state["run_directory"]) / "contracts"
+    try:
+        contracts_metadata = contracts_root.lstat()
+    except FileNotFoundError as exc:
+        raise WorkflowError(f"reviewer contract parent is missing: {contracts_root}") from exc
+    if contracts_root.is_symlink() or not stat.S_ISDIR(contracts_metadata.st_mode):
+        raise WorkflowError(f"reviewer contract parent must be a real directory: {contracts_root}")
+    contract_root = contracts_root / "review_contract"
     for name, source in REVIEW_CONTRACT_SOURCES.items():
         entry = contract.get(name)
         if not isinstance(entry, dict):
@@ -1082,15 +1112,33 @@ def validate_review_contract(state: dict[str, Any]) -> None:
         if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
             raise WorkflowError(f"frozen reviewer contract must be a regular file: {path}")
         expected_digest = entry.get("sha256")
-        if not isinstance(expected_digest, str) or sha256_file(path) != expected_digest:
+        try:
+            digest = sha256_file(path)
+        except OSError as exc:
+            raise WorkflowError(f"cannot read frozen reviewer contract {path}: {exc}") from exc
+        if not isinstance(expected_digest, str) or digest != expected_digest:
             raise WorkflowError(f"frozen reviewer contract digest mismatch: {path}")
+
+
+def installed_review_contract_descriptor() -> dict[str, dict[str, str]]:
+    descriptor: dict[str, dict[str, str]] = {}
+    for name, source in REVIEW_CONTRACT_SOURCES.items():
+        try:
+            digest = sha256_file(source)
+        except OSError as exc:
+            raise WorkflowError(f"cannot inspect installed reviewer contract {source}: {exc}") from exc
+        descriptor[name] = {"source": str(source), "sha256": digest}
+    return descriptor
 
 
 def read_review_contract(state: dict[str, Any], name: str) -> str:
     validate_review_contract(state)
     entry = state["review_contract"][name]
     path = Path(entry["path"])
-    content = path.read_bytes()
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise WorkflowError(f"cannot read frozen reviewer contract {path}: {exc}") from exc
     if sha256_bytes(content) != entry["sha256"]:
         raise WorkflowError(f"frozen reviewer contract changed while being read: {path}")
     try:
@@ -4254,6 +4302,9 @@ def command_migrate(args: argparse.Namespace) -> None:
             != ENVIRONMENT_FINGERPRINT_VERSION
         ),
         "review_contract_migration": schema_pending,
+        "review_contract_candidate": (
+            installed_review_contract_descriptor() if schema_pending else None
+        ),
     }
     if not args.apply:
         emit(preview)
@@ -4375,6 +4426,7 @@ def write_final_report(state: dict[str, Any], integrated: bool) -> Path:
         f"- Plan snapshot SHA-256: `{state.get('plan_snapshot_digest')}`\n"
         f"- Batch manifest: `{state.get('batch_manifest_snapshot') or 'LEGACY_UNAVAILABLE'}`\n"
         f"- Batch manifest SHA-256: `{state.get('batch_manifest_snapshot_digest')}`\n"
+        f"- Frozen reviewer contract: `{json.dumps(state.get('review_contract'), ensure_ascii=False, sort_keys=True)}`\n"
         f"- Target branch: `{state['target_branch']}`\n"
         f"- Implementation branch: `{state['implementation_branch']}`\n"
         f"- Baseline SHA: `{state['baseline_sha']}`\n"

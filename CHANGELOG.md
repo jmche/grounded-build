@@ -16,6 +16,8 @@ All notable changes use semantic versioning.
 - Froze both implementation reviewer templates inside each run, bound them by SHA-256, and raised
   implementation state to schema v8 so older runs must explicitly migrate before adopting newly
   installed review semantics.
+- Preserved sequential migration history while deriving every backup from the run's actual loaded
+  schema, preventing an earlier schema-6 backup from blocking a later schema-7-to-8 transition.
 
 ## [0.6.0] - 2026-09-01
 

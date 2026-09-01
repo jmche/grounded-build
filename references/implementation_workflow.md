@@ -94,8 +94,10 @@ review. Target movement is integration divergence, not execution staleness.
 Read `references/reviewer_prompt.md` before initializing a run. It is the installed canonical
 detailed contract shared with the independent reviewer; initialization freezes both reviewer
 templates into the run and records their SHA-256 digests. Every later contract and batch review reads
-those snapshots, so installing a newer skill cannot silently change an in-flight run. The host must
-reason with the same lifecycle rather than treating reviewer output as an opaque PASS/FAIL gate.
+those snapshots, so installing edited template files cannot silently change an in-flight run. This is
+a template contract, not a freeze of the Python state-machine engine; engine and schema changes still
+follow their own migration boundary. The host must reason with the same lifecycle rather than treating
+reviewer output as an opaque PASS/FAIL gate.
 
 - Every finding has a stable semantic `fingerprint` and an ID that is reused while the same defect remains.
 - `novelty` is exactly one of `INITIAL_REVIEW`, `INTRODUCED_BY_FIX`, `PREVIOUSLY_MASKED`, `PRE_EXISTING`, or `UNRELATED`. `INTRODUCED_BY_FIX` requires `introduced_by_sha`; `PREVIOUSLY_MASKED` requires an explanation of why earlier detection was impossible.
@@ -248,8 +250,10 @@ If status reports `MIGRATION_REQUIRED`, preview and explicitly apply the migrati
 
 Migration preserves a mode-0600 backup of the prior state, records its digest, labels unverifiable
 legacy information, and appends migration events. Schema v7 and earlier runs explicitly snapshot the
-currently installed reviewer templates during this operation; the audit record identifies that
-migration-time basis. Migration never silently invents missing evidence.
+currently installed reviewer templates during this operation; the preview lists their source paths
+and digests, and the audit record identifies that migration-time basis. Migration never silently
+invents missing evidence. Each transition records its actual source schema and preserves any prior
+applied migration in `migration_history`, so sequential upgrades never reuse an older backup name.
 
 ## Implement each batch
 

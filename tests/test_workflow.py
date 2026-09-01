@@ -1535,6 +1535,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
 
     def test_review_contract_snapshot_is_stable_when_installed_source_changes(self) -> None:
         run_root = self.root / "snapshot-run"
+        (run_root / "contracts").mkdir(parents=True)
         source = self.root / "reviewer-source.md"
         source.write_text("frozen semantics\n", encoding="utf-8")
         original_sources = WORKFLOW_MODULE.REVIEW_CONTRACT_SOURCES
@@ -1582,6 +1583,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
         )
         self.assertTrue(preview["review_contract_migration"])
+        self.assertEqual(
+            set(preview["review_contract_candidate"]), {"batch_review", "contract_review"}
+        )
         migrated = self.workflow(
             "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
             "--apply",
@@ -1591,6 +1595,37 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(current["schema_version"], 8)
         WORKFLOW_MODULE.validate_review_contract(current)
         self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema7"))
+
+    def test_sequential_migration_uses_the_actual_loaded_schema(self) -> None:
+        initialized = self.initialize_raw("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.pop("review_contract")
+        state["migration"] = {
+            "from_schema": 6,
+            "mode": "LEGACY_COMPATIBILITY",
+            "status": "APPLIED",
+            "backup_path": str(state_path.with_name("workflow.schema6.json")),
+            "backup_sha256": "legacy-digest",
+        }
+        self.write_authenticated_legacy_state(state_path, state, 7)
+        old_backup = state_path.with_name("workflow.schema6.json")
+        old_backup.write_text("older schema backup\n", encoding="utf-8")
+        old_backup.chmod(0o600)
+
+        preview = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(preview["from_schema"], 7)
+        migrated = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply",
+        )
+        self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema7"))
+        current = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["migration"]["from_schema"], 7)
+        self.assertEqual(current["migration_history"][0]["from_schema"], 6)
+        self.assertEqual(old_backup.read_text(encoding="utf-8"), "older schema backup\n")
 
     def test_schema6_environment_fingerprint_requires_explicit_rebase(self) -> None:
         initialized = self.initialize("codex")
