@@ -13,13 +13,17 @@ Grounded Build is a local workflow for a trusted operating-system account. The r
 
 - Planning agents receive a read-only fixed-SHA worktree and a stage-specific context through an allowlist bubblewrap namespace.
 - The original checkout, sibling planning slot, other runs, general HOME, user sockets, and unrelated provider credentials are not mounted.
-- Only the selected provider's discovered configuration and authentication files are mounted for the CLI itself. Model tools are denied access to the private HOME, while both adapters retain shell access so they can inspect and measure the read-only repository.
+- Only the selected provider's discovered configuration and authentication files are mounted for the CLI itself. Model tools are denied access to the private HOME, while each supported adapter retains restricted shell access so it can inspect and measure the read-only repository.
 - Native web-search/fetch tools are disabled by default. They are enabled only for investigation assignments initialized with `research_policy=authoritative-web`; the assignment contract limits evidence to official project documentation and the official GitHub repository.
 - The research policy is an audited model/tool policy, not a hard network-isolation boundary. Provider CLIs require network access, and shell subprocess egress can depend on the adapter and host. Enforce a host firewall or isolated network when a hard egress boundary is required.
 - Provider versions that cannot enforce the documented filesystem or native-tool restrictions are unsupported. Use short-lived or least-privilege credentials where supported.
 - Secret-like host environment variables are not inherited. The sandbox receives a minimal environment and private HOME/TMP directories.
 - Planning state is HMAC-authenticated and revisions are anchored outside each run directory. This detects subagent writes, accidental edits, stale restoration of a run, and partial artifact corruption.
 - Implementation verification uses the stricter sandbox and resource controls documented in `references/implementation_workflow.md`.
+- The dsh implementation reviewer uses a writable `.review-out/` channel inside its detached reviewer
+  worktree because the headless CLI has no structured-output flag. The workflow excludes only that
+  channel from cleanliness checks, validates its JSON against the same schema, and rejects unrelated
+  reviewer-worktree changes; the original and implementation worktrees are not writable through it.
 - Environment fingerprinting reads `.venv` content from the controller process and never launches the
   project interpreter. Project `.pth` and startup hooks execute only inside an authorized verification
   sandbox, never as a side effect of preflight, status, review, or state validation.

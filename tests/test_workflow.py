@@ -47,9 +47,16 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.run_command("git", "-C", str(self.project), "commit", "-qm", "base")
         self.make_fake_reviewer("codex")
         self.make_fake_reviewer("claude")
+        self.make_fake_reviewer("dsh")
         self.environment = os.environ.copy()
         self.environment["PATH"] = f"{self.bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["GROUNDED_BUILD_IMPLEMENT_HOME"] = str(self.state_home)
+        dsh_home = self.root / "dsh-home"
+        dsh_home.mkdir()
+        (dsh_home / "settings.yaml").write_text(
+            "agent-default-model:\n  provider: deepseek-official\n"
+            "  model: deepseek-v4-flash\n", encoding="utf-8")
+        self.environment["DSH_HOME"] = str(dsh_home)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -147,6 +154,8 @@ class WorkflowIntegrationTests(unittest.TestCase):
                     output = sys.argv[sys.argv.index("-o") + 1]
                     with open(output, "w", encoding="utf-8") as handle:
                         json.dump(payload, handle)
+                elif "{name}" == "dsh":
+                    print(json.dumps(payload))
                 else:
                     print(json.dumps({{"structured_output": payload}}))
                 """
@@ -264,6 +273,24 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(status["implementer"], "claude")
         self.assertEqual(status["reviewer"], "claude")
         self.assertEqual(status["reviewer_history"][0]["source"], "RUN_INITIALIZED")
+
+    def test_dsh_reviews_the_contract_and_fixed_sha_batch(self) -> None:
+        initialized = self.initialize("dsh")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
+        )
+        self.assertEqual(status["reviewer_runtime"]["adapter"], "dsh")
+        self.assertEqual(status["reviewer_runtime"]["model"], "deepseek-v4-flash")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        reviewed_sha = self.commit_batch_change(implementation)
+        review = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        )
+        self.assertEqual(review["status"], "REVIEW_PASS")
+        self.assertEqual(review["reviewed_sha"], reviewed_sha)
+        report = json.loads(Path(str(review["report_path"])).read_text(encoding="utf-8"))
+        self.assertEqual(report["reviewer"], "dsh")
 
     def test_reviewer_switch_is_audited_without_resetting_state_or_budget(self) -> None:
         initialized = self.initialize_raw("codex", implementer="claude")
@@ -2666,6 +2693,25 @@ class ReviewerSchemaCompatibilityTests(unittest.TestCase):
 
 
 class DocumentationContractTests(unittest.TestCase):
+    def test_public_contract_documents_dsh_as_an_implementation_reviewer(self) -> None:
+        documents = {
+            "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "readme": (SKILL_ROOT / "README.md").read_text(encoding="utf-8"),
+            "support": (SKILL_ROOT / "SUPPORT.md").read_text(encoding="utf-8"),
+            "implementation": (
+                SKILL_ROOT / "references" / "implementation_workflow.md"
+            ).read_text(encoding="utf-8"),
+        }
+        self.assertEqual(WORKFLOW_MODULE.SUPPORTED_REVIEWERS, ("claude", "codex", "dsh"))
+        for name, document in documents.items():
+            with self.subTest(document=name):
+                self.assertIn("dsh", document)
+                self.assertNotIn("dsh is supported for planning only", document.lower())
+                self.assertNotIn("not an Implement reviewer", document)
+                self.assertNotIn("planning backend only", document.lower())
+        self.assertIn("--dsh-model", documents["skill"])
+        self.assertIn("--dsh-model-provider", documents["implementation"])
+
     def test_host_and_reviewer_share_finding_lifecycle_vocabulary(self) -> None:
         skill = (SKILL_ROOT / "references" / "implementation_workflow.md").read_text(
             encoding="utf-8"

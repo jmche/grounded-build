@@ -45,7 +45,7 @@ the skill. Read [SECURITY.md](SECURITY.md) before using it with sensitive reposi
 | Git | Yes | Worktrees and atomic ref updates are core primitives. |
 | Claude CLI | Plan + Implement reviewer | Tested through a restricted fresh process. |
 | Codex CLI | Plan + Implement reviewer | Adapter identity is separate from configured model identity. |
-| dsh | Plan only | Uses the model selected by the local harness; not an Implement reviewer. |
+| dsh | Plan + Implement reviewer | Uses the model selected by the local harness unless explicitly overridden. |
 | macOS / Windows | No | No silent fallback to a weaker sandbox is provided. |
 
 At least one supported provider CLI must already be installed and authenticated. Grounded Build never

@@ -25,6 +25,8 @@ All notable changes use semantic versioning.
   mount a declared absolute Python runtime by its narrow, read-only installation prefix.
 - Replaced a shared-runner wall-clock concurrency threshold with direct simultaneous-invocation
   evidence, eliminating load-dependent CI failures without weakening the concurrency assertion.
+- Synchronized the public and host contracts with the implemented dsh acceptance-contract and
+  fixed-SHA code-review paths, including model overrides and the audited incremental output channel.
 
 ## [0.5.0] - 2026-08-31
 

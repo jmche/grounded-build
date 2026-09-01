@@ -2,9 +2,9 @@
 
 ## Supported environment
 
-The current public beta supports Linux, Git, bubblewrap, and CPython 3.11–3.13. Claude and Codex are
-supported for planning and implementation review; dsh is supported for planning only. Provider CLI
-authentication and model availability remain the operator's responsibility.
+The current public beta supports Linux, Git, bubblewrap, and CPython 3.11–3.13. Claude, Codex, and dsh
+are supported for both planning and implementation review. Provider CLI authentication, harness
+configuration, and model availability remain the operator's responsibility.
 
 The latest minor release receives compatibility and security fixes. Older minor releases remain
 available for audit and rollback but are not actively supported unless a security advisory states otherwise.

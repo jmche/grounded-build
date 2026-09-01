@@ -3,7 +3,7 @@ name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
   version: 0.6.0
-  compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude or Codex CLI adapter
+  compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude, Codex, or dsh CLI adapter
 ---
 
 # Grounded Build
@@ -152,7 +152,11 @@ invalidates baseline execution: finish the reviewed candidate, then use preview-
 `submit-reconciliation` when the target has diverged. Re-running `reconcile` returns the active attempt;
 use preview-first `abandon-reconciliation` before intentionally starting another.
 
-The implementation host remains the current host model. Its isolated reviewer defaults to Opus for Claude or `gpt-5.6-sol` for Codex; `--claude-model`, `--codex-model`, `--codex-model-provider`, and `--codex-profile` may override that selection at `init` and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.
+The implementation host remains the current host model. Its isolated reviewer may be Claude, Codex, or
+dsh. Claude defaults to Opus, Codex to `gpt-5.6-sol`, and dsh to the model selected in
+`~/.dsh/settings.yaml`; `--claude-model`, `--codex-model`, `--codex-model-provider`,
+`--codex-profile`, `--dsh-model`, and `--dsh-model-provider` may override that selection at `init`
+and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.
 
 Before implementation preflight, resolve one stable CPython 3.11+ executable and use its absolute path
 for every `workflow.py` command in that run. Report and preserve the frozen `controller_runtime`; never

@@ -1744,10 +1744,20 @@ def reviewer_command(
 ) -> list[str]:
     if reviewer == "dsh":
         # dsh-headless has no structured-output flag, so the schema travels IN the prompt and the
-        # host parses the printed final message. DSH_PERMISSION_MODE=read-only is set inline via
-        # `env` because the implementation reviewer is not bubblewrap-wrapped (matching the
-        # existing claude/codex implementation-reviewer isolation, which relies on CLI flags).
+        # host parses the printed final message. Contract review needs no writable output channel.
         schema_text = json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
+        if "assessment" in schema.get("properties", {}):
+            dsh_prompt = (
+                prompt
+                + "\n\nOUTPUT CONTRACT. Your FINAL assistant message must be ONLY one complete "
+                + "JSON object matching this schema — no prose, no fences, and no file writes. "
+                + "Verify it is complete and valid before stopping.\n"
+                + schema_text
+            )
+            return ["env", "DSH_PERMISSION_MODE=read-only", "dsh", "--profile", "headless", dsh_prompt]
+        # Code review persists incremental findings because a long review may lose its final stream.
+        # dsh receives workspace-write only in the detached reviewer worktree; post-run cleanliness
+        # rejects every write outside the ignored `.review-out/` channel.
         dsh_prompt = (
             prompt
             + "\n\nOUTPUT CONTRACT. Working directory for all file writes is the current working "

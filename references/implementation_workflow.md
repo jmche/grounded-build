@@ -1,6 +1,6 @@
 # Implement mode contract
 
-Execute a user-provided implementation plan without changing the original project until final integration. The current host coding agent implements and fixes the plan in an isolated worktree. A selected `claude` or `codex` CLI reviews each fixed commit in a second isolated worktree. The reviewer may use the same agent family as the host; independence means a fresh process, isolated context, separate worktree, restricted authority, and audited output—not necessarily a different vendor or model.
+Execute a user-provided implementation plan without changing the original project until final integration. The current host coding agent implements and fixes the plan in an isolated worktree. A selected `claude`, `codex`, or `dsh` CLI reviews each fixed commit in a second isolated worktree. The reviewer may use the same agent family as the host; independence means a fresh process, isolated context, separate worktree, restricted authority, and audited output—not necessarily a different vendor or model.
 
 Use the bundled script for Git, worktrees, state, fixed-SHA review dispatch, and integration. The host agent owns plan interpretation, implementation, tests, and semantic repair.
 
@@ -22,17 +22,16 @@ Collect or infer:
 
 - `plan`: an existing local plan file, resolved to an absolute path.
 - `batch_manifest`: a host-authored file that explicitly declares this run's included and excluded total scope and maps every batch ID to plan work. This is execution authority, not reviewer output.
-- `reviewer`: exactly `claude` or `codex`; it may match the host/implementer. The `dsh` adapter is
-  currently a planning backend only and is not accepted by the Implement workflow.
-- `reviewer_runtime`: the non-secret model identity frozen at initialization. Claude defaults to Opus and
-  Codex defaults to `gpt-5.6-sol`; optional `--claude-model`, `--codex-model`,
-  `--codex-model-provider`, and `--codex-profile` select GPT, an
-  OpenAI-compatible DeepSeek gateway, or another configured model without treating the CLI name
+- `reviewer`: exactly `claude`, `codex`, or `dsh`; it may match the host/implementer.
+- `reviewer_runtime`: the non-secret model identity frozen at initialization. Claude defaults to Opus,
+  Codex defaults to `gpt-5.6-sol`, and dsh reads the harness selection from `~/.dsh/settings.yaml`.
+  Optional `--claude-model`, `--codex-model`, `--codex-model-provider`, `--codex-profile`,
+  `--dsh-model`, and `--dsh-model-provider` select a configured model without treating the CLI name
   as the model family.
 - `fix_policy`: `ask` by default, `auto` only when explicitly requested, or `never` for review without repair.
 - `target_branch`: the current branch unless the user explicitly names another branch.
 
-The agent invoking this skill is always the implementer. Do not launch another implementer. A same-family reviewer is allowed only as a fresh reviewer CLI invocation under the workflow's isolated read-only contract; the current host conversation must never issue its own PASS.
+The agent invoking this skill is always the implementer. Do not launch another implementer. A same-family reviewer is allowed only as a fresh reviewer CLI invocation under the workflow's isolated reviewer contract; the current host conversation must never issue its own PASS. Claude and Codex use their read-only CLI modes. dsh uses workspace-write only in the detached reviewer worktree so it can persist structured output under `.review-out/`; the workflow rejects any unrelated worktree mutation.
 
 ## Storage and isolation
 
@@ -155,7 +154,7 @@ Initialize a new run:
   --plan <absolute-plan-path> \
   --batch-manifest <absolute-batch-manifest-path> \
   --implementer <current-host-agent-name> \
-  --reviewer <claude-or-codex> \
+  --reviewer <claude-or-codex-or-dsh> \
   --fix-policy <ask-auto-or-never> \
   --batches <comma-separated-batch-ids> \
   --target-branch <branch>
@@ -167,9 +166,10 @@ isolated reviewer's advanced default, append the same selection verified during 
 ```bash
 --claude-model <model>
 --codex-model <model> --codex-model-provider <configured-provider> --codex-profile <profile>
+--dsh-model <model> --dsh-model-provider <configured-provider>
 ```
 
-Use `cli-default` for either model to defer to its CLI. These values are frozen in `reviewer_runtime`; credentials, bearer tokens, and endpoint URLs are
+Use `cli-default` for any reviewer model to defer to its CLI or harness. These values are frozen in `reviewer_runtime`; credentials, bearer tokens, and endpoint URLs are
 never copied into workflow state.
 
 Initialization snapshots both the plan and batch manifest, records their digests, verifies that the manifest names every declared batch ID, creates a unique implementation branch and reviewer worktree, and leaves the original project's branch, HEAD, index, and files unchanged. The new run starts at `AWAITING_CONTRACT_REVIEW`.
@@ -274,7 +274,8 @@ Interpret statuses as follows:
 
 Every real reviewer call is stored under a unique `round_N/invocation_N/` directory. A malformed result or process failure leaves a terminal invocation record but does not create a quality review. Invocation budgets stop repeated infrastructure failures from consuming unbounded external-agent budget.
 
-If the selected reviewer becomes unavailable—for example, Codex exhausts its token quota—switch subsequent calls without restarting the run:
+If the selected reviewer becomes unavailable—for example, Codex exhausts its token quota—switch to
+Claude, Codex, or dsh without restarting the run:
 
 ```bash
 <controller-python> <skill-root>/scripts/workflow.py change-reviewer \
@@ -287,6 +288,9 @@ If the selected reviewer becomes unavailable—for example, Codex exhausts its t
 ```
 
 Preview before applying. The new reviewer may match the implementer, but it still runs as a fresh isolated CLI reviewer. Switching preserves the current workflow phase, finding ledger, accepted evidence, quality rounds, verification state, and invocation usage; it never turns the prior infrastructure failure into code `FAIL` and never resets budget.
+
+For dsh, append `--dsh-model <model>` and optionally `--dsh-model-provider <provider>` to either
+preview or apply command when the harness selection should not be used.
 
 ## Fix loop
 
