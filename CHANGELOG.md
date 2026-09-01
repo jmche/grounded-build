@@ -19,6 +19,8 @@ All notable changes use semantic versioning.
   the deterministic release gate to verify the public surface and packaging contract.
 - Expanded CI across CPython 3.11, 3.12, and 3.13 while preserving the zero-paid-call fake-adapter suite.
 - Pinned every GitHub Action to a full commit SHA and configured monthly reviewed update proposals.
+- Enabled bubblewrap's user-namespace prerequisite explicitly on ephemeral Ubuntu 24.04 runners and
+  pinned the Node 24 generations of the official checkout and Python setup actions.
 
 ## [0.5.0] - 2026-08-31
 
