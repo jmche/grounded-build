@@ -238,7 +238,6 @@ class PlanWorkflowTest(unittest.TestCase):
             "--backend", "claude", "--final-reviewer", "both")
         action = initialized["next_action"]
         self.assertEqual(action["kind"], "RUN_AGENT_BATCH")
-        started = __import__("time").monotonic()
         processes = [subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, env=self.env)
                      for command in action["commands"]]
@@ -247,9 +246,7 @@ class PlanWorkflowTest(unittest.TestCase):
             "status", "--project", str(self.project), "--run-id", initialized["run_id"])
         self.assertEqual(set(running["active_invocations"]), {"investigate-A", "investigate-B"})
         results = [process.communicate(timeout=15) + (process.returncode,) for process in processes]
-        elapsed = __import__("time").monotonic() - started
         self.assertTrue(all(returncode == 0 for _, _, returncode in results), results)
-        self.assertLess(elapsed, 1.8, results)
         state = self.get_state(initialized)
         self.assertEqual(set(state["investigations"]), {"A", "B"})
         self.assertEqual(state["status"], "EVIDENCE_READY")

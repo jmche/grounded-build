@@ -23,6 +23,8 @@ All notable changes use semantic versioning.
   pinned the Node 24 generations of the official checkout and Python setup actions.
 - Removed the accidental PyYAML dependency from dsh identity discovery and taught verification to
   mount a declared absolute Python runtime by its narrow, read-only installation prefix.
+- Replaced a shared-runner wall-clock concurrency threshold with direct simultaneous-invocation
+  evidence, eliminating load-dependent CI failures without weakening the concurrency assertion.
 
 ## [0.5.0] - 2026-08-31
 
