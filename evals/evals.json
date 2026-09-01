@@ -122,6 +122,43 @@
         "The host does not run uv sync, download an interpreter, or install dependencies without explicit authority.",
         "An absent .venv is classified as an actionable infrastructure condition rather than a code-review failure."
       ]
+    },
+    {
+      "id": 11,
+      "prompt": "Use grounded-build to plan a fix for this orchestration defect: the user contract requires an HTML report, a generated plan restates the output as Markdown, the coding agent produces HTML, and a downstream validator rejects it because it only recognizes .md filenames. Do not solve this by adding another extension fallback.",
+      "expected_output": "Planning traces the frozen user requirement through the actual plan and producer prompt to the generated artifact and validator, identifies duplicated conflicting authority as the earliest divergence, and repairs the authority and handoff before considering bounded recovery.",
+      "files": [],
+      "assertions": [
+        "The plan explains why the coding agent reasonably produced HTML rather than treating generative variation as the root cause.",
+        "The primary repair removes the conflicting output declaration and binds producer output structurally.",
+        "Filename regexes and extension allowlists are not accepted as semantic evidence of producer intent.",
+        "Any fallback is explicitly bounded to an unavailable producer or legacy artifact population.",
+        "Verification covers a valid non-Markdown output and the complete producer-to-consumer production path."
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "Use grounded-build to plan a repair for a cache that accepts a manifest from the wrong revision. The manifest contains an exact revision and digest, but the consumer never compares them. Keep this deterministic and do not ask an LLM whether the manifest looks correct.",
+      "expected_output": "Planning identifies the revision/digest comparison as a machine-fact responsibility at the consuming boundary and proposes a consequential deterministic test without introducing semantic review.",
+      "files": [],
+      "assertions": [
+        "The causal trace names the authoritative revision, manifest writer, and consumer that omitted the comparison.",
+        "Revision and digest equality remain deterministic machine facts.",
+        "The plan does not add a semantic reviewer, keyword heuristic, or generative project classification.",
+        "The negative test proves that a stale or mismatched manifest is rejected at the responsible boundary."
+      ]
+    },
+    {
+      "id": 13,
+      "prompt": "Use grounded-build to plan a one-function fix for an off-by-one loop with a direct failing unit test. Keep the process proportional; there are no agents, external services, or cross-layer contracts involved.",
+      "expected_output": "Planning records the direct input, responsible loop, observed output, and failing test without manufacturing a large orchestration analysis or widening scope.",
+      "files": [],
+      "assertions": [
+        "The plan uses a short deterministic causal trace appropriate to the local defect.",
+        "It does not add producer manifests, semantic reviewers, new gates, or fallback ladders.",
+        "Verification is the consequential unit test plus relevant regression coverage.",
+        "The requested one-function scope remains frozen."
+      ]
     }
   ]
 }

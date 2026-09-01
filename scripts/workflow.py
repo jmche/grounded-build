@@ -2102,7 +2102,7 @@ def command_contract_review(args: argparse.Namespace) -> None:
         + f"- Plan snapshot: `{plan_copy}`\n- Baseline SHA: `{state['baseline_sha']}`\n"
         + f"- Authoritative run scope and batch manifest: `{batch_manifest_copy}`\n"
         + f"- Batches: `{','.join(state['batches'])}`\n"
-        + "Treat the frozen manifest as authoritative for this run's included/excluded scope and "
+        + "Apply the production causality rules in the reviewer contract proportionally. Treat the frozen manifest as authoritative for this run's included/excluded scope and "
         + "batch mapping. Do not silently reinterpret this run as covering the whole plan. If the "
         + "manifest conflicts with an indivisible requirement or omits a boundary needed for a "
         + "decidable criterion, return NEEDS_USER_DECISION and propose the change.\n"

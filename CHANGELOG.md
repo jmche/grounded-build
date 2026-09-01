@@ -2,6 +2,18 @@
 
 All notable changes use semantic versioning.
 
+## [0.6.1] - 2026-09-01
+
+- Added one production-causality protocol shared by planning, host synthesis, acceptance-contract
+  review, implementation, and fixed-SHA review. It traces authority, actual inputs, responsible
+  producers, consumer interpretation, and the earliest supported divergence across deterministic,
+  generative, external, human, and hybrid systems.
+- Kept machine facts in deterministic validation and semantic judgments with independent reviewers,
+  while requiring new gates, resolvers, and fallbacks to justify valid variations and complete recovery.
+- Established a pre-1.0 release policy: compatible refinements remain on the current patch line,
+  substantial capabilities may advance the 0.x minor line, and 1.0 requires an explicit maintainer
+  product-readiness decision plus a reviewed release-gate change.
+
 ## [0.6.0] - 2026-09-01
 
 - Reopened every re-reported P0 finding as blocking even when an earlier P1 observation had been

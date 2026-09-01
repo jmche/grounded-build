@@ -32,6 +32,7 @@ class ReleasePackageTests(unittest.TestCase):
             {f"grounded-build/{relative}" for relative in PACKAGE.RUNTIME_MANIFEST},
         )
         self.assertIn("grounded-build/tests/test_workflow.py", files)
+        self.assertIn("grounded-build/references/causal_analysis.md", files)
         self.assertIn("grounded-build/.github/workflows/ci.yml", files)
         self.assertNotIn("grounded-build/AGENTS.md", files)
         self.assertFalse(any("__pycache__" in name or name.startswith("grounded-build/.git/") for name in files))
@@ -50,6 +51,17 @@ class ReleasePackageTests(unittest.TestCase):
             self.assertEqual(filename, archive.name)
             self.assertEqual(digest, hashlib.sha256(archive.read_bytes()).hexdigest())
             self.assertIn(f"sha256={digest}", result.stdout)
+
+    def test_public_beta_packager_rejects_a_major_version(self) -> None:
+        original_root = PACKAGE.ROOT
+        try:
+            with tempfile.TemporaryDirectory(prefix="grounded-build-version-") as raw:
+                PACKAGE.ROOT = Path(raw)
+                (PACKAGE.ROOT / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+                with self.assertRaisesRegex(SystemExit, "remain below 1.0.0"):
+                    PACKAGE.version()
+        finally:
+            PACKAGE.ROOT = original_root
 
 
 if __name__ == "__main__":

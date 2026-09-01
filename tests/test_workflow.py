@@ -2693,6 +2693,33 @@ class ReviewerSchemaCompatibilityTests(unittest.TestCase):
 
 
 class DocumentationContractTests(unittest.TestCase):
+    def test_causality_contract_is_shared_without_turning_semantics_into_a_gate(self) -> None:
+        documents = {
+            "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "implementation": (
+                SKILL_ROOT / "references" / "implementation_workflow.md"
+            ).read_text(encoding="utf-8"),
+            "reviewer": (
+                SKILL_ROOT / "references" / "reviewer_prompt.md"
+            ).read_text(encoding="utf-8"),
+            "contract": (
+                SKILL_ROOT / "references" / "contract_reviewer_prompt.md"
+            ).read_text(encoding="utf-8"),
+        }
+        for name, document in documents.items():
+            with self.subTest(document=name):
+                self.assertIn("earliest responsible", document)
+                self.assertIn("deterministic", document.lower())
+                self.assertIn("generative", document.lower())
+                self.assertIn("semantic", document.lower())
+        protocol = (SKILL_ROOT / "references" / "causal_analysis.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("actual input", protocol)
+        self.assertIn("consumer interpretation", protocol)
+        self.assertIn("valid outputs", protocol.lower())
+        self.assertIn("Keep verification proportional to risk", protocol)
+
     def test_public_contract_documents_dsh_as_an_implementation_reviewer(self) -> None:
         documents = {
             "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),

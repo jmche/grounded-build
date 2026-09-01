@@ -61,11 +61,18 @@ credentials, and private repository content must never be committed.
 
 ## Versioning and releases
 
-Grounded Build uses semantic versioning:
+Grounded Build uses semantic versioning while it remains a public beta:
 
-- Patch: compatible correctness, security, and documentation fixes.
-- Minor: compatible workflow capability or public-surface additions.
-- Major: incompatible state, command, installation, or authority changes that cannot be migrated safely.
+- Patch (`0.6.x` on the current line): compatible correctness, security, documentation, prompt,
+  review-policy, and other bounded refinements.
+- Minor (`0.x.0`, including values such as `0.100.0`): substantial compatible workflow capability or
+  public-surface additions that deserve a distinct product milestone.
+- Major (`1.0.0`): prohibited by the release gate until the maintainer explicitly declares the product
+  ready, reviews the compatibility and migration boundary, and deliberately changes that gate in the
+  same release change. Ordinary feature work never implies 1.0 readiness.
+
+Do not increment the minor component merely to make a release look significant. Prefer the current
+patch line unless the change adds a strong, user-visible capability with its own compatibility surface.
 
 A release updates `VERSION`, `SKILL.md`, `README.md`, `CHANGELOG.md`, and
 `scripts/plan_workflow.py` together. The release gate checks synchronization. After the release commit:

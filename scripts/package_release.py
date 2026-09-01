@@ -34,6 +34,7 @@ RUNTIME_MANIFEST = (
     "VERSION",
     "agents/openai.yaml",
     "evals/evals.json",
+    "references/causal_analysis.md",
     "references/contract_reviewer_prompt.md",
     "references/implementation_workflow.md",
     "references/planning_workflow.md",
@@ -58,6 +59,11 @@ def version() -> str:
         r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", value
     ):
         raise SystemExit(f"VERSION is not stable semantic versioning: {value!r}")
+    if int(value.split(".", 1)[0]) != 0:
+        raise SystemExit(
+            "VERSION must remain below 1.0.0 until the maintainer explicitly changes the "
+            "public-beta release gate"
+        )
     return value
 
 

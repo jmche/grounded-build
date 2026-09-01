@@ -95,9 +95,15 @@ def validate_public_release() -> None:
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", version):
         raise SystemExit(f"VERSION is not stable semantic versioning: {version!r}")
+    if int(version.split(".", 1)[0]) != 0:
+        raise SystemExit(
+            "VERSION must remain below 1.0.0 until the maintainer explicitly changes the "
+            "public-beta release gate"
+        )
     skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
     script = (ROOT / "scripts" / "plan_workflow.py").read_text(encoding="utf-8")
     checks = {
         "SKILL.md": f"version: {version}" in skill,
@@ -109,6 +115,8 @@ def validate_public_release() -> None:
     drift = [name for name, valid in checks.items() if not valid]
     if drift:
         raise SystemExit(f"release version {version} is not synchronized in: {', '.join(drift)}")
+    if "Major (`1.0.0`): prohibited by the release gate" not in contributing:
+        raise SystemExit("CONTRIBUTING.md does not preserve the explicit pre-1.0 release policy")
 
     first_release = re.search(r"^## \[([^]]+)] - (\d{4}-\d{2}-\d{2})$", changelog, re.MULTILINE)
     if not first_release or first_release.group(1) != version:

@@ -219,8 +219,12 @@ class PlanWorkflowTest(unittest.TestCase):
         draft_a_context = next((Path(initialized["run_directory"]) / "invocations" / "draft-A").glob("attempt_1_*/context"))
         self.assertEqual(
             sorted(item.name for item in draft_a_context.iterdir() if item.name != "schema.json"),
-            ["investigation.json", "request.md", "scope_contract.json"],
+            ["causal_analysis.md", "investigation.json", "request.md", "scope_contract.json"],
         )
+        causal = (draft_a_context / "causal_analysis.md").read_text(encoding="utf-8")
+        self.assertIn("canonical authority", causal)
+        self.assertIn("Deterministic", causal)
+        self.assertIn("Generative", causal)
         self.submit_candidate(initialized)
         for reviewer in ("A", "B"):
             self.call("final-review", "--project", str(self.project), "--run-id", initialized["run_id"], "--reviewer", reviewer)

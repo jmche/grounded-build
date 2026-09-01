@@ -46,6 +46,11 @@ the draft may cite it. Local repository evidence is primary. With
 the official GitHub repository. Each external record includes its URL, retrieval time, version/tag/commit,
 content digest, and supported claim. Search snippets are discovery aids only.
 
+Every planning stage receives `causal_analysis.md`. Use its universal production trace for material
+defects and responsibility disputes, then adapt evidence to deterministic, generative, external,
+human, or hybrid producers. This is one causal model with producer-aware verification, not a keyword
+gate that labels a repository as an "agent project." Keep the trace proportional for direct local work.
+
 Evidence states are `VERIFIED`, `STRONGLY_INFERRED`, `WEAKLY_INFERRED`, `UNRESOLVED`, and `REFUTED`.
 Priority lanes are `STOP_THE_LINE`, `MUST_RESOLVE`, `INVESTIGATE_IF_BUDGET`, and `RECORD_ONLY`.
 Rank only after the scope gate: user priority, severity, urgency, blockers/dependencies, causal leverage,

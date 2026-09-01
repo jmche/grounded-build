@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.6.0
+  version: 0.6.1
   compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude, Codex, or dsh CLI adapter
 ---
 
@@ -26,6 +26,12 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
 - Agreement is not evidence. Bind claims to files, symbols, tests, commands, or authoritative sources.
 - Freeze scope before investigation. Divergence may widen evidence, causal analysis, failure-path coverage,
   alternatives, and verification, but never the user-authorized objective.
+- Use [references/causal_analysis.md](references/causal_analysis.md) to trace authority, actual inputs,
+  responsible producers, consumer interpretation, and the earliest responsible decision. Apply it
+  proportionally; do not force a large causal model onto a direct, uncontested local edit.
+- Adapt evidence to deterministic, generative, external, human, or hybrid producers. Deterministic code
+  establishes machine facts; an authorized semantic reviewer establishes meaning. Never replace semantic
+  judgment with regexes, keywords, filenames, extension allowlists, or similarity thresholds.
 - Order work by scope gate, user priority, severity, urgency, blockers/dependencies, causal leverage,
   evidence strength, then effort. Do not promote or demote a finding without new evidence.
 - Authentication, overload, rate limit, timeout, adapter startup, or tool-host failure is infrastructure, not a quality FAIL and not a consumed quality attempt.
@@ -109,6 +115,9 @@ Every investigation finding must state its scope id, severity (`P0`–`P3`), urg
 priority lane, evidence status, problem, evidence ids, root-cause status and causal chain, affected surfaces,
 recommended solution, alternatives/tradeoffs, and verification. Keep unresolved claims visible. A bounded
 convergence run guarantees an honest terminal state or typed user decision—not consensus or correctness.
+For a material defect, the causal chain identifies the governing authority, actual production input,
+responsible producer, consumer interpretation, and earliest supported divergence; for a new capability,
+identify the earliest responsible authority and design boundary instead of inventing a root cause.
 The workflow computes stable `F-*` fingerprints from scope, problem, and causal chain; later rounds must
 dispose those ledger keys and must submit genuinely new findings in full solution form. Draft-time repository
 discoveries go into structured `new_evidence`; unrecorded observations cannot be cited. Integrators may propose
@@ -165,7 +174,9 @@ project `.venv` is expected not to appear in Git worktrees: the verifier reuses 
 original checkout. If it is absent, do not install dependencies or run `uv sync` without explicit user
 authority; follow the environment diagnostic in the implementation reference.
 
-Follow [references/implementation_workflow.md](references/implementation_workflow.md) exactly. Never treat the current host conversation as its own independent reviewer.
+Follow [references/implementation_workflow.md](references/implementation_workflow.md) exactly and apply
+[references/causal_analysis.md](references/causal_analysis.md) when responsibility or causality is material.
+Never treat the current host conversation as its own independent reviewer.
 
 ## Resume
 

@@ -83,6 +83,7 @@ no finite batch manifest, the host derives one and obtains confirmation before f
 |---|---:|---:|
 | Every reviewer sees one recorded Git snapshot | Not guaranteed | Yes |
 | Planning evidence is reviewed separately from agreement | Rarely | Yes |
+| Repairs target the earliest responsible production boundary | Inconsistent | Yes |
 | Review is bound to an exact implementation commit | Inconsistent | Yes |
 | Original checkout stays untouched during work | Not guaranteed | Yes |
 | Infrastructure failures stay separate from quality failures | Rarely | Yes |
@@ -137,6 +138,11 @@ frozen plan + batch manifest + Git SHA
 
 Plan and Implement use separate state roots. They never import or rewrite each other's runs.
 
+Across both workflows, Grounded Build traces the production chain from authority through actual input,
+producer output, consumer interpretation, and observed behavior. It uses reproducible checks for machine
+facts and independent semantic review for meaning, adapting the evidence to deterministic, generative,
+external, human, and hybrid producers without adding keyword-based project gates.
+
 ## Guarantees
 
 - The original checkout is not modified before explicit final integration.
@@ -181,7 +187,7 @@ deployments.
 
 ## Public beta status
 
-Version `v0.6.0` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
+Version `v0.6.1` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
 release gate are production-oriented, but broader provider and repository coverage is still needed
 before a general-availability claim.
 

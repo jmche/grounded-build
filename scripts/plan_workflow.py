@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex", "dsh")
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
@@ -39,6 +39,7 @@ DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 AUTO_PREFERENCE = ("claude", "dsh", "codex")
 TERMINAL_STATUSES = {"READY", "ABANDONED"}
 SKILL_ROOT = Path(__file__).resolve().parent.parent
+CAUSAL_ANALYSIS = SKILL_ROOT / "references" / "causal_analysis.md"
 
 #: Codex's tool policy for a planning invocation, expressed as command-line overrides.
 #:
@@ -761,6 +762,7 @@ def engine_contract() -> dict[str, Any]:
         "plan_workflow.py": Path(__file__).resolve(),
         "SKILL.md": SKILL_ROOT / "SKILL.md",
         "planning_workflow.md": SKILL_ROOT / "references" / "planning_workflow.md",
+        "causal_analysis.md": CAUSAL_ANALYSIS,
     }
     return {
         "software_version": VERSION,
@@ -2358,7 +2360,9 @@ def command_investigate(args: argparse.Namespace) -> None:
     prompt = (
         "You are independent evidence investigator {slot}. Read {context}/request.md and "
         "{context}/scope_contract.json, then inspect the complete relevant repository surface at baseline {sha}. "
-        "Do not draft or edit the solution yet. Establish what is true. Every claim and finding must map to a scope id "
+        "Do not draft or edit the solution yet. Read {context}/causal_analysis.md and establish what is true. "
+        "Use its proportional production trace and producer-aware evidence model; do not infer system shape from keywords. "
+        "Every claim and finding must map to a scope id "
         "matching exactly TARGET-001, REQUIRED_SUPPORT-NNN, EVIDENCE_ONLY-NNN, PROPOSED_EXTENSION-NNN, or OUT_OF_SCOPE-NNN "
         "(NNN is at least three digits; a bare class name is invalid). "
         "anything outside the frozen objective is OUT_OF_SCOPE or a PROPOSED_EXTENSION and must not enter the plan. "
@@ -2372,7 +2376,8 @@ def command_investigate(args: argparse.Namespace) -> None:
     payload = invoke(
         state, f"investigate-{slot}", provider, slot,
         {"request.md": Path(state["request_snapshot"]),
-         "scope_contract.json": Path(state["scope_contract"])},
+         "scope_contract.json": Path(state["scope_contract"]),
+         "causal_analysis.md": CAUSAL_ANALYSIS},
         INVESTIGATION_SCHEMA, prompt, args.timeout, args.dry_run,
         validator=lambda value: validate_investigation(value, state, slot),
     )
@@ -2401,7 +2406,8 @@ def command_draft(args: argparse.Namespace) -> None:
     provider = assignment_provider(state, f"draft-{slot}", state["planners"][slot])
     prompt = (
         "You are independent planning instance {slot}. Read {context}/request.md, {context}/scope_contract.json, "
-        "and only your own independently produced {context}/investigation.json. You cannot see the other planner's work. "
+        "{context}/causal_analysis.md, and only your own independently produced {context}/investigation.json. "
+        "You cannot see the other planner's work. "
         "Re-check repository facts before planning. If that check discovers evidence absent from investigation.json, "
         "record it in new_evidence with a valid suffixed scope id and cite it from evidence_ids; never cite an unrecorded "
         "observation. Use evidence ids and preserve uncertainty. Produce a detailed "
@@ -2416,6 +2422,7 @@ def command_draft(args: argparse.Namespace) -> None:
         state, f"draft-{slot}", provider, slot,
         {"request.md": Path(state["request_snapshot"]),
          "scope_contract.json": Path(state["scope_contract"]),
+         "causal_analysis.md": CAUSAL_ANALYSIS,
          "investigation.json": Path(state["investigations"][slot]["path"])},
         DRAFT_SCHEMA, prompt, args.timeout, args.dry_run,
         validator=lambda value: validate_draft(value, state, slot),
@@ -2452,7 +2459,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
     target = f"draft-{target_slot}"
     prompt = (
         "You are independent reviewer and integrator slot {slot}, producing draft_02. Read {context}/request.md, "
-        "{context}/scope_contract.json, {context}/finding_ledger.json, your own investigation and draft, and the other planner's "
+        "{context}/scope_contract.json, {context}/causal_analysis.md, {context}/finding_ledger.json, your own investigation and draft, and the other planner's "
         "plan at {context}/target_plan.md, and its claims at {context}/target_claims.json (the same "
         "draft, split so the plan is readable prose rather than one escaped JSON string). Read the "
         "plan IN FULL, in parts if your reader truncates it, before judging it. Then inspect the "
@@ -2473,6 +2480,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
+        "causal_analysis.md": CAUSAL_ANALYSIS,
         "finding_ledger.json": barrier_ledger,
         "own_investigation.json": Path(state["investigations"][slot]["path"]),
         "peer_investigation.json": Path(state["investigations"][target_slot]["path"]),
@@ -2528,7 +2536,7 @@ def command_diverge(args: argparse.Namespace) -> None:
     target = "draft-02-both"
     prompt = (
         "You are independent deep-planning slot {slot}, producing divergent draft_03. Read the frozen request, "
-        "scope contract, stable finding ledger, both investigations, and both draft_02 plans. Re-check repository evidence before accepting "
+        "scope contract, causal analysis protocol, stable finding ledger, both investigations, and both draft_02 plans. Re-check repository evidence before accepting "
         "a claim. Mine only in-scope omissions: deeper causal chains, failure paths, required support, alternatives, "
         "and verification. Novelty without a scope id or evidentiary effect must be rejected. Do not broaden the user "
         "objective. Preserve priority order and explicitly disposition stable F-* ledger keys; return a genuinely new "
@@ -2541,6 +2549,7 @@ def command_diverge(args: argparse.Namespace) -> None:
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
+        "causal_analysis.md": CAUSAL_ANALYSIS,
         "finding_ledger.json": barrier_ledger,
         "investigation_A.json": Path(state["investigations"]["A"]["path"]),
         "investigation_B.json": Path(state["investigations"]["B"]["path"]),
@@ -2578,7 +2587,7 @@ def command_synthesis_context(args: argparse.Namespace) -> None:
     assignment.write_text(
         "# Host synthesis assignment\n\n"
         f"Baseline: `{state['baseline_sha']}`\n\n"
-        "Read the frozen request, scope contract, both investigations, every completed draft round, and reviews. Resolve claims by "
+        "Read the frozen request, scope contract, causal analysis protocol, both investigations, every completed draft round, and reviews. Resolve claims by "
         "repository evidence rather than vote count. Preserve material disagreements and unresolved product "
         "choices. Scope-lock every item to the frozen objective, preserve priority order, and record each material "
         "finding as problem, evidence, root cause, affected surfaces, solution/tradeoffs, and verification. Produce "
@@ -2595,6 +2604,7 @@ def command_synthesis_context(args: argparse.Namespace) -> None:
         "request": state["request_snapshot"],
         "scope_contract": state["scope_contract"],
         "finding_ledger": state["finding_ledger_path"],
+        "causal_analysis": str(CAUSAL_ANALYSIS),
         "investigations": {key: value["path"] for key, value in state["investigations"].items()},
         "drafts": {key: value["path"] for key, value in state["drafts"].items()},
         "draft_rounds": state["draft_rounds"],
@@ -2688,7 +2698,7 @@ def command_convergence_review(args: argparse.Namespace) -> None:
     target = f"candidate-round-{state['candidate']['round']}"
     prompt = (
         "You are convergence reviewer ({slot}), round one of exactly two bounded convergence rounds. Read "
-        "{context}/request.md, the scope contract, synthesized plan, batches, and finding evidence. Inspect the repository at "
+        "{context}/request.md, {context}/causal_analysis.md, the scope contract, synthesized plan, batches, and finding evidence. Inspect the repository at "
         "baseline {sha}. This is not a novelty round: reject new objectives. A new finding is admissible only when "
         "it is in scope, materially affects correctness/safety/verification, cites evidence, and states root cause or "
         "honest uncertainty. Check that high-priority findings have dispositions and that priority changes are "
@@ -2701,6 +2711,7 @@ def command_convergence_review(args: argparse.Namespace) -> None:
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
+        "causal_analysis.md": CAUSAL_ANALYSIS,
         "finding_ledger.json": Path(state["finding_ledger_path"]),
         "implementation_plan.md": Path(state["candidate"]["plan"]),
         "batches.md": Path(state["candidate"]["batch_manifest"]),
@@ -2750,7 +2761,7 @@ def command_final_review(args: argparse.Namespace) -> None:
     target = f"candidate-round-{state['candidate']['round']}"
     prompt = (
         "You are a fresh final planning reviewer ({slot}). Read {context}/request.md, "
-        "{context}/implementation_plan.md, and {context}/batches.md. Inspect the repository at baseline {sha}. "
+        "{context}/implementation_plan.md, {context}/batches.md, and {context}/causal_analysis.md. Inspect the repository at baseline {sha}. "
         "Judge factual correctness, full request coverage, dependency order, budget bounds, batch scope, and "
         "whether every exit condition names a finite observation. The plan may choose between drafts only when "
         "the choice is supported by evidence; do not demand excluded work without identifying a request conflict. "
@@ -2763,6 +2774,7 @@ def command_final_review(args: argparse.Namespace) -> None:
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
+        "causal_analysis.md": CAUSAL_ANALYSIS,
         "finding_ledger.json": Path(state["finding_ledger_path"]),
         "implementation_plan.md": Path(state["candidate"]["plan"]),
         "batches.md": Path(state["candidate"]["batch_manifest"]),

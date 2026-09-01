@@ -2,6 +2,13 @@
 
 Execute a user-provided implementation plan without changing the original project until final integration. The current host coding agent implements and fixes the plan in an isolated worktree. A selected `claude`, `codex`, or `dsh` CLI reviews each fixed commit in a second isolated worktree. The reviewer may use the same agent family as the host; independence means a fresh process, isolated context, separate worktree, restricted authority, and audited output—not necessarily a different vendor or model.
 
+Read `references/causal_analysis.md` before implementing a defect, failed repair, cross-layer
+mismatch, or change with an unclear responsibility boundary. Apply its production trace
+proportionally to every project; producer-aware evidence is not an agent-project-only mode.
+Identify the earliest responsible production boundary and adapt verification to deterministic,
+generative, external, human, or hybrid producers. Keep machine facts in deterministic checks and
+semantic meaning with an authorized semantic reviewer.
+
 Use the bundled script for Git, worktrees, state, fixed-SHA review dispatch, and integration. The host agent owns plan interpretation, implementation, tests, and semantic repair.
 
 ## Choose and preserve the controller interpreter
@@ -242,13 +249,18 @@ Migration preserves a mode-0600 backup of the prior state, records its digest, l
 For the next pending batch:
 
 1. Read that batch from the plan snapshot.
-2. Inspect governing repository instructions and all affected producers, consumers, failure paths, recovery paths, and compatibility paths.
+2. Inspect governing repository instructions and all affected producers, consumers, failure paths, recovery paths, and compatibility paths. For a material defect, trace authority, actual production input, responsible producer, consumer interpretation, and the earliest supported divergence. For a direct local edit, keep this trace correspondingly small.
 3. Implement only that batch in `implementation_worktree`.
 4. Add focused tests and run required verification there.
 5. Commit all intended changes and leave the implementation worktree clean.
 6. Request review.
 
 Use small logical commits. The reviewer evaluates the cumulative batch range from the prior accepted SHA through the current implementation HEAD.
+
+Do not add a validator, resolver, semantic check, fallback, retry, or rejection merely because a
+downstream output varies. First establish the production failure, producer and actual inputs,
+machine-versus-semantic boundary, repair path, valid counterexamples, and a production-shaped
+recovery test. A root repair should still prevent the mismatch if the downstream mechanism vanished.
 
 ## Run an independent review
 
