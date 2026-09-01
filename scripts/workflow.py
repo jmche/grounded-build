@@ -977,6 +977,8 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
         }])
         prior_migration = state.get("migration")
         migration_history = state.setdefault("migration_history", [])
+        if not isinstance(migration_history, list):
+            raise WorkflowError("legacy migration_history must be a list")
         if (
             isinstance(prior_migration, dict)
             and prior_migration.get("status") == "APPLIED"
@@ -1042,13 +1044,18 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def snapshot_review_contract(run_root: Path) -> dict[str, dict[str, str]]:
+def snapshot_review_contract(
+    run_root: Path, *, create_missing_parent: bool = False,
+) -> dict[str, dict[str, str]]:
     """Freeze the installed reviewer semantics for one implementation run."""
     contracts_root = run_root / "contracts"
     try:
         contracts_metadata = contracts_root.lstat()
     except FileNotFoundError as exc:
-        raise WorkflowError(f"reviewer contract parent is missing: {contracts_root}") from exc
+        if not create_missing_parent:
+            raise WorkflowError(f"reviewer contract parent is missing: {contracts_root}") from exc
+        secure_directory(contracts_root)
+        contracts_metadata = contracts_root.lstat()
     if contracts_root.is_symlink() or not stat.S_ISDIR(contracts_metadata.st_mode):
         raise WorkflowError(f"reviewer contract parent must be a real directory: {contracts_root}")
     contract_root = run_root / "contracts" / "review_contract"
@@ -4297,8 +4304,8 @@ def command_migrate(args: argparse.Namespace) -> None:
         "plan_snapshot_digest": state.get("plan_snapshot_digest"),
         "pending_decision_repair": decision_repair,
         "environment_fingerprint_migration": (
-            isinstance(state.get("environment_contract"), dict)
-            and state["environment_contract"].get("fingerprint_version")
+            not isinstance(state.get("environment_contract"), dict)
+            or state["environment_contract"].get("fingerprint_version")
             != ENVIRONMENT_FINGERPRINT_VERSION
         ),
         "review_contract_migration": schema_pending,
@@ -4313,7 +4320,7 @@ def command_migrate(args: argparse.Namespace) -> None:
     if schema_pending:
         path = state_path(project, state["run_id"])
         backup = path.with_name(f"workflow.schema{migration.get('from_schema', 'legacy')}.json")
-        if backup.exists():
+        if backup.exists() or backup.is_symlink():
             if (
                 backup.is_symlink()
                 or not stat.S_ISREG(backup.lstat().st_mode)
@@ -4332,9 +4339,13 @@ def command_migrate(args: argparse.Namespace) -> None:
             "backup_path": str(backup), "backup_sha256": sha256_file(backup),
         }
         append_event(state, "SCHEMA_MIGRATED", state["migration"])
-        state["review_contract"] = snapshot_review_contract(Path(state["run_directory"]))
+        previous_review_contract = copy.deepcopy(state.get("review_contract"))
+        state["review_contract"] = snapshot_review_contract(
+            Path(state["run_directory"]), create_missing_parent=True,
+        )
         append_event(state, "REVIEW_CONTRACT_MIGRATED", {
             "basis": "MIGRATION_TIME_INSTALLED_TEMPLATES",
+            "previous_review_contract": previous_review_contract,
             "review_contract": state["review_contract"],
         })
         old_environment = state.get("environment_contract")

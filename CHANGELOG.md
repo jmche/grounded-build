@@ -18,6 +18,8 @@ All notable changes use semantic versioning.
   installed review semantics.
 - Preserved sequential migration history while deriving every backup from the run's actual loaded
   schema, preventing an earlier schema-6 backup from blocking a later schema-7-to-8 transition.
+- Hardened migration previews and recovery around null fingerprints, missing legacy contract
+  directories, malformed history, dangling backup symlinks, and prior reviewer-contract audit data.
 
 ## [0.6.0] - 2026-09-01
 

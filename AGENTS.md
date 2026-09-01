@@ -44,8 +44,9 @@ Not documented (generated or transient): `.omc/`, `.pytest_cache/`, `.ipynb_chec
 - **Runtime state lives outside this repository.** Planning writes to `~/.grounded-build/planning/`
   (override: `GROUNDED_BUILD_PLAN_HOME`), implementation to `~/.grounded-build/implementation/`
   (override: `GROUNDED_BUILD_IMPLEMENT_HOME`). Never create run state inside the skill directory.
-- **Editing `scripts/plan_workflow.py`, `SKILL.md`, or `references/planning_workflow.md` invalidates
-  in-flight planning runs.** `engine_contract()` hashes exactly those three files; a run whose hashes
+- **Editing `scripts/plan_workflow.py`, `SKILL.md`, `references/planning_workflow.md`, or
+  `references/causal_analysis.md` invalidates in-flight planning runs.** `engine_contract()` hashes
+  those four files; a run whose hashes
   changed rejects ordinary commands as engine drift. The only sanctioned recovery is
   `migrate-engine --reason … --actor … --apply` — never edit run state to bypass it.
 - **The version must be changed in five places at once**: `VERSION`, `SKILL.md`

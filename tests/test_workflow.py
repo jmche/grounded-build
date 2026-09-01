@@ -5,6 +5,7 @@ import json
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1627,6 +1628,39 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(current["migration_history"][0]["from_schema"], 6)
         self.assertEqual(old_backup.read_text(encoding="utf-8"), "older schema backup\n")
 
+    def test_legacy_migration_recreates_missing_contracts_parent(self) -> None:
+        initialized = self.initialize_raw("codex")
+        run_root = Path(str(initialized["run_directory"]))
+        state_path = run_root / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.pop("review_contract")
+        state["environment_contract"] = None
+        self.write_authenticated_legacy_state(state_path, state, 7)
+        shutil.rmtree(run_root / "contracts")
+        preview = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertTrue(preview["environment_fingerprint_migration"])
+        migrated = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply",
+        )
+        self.assertEqual(migrated["status"], "MIGRATED")
+        current = json.loads(state_path.read_text(encoding="utf-8"))
+        WORKFLOW_MODULE.validate_review_contract(current)
+
+    def test_invalid_legacy_migration_history_fails_as_workflow_error(self) -> None:
+        initialized = self.initialize_raw("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["migration_history"] = {"invalid": True}
+        self.write_authenticated_legacy_state(state_path, state, 7)
+        refused = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            expected=1,
+        )
+        self.assertIn("migration_history must be a list", str(refused["error"]))
+
     def test_schema6_environment_fingerprint_requires_explicit_rebase(self) -> None:
         initialized = self.initialize("codex")
         state_path = Path(str(initialized["run_directory"])) / "workflow.json"
@@ -1710,6 +1744,21 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--apply", expected=1,
         )
         self.assertIn("backup exists but does not match", str(refused["error"]))
+
+    def test_migration_refuses_a_dangling_symlinked_backup(self) -> None:
+        initialized = self.initialize("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text())
+        self.write_authenticated_legacy_state(state_path, state, 4)
+        backup = state_path.with_name("workflow.schema4.json")
+        target = self.root / "must-not-be-created.json"
+        os.symlink(target, backup)
+        refused = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply", expected=1,
+        )
+        self.assertIn("backup exists but does not match", str(refused["error"]))
+        self.assertFalse(target.exists())
 
     def test_event_tampering_is_detected(self) -> None:
         initialized = self.initialize("codex")

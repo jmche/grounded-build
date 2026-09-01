@@ -21,8 +21,8 @@ cross.
 ## For AI Agents
 
 ### Working In This Directory
-- **`plan_workflow.py` is hashed into every planning run's engine contract** (with `SKILL.md` and
-  `references/planning_workflow.md`). Any edit makes live runs reject commands as drift; recovery is
+- **`plan_workflow.py` is hashed into every planning run's engine contract** (with `SKILL.md`,
+  `references/planning_workflow.md`, and `references/causal_analysis.md`). Any edit makes live runs reject commands as drift; recovery is
   `migrate-engine`, never state editing.
 - `release_check.py` regex-asserts `^VERSION = "<VERSION file>"$` in `plan_workflow.py`. Keep that
   literal on its own line.
