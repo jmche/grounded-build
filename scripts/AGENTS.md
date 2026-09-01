@@ -13,9 +13,10 @@ cross.
 ## Key Files
 | File | Description |
 |------|-------------|
-| `plan_workflow.py` | Planning engine (~3.2k lines, `VERSION = "0.5.0"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
+| `plan_workflow.py` | Planning engine (~3.2k lines, `VERSION = "0.6.0"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
 | `workflow.py` | Implementation engine (`SCHEMA_VERSION = 7`). Concurrent run discovery, worktree isolation, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
 | `release_check.py` | No-network release gate: validates `evals/evals.json` shape, required public-release files, LICENSE/SECURITY content, cross-file version synchronization, and the English-only rule; then compiles both engines and runs the unit suites. Optional `--quick-validator <path>` chains an external skill validator. |
+| `package_release.py` | Deterministic standard-library packager for versioned `.tar.gz` release archives and SHA-256 checksum files. |
 
 ## For AI Agents
 

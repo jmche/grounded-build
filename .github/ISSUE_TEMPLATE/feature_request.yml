@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a new workflow capability or compatibility target.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the observable limitation, not only the preferred implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: authority
+    attributes:
+      label: Authority and safety boundary
+      description: Explain who authorizes the action and what must remain impossible.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Expected observable outcome
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include existing commands, typed decisions, or configuration that were insufficient.

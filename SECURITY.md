@@ -2,6 +2,13 @@
 
 Grounded Build is a local workflow for a trusted operating-system account. The repository and spawned planning/review processes are treated as untrusted; the account owner, installed skill code, provider CLI binaries, and provider credential mechanism are trusted.
 
+## Supported versions
+
+| Version | Security support |
+|---|---|
+| 0.6.x | Supported public beta |
+| 0.5.x and earlier | Upgrade required unless an advisory says otherwise |
+
 ## Enforced boundaries
 
 - Planning agents receive a read-only fixed-SHA worktree and a stage-specific context through an allowlist bubblewrap namespace.
@@ -28,4 +35,11 @@ The workflow cannot defend itself from the same trusted OS account deliberately 
 
 ## Reporting
 
-Use GitHub's private vulnerability reporting for this repository when it is enabled. If it is unavailable, open a public issue containing no sensitive details and ask the maintainers for a private reporting channel. Never attach credentials, private source, or complete workflow logs to a public issue.
+Use GitHub's private vulnerability reporting for this repository when it is enabled. Include the affected
+version, trust boundary, minimal reproduction, and impact. If private reporting is unavailable, open a public
+issue containing no vulnerability details and ask the maintainers to establish a private channel.
+
+Never attach credentials, private source, complete prompts, centralized run state, or raw workflow logs to a
+public issue. Maintainers should acknowledge valid private reports before public discussion and coordinate
+disclosure after a fix or documented mitigation is available; no fixed response-time promise is made during
+the public beta.

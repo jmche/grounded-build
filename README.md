@@ -1,91 +1,185 @@
 # Grounded Build
 
-Grounded Build is a local coding-agent skill with two independent modes:
+Grounded Build is a local coding-agent skill for evidence-backed planning and reviewed implementation.
+It keeps agent agreement separate from evidence, freezes every run at an exact Git commit, and makes
+workflow state—not conversation memory—the authority for the next action.
 
-1. **Plan:** two isolated Claude/Codex instances investigate the same Git snapshot independently before
-   drafting, integrate each other's evidence without widening scope, and converge on a host-synthesized plan.
-2. **Implement:** execute approved plans concurrently in run-owned Git worktrees with fixed-SHA review, bounded repair, environment drift detection, PR-style reconciliation, and explicit final integration.
+Version `v0.6.0` is a public beta. The state machines and release gate are production-oriented, but the
+project intentionally does not claim general availability until it has broader provider and repository
+coverage in real-world use.
 
-Version `v0.5.0` is a developer preview. Linux, Git, Python 3.11+, bubblewrap, and at least one of the `claude`, `codex`, or `dsh` CLI adapters are required.
+## Why Grounded Build
 
-The sandbox is exercised with Claude Code 2.1.238 and Codex CLI 0.149.0. Codex is treated as an adapter: its configured model may be GPT, DeepSeek through an OpenAI-compatible gateway, or another model. The run freezes and reports the non-secret model identity separately from the adapter.
+Large coding tasks fail in predictable ways: agents inspect different repository states, reviewers approve
+moving branches, implementation begins before scope is settled, and infrastructure failures are mistaken
+for code defects. Grounded Build addresses those failure modes with two independent workflows:
+
+- **Plan** — two isolated planning slots investigate one frozen Git snapshot, draft independently,
+  cross-review evidence, and review a host-synthesized implementation plan.
+- **Implement** — the current host executes an approved plan in a run-owned worktree while a fresh CLI
+  reviewer evaluates exact commit SHAs through a bounded review and verification loop.
+
+The workflows use separate state roots and never import or rewrite each other's runs.
+
+## Guarantees
+
+- The original checkout is not modified before explicit final integration.
+- Planning and review operate on exact, recorded Git SHAs rather than moving branch names.
+- Same-round planning slots receive frozen inputs and run concurrently.
+- Provider failures, timeouts, malformed output, and missing environments are infrastructure outcomes,
+  not automatic code-quality failures.
+- Typed user decisions stop the state machine when product authority is required.
+- Planning state is authenticated; implementation state has an append-only event chain and checkpoint.
+- Verification uses a read-only worktree, private HOME/TMP, minimal environment, bounded resources, and
+  an explicit network policy.
+
+These controls do not create an adversarial boundary against the operating-system account that installed
+the skill. Read [SECURITY.md](SECURITY.md) before using it with sensitive repositories.
+
+## Compatibility
+
+| Component | Supported | Notes |
+|---|---:|---|
+| Linux | Yes | Bubblewrap and Linux namespaces are required. |
+| Python | 3.11–3.13 | Runtime uses only the standard library. |
+| Git | Yes | Worktrees and atomic ref updates are core primitives. |
+| Claude CLI | Plan + Implement reviewer | Tested through a restricted fresh process. |
+| Codex CLI | Plan + Implement reviewer | Adapter identity is separate from configured model identity. |
+| dsh | Plan only | Uses the model selected by the local harness; not an Implement reviewer. |
+| macOS / Windows | No | No silent fallback to a weaker sandbox is provided. |
+
+At least one supported provider CLI must already be installed and authenticated. Grounded Build never
+installs provider CLIs, project dependencies, or interpreters on the user's behalf.
 
 ## Install
 
-Place this directory at:
+After cloning this repository, choose one installation style.
 
-```text
-~/.agents/skills/grounded-build/
-```
-
-The host discovers usage from `SKILL.md`. Runtime history is stored outside the skill:
-
-```text
-~/.grounded-build/
-├── planning/
-└── implementation/
-```
-
-## Example
-
-```text
-Use $grounded-build to create a repository-grounded plan for this change.
-Use Claude and Codex as isolated planners, have them cross-review each other,
-use Codex for final review, and stop before implementation.
-```
-
-Use `--planning-depth deep` when the risk justifies an additional `draft_03` divergence round and two
-bounded convergence reviews. Use `--research-policy authoritative-web` only when official upstream evidence
-may be needed; local-only is the default.
-
-If only one provider is available:
-
-```text
-Use $grounded-build with two isolated Claude instances. They must draft
-independently, review each other, and both review the synthesized plan.
-```
-
-An existing plan can go directly to Implement mode without paying for planning again.
-
-## Implementation runtime notes
-
-Invoke `scripts/workflow.py` with one stable, absolute CPython 3.11+ path for the lifetime of a run.
-Preflight reports the exact controller identity and initialization freezes it, preventing a later shell
-from silently selecting a different `python3` through PATH.
-
-Project `.venv` directories are normally ignored and therefore do not follow Git worktrees. Fixed-SHA
-verification deliberately reuses `<project>/.venv` read-only while keeping the reviewed worktree as cwd.
-Each implementation run statically fingerprints that shared environment without launching its Python
-interpreter, executing `.pth` startup code, or following symlinks outside `.venv`. Bounded metadata
-checks protect ordinary commands from repeated full scans; full package contents are checked immediately
-before and after evidence-producing verification. Drift is infrastructure and never silently becomes review evidence.
-If it is absent, preflight reports whether uv metadata and the uv executable are available, but Grounded
-Build does not install dependencies automatically. Provisioning remains an explicit operator action so
-network access, lockfile selection, and executed build hooks cannot be hidden inside verification.
-
-## Coexistence with implement-plan-with-review
-
-This skill does not replace or migrate the existing `implement-plan-with-review` installation. Generic requests to implement an existing plan should continue using that skill. Select `grounded-build` when independently generating or auditing the plan, when handing off a plan produced by this skill, or when the user names it explicitly. The two skills use different environment variables and state roots; old runs are never imported automatically.
-
-## Test
+For development, link the checkout so updates are immediately visible:
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 -m py_compile scripts/plan_workflow.py scripts/workflow.py
-python3 scripts/release_check.py \
-  --quick-validator ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py
+mkdir -p "$HOME/.agents/skills"
+ln -s "$(pwd)" "$HOME/.agents/skills/grounded-build"
 ```
 
-The planning workflow uses fake local agent adapters in tests; no paid model calls are made by the unit suite.
+For a versioned GitHub release, extract the archive into the skill directory:
 
-Run `plan_workflow.py next` after every planning action. Same-round A/B work is returned as a `RUN_AGENT_BATCH`; launch all listed commands concurrently and wait at the barrier. Other states return one legal action. This keeps orchestration independent of host memory while preventing accidental serialization and asymmetric round inputs.
+```bash
+mkdir -p "$HOME/.agents/skills"
+tar -xzf grounded-build-v0.6.0.tar.gz -C "$HOME/.agents/skills"
+```
 
-Planning uses Opus and `gpt-5.6-sol` by default. Implementation uses the current host unchanged and defaults only the isolated reviewer to Opus or `gpt-5.6-sol`. Every default can be overridden explicitly, including `cli-default` to defer to a CLI configuration.
+The archive contains one top-level `grounded-build/` directory. Verify the adjacent checksum first:
 
-## Security
+```bash
+sha256sum --check grounded-build-v0.6.0.tar.gz.sha256
+```
 
-Read [SECURITY.md](SECURITY.md) for the trust model, enforced filesystem boundaries, network-policy
-limitations, and private vulnerability-reporting guidance.
+If the destination already exists, move it aside deliberately before installing. Do not overlay two
+versions: in-flight planning runs detect engine drift and require an audited `migrate-engine` decision.
+
+## Quick start
+
+### Create a plan
+
+Ask the host explicitly to use the skill:
+
+```text
+Use $grounded-build to create a repository-grounded implementation plan for this change.
+Use two isolated planners, require evidence-backed cross-review, and stop before implementation.
+```
+
+Use deep planning only when the risk justifies the additional paid calls:
+
+```text
+Use $grounded-build in deep planning mode for this security-sensitive refactor.
+Allow authoritative upstream documentation during investigation, but do not widen scope.
+```
+
+### Implement an approved plan
+
+```text
+Use $grounded-build to implement this approved plan and batch manifest.
+Keep the original checkout untouched until I approve final integration.
+```
+
+An existing plan can enter Implement directly; it does not need to pay for Plan again. If the plan has no
+batch manifest, the host derives a finite manifest and obtains confirmation before freezing it.
+
+### Resume safely
+
+```text
+Resume grounded-build run <run-id>. Determine which workflow owns it, follow the recorded next action,
+and do not initialize a replacement.
+```
+
+Planning state is stored under `~/.grounded-build/planning/`; implementation state is stored under
+`~/.grounded-build/implementation/`. Both roots can be overridden for tests and controlled deployments.
+
+## Operational model
+
+```text
+Plan
+  frozen request + Git SHA
+    -> independent investigations
+    -> independent drafts
+    -> mutual evidence review
+    -> host synthesis
+    -> independent final review
+    -> explicit implementation approval
+
+Implement
+  frozen plan + batch manifest + Git SHA
+    -> acceptance-contract review
+    -> implementation commit
+    -> fixed-SHA review / verification / bounded repair
+    -> reviewed reconciliation when the target advanced
+    -> explicit final integration
+```
+
+The authoritative host contract is [SKILL.md](SKILL.md). Detailed recovery and state semantics live in
+[references/planning_workflow.md](references/planning_workflow.md) and
+[references/implementation_workflow.md](references/implementation_workflow.md).
+
+## Runtime notes
+
+Use one stable, absolute CPython 3.11+ executable for every `workflow.py` command in an implementation
+run. Preflight reports the controller identity and initialization freezes it.
+
+Git-ignored `.venv` directories do not follow worktrees. Fixed-SHA verification reuses the original
+project's `.venv` read-only while keeping the reviewed worktree as the current directory. Environment
+fingerprinting is static and content-sensitive; it never executes `.pth` startup hooks. Grounded Build
+does not run `uv sync` or install missing dependencies implicitly.
+
+Provider CLIs require network access. Planning's `authoritative-web` option controls native research tools
+and evidence policy; it is not a hard egress boundary. Use host-level network controls when required.
+
+## Development
+
+From a source checkout, the complete deterministic gate uses fake provider adapters and makes no paid
+model calls:
+
+```bash
+python3 scripts/release_check.py
+```
+
+Focused commands are available for development:
+
+```bash
+python3 -m py_compile scripts/plan_workflow.py scripts/workflow.py scripts/package_release.py
+python3 -m unittest discover -s tests -v
+python3 scripts/package_release.py --output-dir dist
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for compatibility and pull-request requirements. Behavioral
+evaluation prompts are tracked in [evals/evals.json](evals/evals.json).
+
+## Support and security
+
+- Usage and compatibility: [SUPPORT.md](SUPPORT.md)
+- Vulnerability reporting and trust model: [SECURITY.md](SECURITY.md)
+- Release history: [CHANGELOG.md](CHANGELOG.md)
+- Contributor expectations: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
 ## License
 

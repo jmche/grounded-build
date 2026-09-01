@@ -2,6 +2,24 @@
 
 All notable changes use semantic versioning.
 
+## [0.6.0] - 2026-09-01
+
+- Reopened every re-reported P0 finding as blocking even when an earlier P1 observation had been
+  deferred, and added an end-to-end regression proving that the superseded PASS cannot authorize
+  batch acceptance.
+- Normalized project-relative `.venv` launcher paths and prevented both literal and symlink-disguised
+  host-root mounts in the verification sandbox.
+- Bound convergence and final planning reviews to the exact synthesized candidate digest, rejected
+  late results from superseded candidates, and gave convergence-boundary decisions a real recovery path.
+- Added a deterministic versioned archive with normalized metadata, a SHA-256 checksum, and a
+  tag-gated GitHub release workflow.
+- Reworked the public README around guarantees, compatibility, installation, quick starts, operations,
+  and explicit beta limitations.
+- Added contribution, support, conduct, issue, pull-request, and dependency-update policies; expanded
+  the deterministic release gate to verify the public surface and packaging contract.
+- Expanded CI across CPython 3.11, 3.12, and 3.13 while preserving the zero-paid-call fake-adapter suite.
+- Pinned every GitHub Action to a full commit SHA and configured monthly reviewed update proposals.
+
 ## [0.5.0] - 2026-08-31
 
 - Added concurrent implementation runs from one frozen baseline, with explicit run selection when more than one run is active.

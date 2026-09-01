@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible workflow, sandbox, state, or compatibility defect.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private source, raw provider logs, or security-sensitive details.
+  - type: input
+    id: version
+    attributes:
+      label: Grounded Build version
+      placeholder: 0.6.0
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, Python, Git, bubblewrap, and provider CLI versions.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Workflow mode
+      options:
+        - Plan
+        - Implement
+        - Installation or release
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use a public or synthetic repository when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed result
+      description: Include the emitted status, exit classification, and redacted error.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: This report contains no credentials, private source, raw logs, or undisclosed vulnerability details.
+          required: true
