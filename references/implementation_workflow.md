@@ -22,7 +22,8 @@ Collect or infer:
 
 - `plan`: an existing local plan file, resolved to an absolute path.
 - `batch_manifest`: a host-authored file that explicitly declares this run's included and excluded total scope and maps every batch ID to plan work. This is execution authority, not reviewer output.
-- `reviewer`: exactly `claude` or `codex`; it may match the host/implementer.
+- `reviewer`: exactly `claude` or `codex`; it may match the host/implementer. The `dsh` adapter is
+  currently a planning backend only and is not accepted by the Implement workflow.
 - `reviewer_runtime`: the non-secret model identity frozen at initialization. Claude defaults to Opus and
   Codex defaults to `gpt-5.6-sol`; optional `--claude-model`, `--codex-model`,
   `--codex-model-provider`, and `--codex-profile` select GPT, an
@@ -361,8 +362,8 @@ variables. stdout/stderr are size-limited, mode 0600, hashed, and copied with th
 into the next reviewer context.
 
 Git-ignored environments do not appear in implementation, reviewer, or verification worktrees. This
-is expected, not missing source. For a command whose executable begins `.venv/`, the verifier resolves
-the launcher from `<project>/.venv`, mounts that environment and its interpreter chain read-only, and
+is expected, not missing source. For a project-relative command whose executable normalizes beneath
+`.venv/`, the verifier resolves the launcher from `<project>/.venv`, mounts that environment and its interpreter chain read-only, and
 runs it with the fixed-SHA worktree as the current directory. A reviewer manually entering its detached
 worktree therefore cannot rerun `.venv/bin/python ...` directly and must not classify that absence as a
 code failure; use the harness evidence instead.

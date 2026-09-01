@@ -610,9 +610,27 @@ def save_parallel_stage(state: dict[str, Any], stage: str) -> None:
     project = Path(state["project"])
     with run_lock(project, state["run_id"]):
         latest = load_state(project, state["run_id"])
-        for field in ("investigations", "drafts", "cross_reviews", "convergence_reviews",
-                      "final_reviews", "finding_aliases"):
+        candidate_bound_field = {
+            "convergence-review": "convergence_reviews",
+            "final-review": "final_reviews",
+        }.get(stage)
+        if candidate_bound_field:
+            current_digest = (latest.get("candidate") or {}).get("plan_sha256")
+            incoming = state.get(candidate_bound_field, {})
+            stale_slots = sorted(
+                slot for slot, record in incoming.items()
+                if record.get("candidate_sha256") != current_digest
+            )
+            if stale_slots:
+                raise WorkflowError(
+                    f"stale {stage} result for a superseded candidate: {','.join(stale_slots)}"
+                )
+        for field in ("investigations", "drafts", "cross_reviews", "finding_aliases"):
             latest.setdefault(field, {}).update(state.get(field, {}))
+        if candidate_bound_field:
+            latest.setdefault(candidate_bound_field, {}).update(
+                state.get(candidate_bound_field, {})
+            )
         for round_number in ("1", "2", "3"):
             latest.setdefault("draft_rounds", {}).setdefault(round_number, {}).update(
                 state.get("draft_rounds", {}).get(round_number, {}))
@@ -2618,6 +2636,10 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
         if state["planning_depth"] == "deep" and not state["convergence_round_one_complete"]
         else "FINAL_REVIEW_REQUIRED"
     )
+    if state["status"] == "CONVERGENCE_REVIEW_REQUIRED":
+        # A prior candidate may have received only one convergence result before a typed user
+        # decision. Neither that result nor a late peer may count for the replacement candidate.
+        state["convergence_reviews"] = {}
     save_state(state)
     emit({"status": state["status"], "run_id": state["run_id"], "candidate": state["candidate"],
           "next_action": next_action(state)})
@@ -2647,15 +2669,17 @@ def command_convergence_review(args: argparse.Namespace) -> None:
     provider = assignment_provider(state, f"convergence-1-{slot}", state["planners"][slot])
     target = f"candidate-round-{state['candidate']['round']}"
     prompt = (
-        "You are convergence reviewer ({slot}), round one of exactly two bounded convergence rounds. Read the "
-        "request, scope contract, synthesized plan, batches, and finding evidence. Inspect the repository at "
+        "You are convergence reviewer ({slot}), round one of exactly two bounded convergence rounds. Read "
+        "{context}/request.md, the scope contract, synthesized plan, batches, and finding evidence. Inspect the repository at "
         "baseline {sha}. This is not a novelty round: reject new objectives. A new finding is admissible only when "
         "it is in scope, materially affects correctness/safety/verification, cites evidence, and states root cause or "
         "honest uncertainty. Check that high-priority findings have dispositions and that priority changes are "
         "evidence-backed. PASS means no supported P0/P1 defect remains; it does not claim consensus or certainty. "
         "Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, baseline_sha={sha}."
         + DELIVERY_CONTRACT
-    ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"])
+    ).format(
+        slot=slot, provider=provider, target=target, sha=state["baseline_sha"], context="{context}"
+    )
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
@@ -2671,7 +2695,11 @@ def command_convergence_review(args: argparse.Namespace) -> None:
     if args.dry_run:
         emit({"status": "CONVERGENCE_REVIEW_DRY_RUN", **payload})
     validate_review(payload, state, provider, slot, target)
-    path = Path(state["run_directory"]) / "convergence_reviews" / f"round_1_{slot}.json"
+    candidate_round = state["candidate"]["round"]
+    path = (
+        Path(state["run_directory"]) / "convergence_reviews"
+        / f"round_1_candidate_{candidate_round}_{slot}.json"
+    )
     atomic_json(path, payload)
     record_artifact(state, f"convergence-1-{slot}", path)
     state["convergence_reviews"][slot] = {
@@ -2737,7 +2765,12 @@ def command_final_review(args: argparse.Namespace) -> None:
     path = Path(state["run_directory"]) / "final_reviews" / f"round_{state['candidate']['round']}_{slot}.json"
     atomic_json(path, payload)
     record_artifact(state, f"final-{state['candidate']['round']}-{slot}", path)
-    state["final_reviews"][slot] = {"provider": provider, "verdict": payload["verdict"], "path": str(path)}
+    state["final_reviews"][slot] = {
+        "provider": provider,
+        "verdict": payload["verdict"],
+        "path": str(path),
+        "candidate_sha256": state["candidate"]["plan_sha256"],
+    }
     if payload["verdict"] == "NEEDS_USER_DECISION":
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {"type": "FINAL_PLAN_BOUNDARY", "created_at": utc_now()}
@@ -2759,6 +2792,7 @@ def command_adjudicate(args: argparse.Namespace) -> None:
     decision_type = state["pending_decision"]["type"]
     allowed = {
         "PLANNING_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
+        "CONVERGENCE_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
         "FINAL_PLAN_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
         "SYNTHESIS_BUDGET_EXHAUSTED": {"GRANT_ONE_SYNTHESIS", "ABANDON"},
         "FINAL_REVIEW_BUDGET_EXHAUSTED": {"GRANT_ONE_SYNTHESIS", "ABANDON"},

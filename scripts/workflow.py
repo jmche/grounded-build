@@ -1937,9 +1937,25 @@ def non_venv_python(executable: str) -> bool:
     none of the project's dependencies. `.venv/` launchers are exempt because the sandbox mounts
     that environment read-only.
     """
-    return not executable.startswith(".venv/") and bool(
+    return normalized_venv_executable(executable) is None and bool(
         re.fullmatch(r"(?:python|python[23](?:\.[0-9]+)*|pypy[0-9]*)", Path(executable).name)
     )
+
+
+def normalized_venv_executable(executable: str) -> str | None:
+    """Return the canonical project-relative `.venv` path, without resolving symlinks.
+
+    Verification accepts argv, not shell text. Lexical normalization therefore closes spelling
+    variants such as `./.venv/bin/python` without following the launcher out of the environment.
+    Absolute paths and relative paths that normalize outside `.venv` are not venv launchers.
+    """
+    path = Path(executable)
+    if path.is_absolute():
+        return None
+    normalized = Path(os.path.normpath(executable))
+    if normalized == Path(".venv") or not normalized.is_relative_to(Path(".venv")):
+        return None
+    return normalized.as_posix()
 
 
 def reject_bare_interpreter(executable: str) -> None:
@@ -2590,7 +2606,11 @@ def apply_convergence_policy(
                     "severity_change_justification": finding["severity_change_justification"],
                 }
             )
-            if new_severity == "P2":
+            if new_severity == "P0":
+                # P0 is categorically blocking. In particular, a finding previously deferred as
+                # P1 must not retain DEFERRED merely because its old status predates the upgrade.
+                existing["status"] = "OPEN"
+            elif new_severity == "P2":
                 existing["status"] = "DEFERRED"
             elif existing["status"] != "DEFERRED":
                 existing["status"] = "OPEN"
@@ -2791,9 +2811,10 @@ def _sandbox_command(
 ) -> tuple[list[str], list[str]]:
     runtime_mounts: list[str] = []
     executable = command[0]
-    relative_venv_executable = executable.startswith(".venv/")
+    venv_executable = normalized_venv_executable(executable)
+    relative_venv_executable = venv_executable is not None
     if relative_venv_executable:
-        executable_path = (project / executable).resolve()
+        executable_path = (project / venv_executable).resolve()
     elif Path(executable).is_absolute():
         executable_path = Path(executable).resolve()
     else:
@@ -2809,7 +2830,7 @@ def _sandbox_command(
         # Mount the venv at its real path and the interpreter tree it points at, both read-only
         # and both narrow, and invoke the launcher itself so it computes its own prefix.
         venv_root = (project / ".venv").resolve()
-        launcher = project / executable
+        launcher = project / venv_executable
         if not launcher.is_file() or not os.access(launcher, os.X_OK):
             runtime = project_runtime_payload(project)
             raise WorkflowError(
@@ -2830,17 +2851,42 @@ def _sandbox_command(
             target = Path(os.readlink(current))
             if not target.is_absolute():
                 target = current.parent / target
+            target = Path(os.path.abspath(target))
             prefix = target.parent.parent
-            if prefix.is_relative_to(home):
-                if prefix == home or prefix.name in {
+            resolved_prefix = prefix.resolve()
+            system_roots = (Path("/usr"), Path("/bin"), Path("/lib"), Path("/lib64"))
+            resolved_target = target.resolve()
+            if any(
+                resolved_target == root or resolved_target.is_relative_to(root)
+                for root in system_roots
+            ):
+                current = target
+                continue
+            if resolved_prefix == Path("/"):
+                # `/bin/python` makes parent.parent `/`. The runtime is already supplied by the
+                # narrow system mounts below. A non-system target resolving through a directory
+                # symlink to `/` is refused rather than exposing the entire host filesystem.
+                raise WorkflowError(
+                    f"refusing to expose broad runtime prefix {resolved_prefix} to verification"
+                )
+            if resolved_prefix in {Path("/etc"), Path("/var"), Path("/opt"), Path("/home")}:
+                raise WorkflowError(
+                    f"refusing to expose broad runtime prefix {resolved_prefix} to verification"
+                )
+            if resolved_prefix.is_relative_to(home):
+                if resolved_prefix == home or resolved_prefix.name in {
                     ".local", ".config", ".cache", ".ssh", ".agents", ".codex",
                 }:
                     raise WorkflowError(
                         "refusing to expose a broad or sensitive home runtime to verification"
                     )
-            if str(prefix) not in mounted and prefix.exists():
-                mounted.add(str(prefix))
-                runtime_mounts.extend(["--ro-bind", str(prefix), str(prefix)])
+            mount_key = f"{resolved_prefix}->{prefix}"
+            if mount_key not in mounted and resolved_prefix.exists():
+                mounted.add(mount_key)
+                # Bind the resolved source at the lexical destination. This preserves a launcher's
+                # expected path without letting bwrap resolve a source-directory symlink to a
+                # broader tree than the policy inspected.
+                runtime_mounts.extend(["--ro-bind", str(resolved_prefix), str(prefix)])
             current = target
         command[0] = str(launcher)
     elif executable_path.is_absolute() and executable_path.is_relative_to(home):

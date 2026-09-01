@@ -80,6 +80,9 @@ else:
     target = re.search(r"target=(candidate-round-\d+)", prompt).group(1)
     verdict = "FAIL" if f"FAKE_FINAL_FAIL={slot}" in request_text else "PASS"
     findings = [] if verdict == "PASS" else [{"id": "P1-final", "severity": "P1", "claim": "missing boundary", "evidence": "plan", "required_change": "add boundary"}]
+    if "convergence reviewer" in prompt and f"FAKE_CONVERGENCE_DECISION={slot}" in request_text:
+        verdict = "NEEDS_USER_DECISION"
+        findings = [{"id": "P1-convergence", "severity": "P1", "claim": "boundary unresolved", "evidence": "plan", "required_change": "choose boundary"}]
     if f"FAKE_PASS_BLOCKING={slot}" in request_text:
         verdict = "PASS"
         findings = [{"id": "P0-pass", "severity": "P0", "claim": "unsafe", "evidence": "plan", "required_change": "fix"}]
@@ -383,6 +386,88 @@ class PlanWorkflowTest(unittest.TestCase):
             result = self.call("final-review", "--project", str(self.project),
                                "--run-id", run_id, "--reviewer", slot)
         self.assertEqual(result["status"], "READY")
+
+    def test_convergence_boundary_can_resume_and_rejects_stale_candidate_results(self) -> None:
+        self.request.write_text(
+            self.request.read_text() + "\nFAKE_CONVERGENCE_DECISION=A\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "both", "--planning-depth", "deep",
+        )
+        run_id = initialized["run_id"]
+        for command in ("investigate", "draft"):
+            for slot in ("A", "B"):
+                self.call(command, "--project", str(self.project), "--run-id", run_id, "--slot", slot)
+        for slot in ("A", "B"):
+            self.call("cross-review", "--project", str(self.project), "--run-id", run_id, "--slot", slot)
+        for slot in ("A", "B"):
+            self.call("diverge", "--project", str(self.project), "--run-id", run_id, "--slot", slot)
+        self.submit_candidate(initialized)
+        old_state = self.get_state(initialized)
+        old_digest = old_state["candidate"]["plan_sha256"]
+
+        decision = self.call(
+            "convergence-review", "--project", str(self.project), "--run-id", run_id,
+            "--reviewer", "A",
+        )
+        self.assertEqual(decision["status"], "NEEDS_USER_DECISION")
+        resumed = self.call(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--choice", "RESOLVE_AND_CONTINUE", "--decision", "replace the candidate",
+            "--actor", "tester", "--apply",
+        )
+        self.assertEqual(resumed["status"], "SYNTHESIS_REQUIRED")
+
+        output = self.call("synthesis-context", "--project", str(self.project), "--run-id", run_id)
+        directory = Path(output["output_directory"])
+        plan = directory / "replacement_plan.md"
+        batches = directory / "replacement_batches.md"
+        plan.write_text(
+            "# Replacement plan\n\n## Scope\nTARGET-001: Implement the corrected request.\n",
+            encoding="utf-8",
+        )
+        batches.write_text(
+            "# Batches\n\n- B01: corrected scope; exit when the named test returns zero.\n",
+            encoding="utf-8",
+        )
+        self.call(
+            "submit-synthesis", "--project", str(self.project), "--run-id", run_id,
+            "--plan", str(plan), "--batch-manifest", str(batches),
+        )
+        current = self.get_state(initialized)
+        self.assertNotEqual(current["candidate"]["plan_sha256"], old_digest)
+        self.assertEqual(current["convergence_reviews"], {})
+
+        spec = importlib.util.spec_from_file_location("gb_stale_candidate", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        stale = dict(old_state)
+        stale["convergence_reviews"] = {
+            "B": {
+                "provider": "claude", "verdict": "PASS", "path": "stale.json",
+                "candidate_sha256": old_digest,
+            }
+        }
+        prior_home = os.environ.get("GROUNDED_BUILD_PLAN_HOME")
+        os.environ["GROUNDED_BUILD_PLAN_HOME"] = self.env["GROUNDED_BUILD_PLAN_HOME"]
+        try:
+            with self.assertRaisesRegex(module.WorkflowError, "stale convergence-review result"):
+                module.save_parallel_stage(stale, "convergence-review")
+            stale["final_reviews"] = {
+                "A": {
+                    "provider": "claude", "verdict": "PASS", "path": "stale-final.json",
+                    "candidate_sha256": old_digest,
+                }
+            }
+            with self.assertRaisesRegex(module.WorkflowError, "stale final-review result"):
+                module.save_parallel_stage(stale, "final-review")
+        finally:
+            if prior_home is None:
+                os.environ.pop("GROUNDED_BUILD_PLAN_HOME", None)
+            else:
+                os.environ["GROUNDED_BUILD_PLAN_HOME"] = prior_home
 
     def test_auto_topology_records_provider_diversity(self) -> None:
         initialized = self.initialize("auto", "codex")

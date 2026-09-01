@@ -106,7 +106,8 @@ semantic quality; final reviewers still inspect repository evidence.
 
 Read `pending_decision` from status. Show its evidence and allowed choices to the user. Run `adjudicate` once without `--apply`, then apply the exact approved choice with actor and reason.
 
-- Planning/final boundary: resolve and continue, or abandon.
+- Planning, convergence, or final boundary: resolve and continue, or abandon. Resolving a
+  convergence boundary returns to synthesis; it never treats the interrupted review as approval.
 - Synthesis budget exhausted: at most one explicit extra synthesis, or abandon.
 - Invocation budget exhausted: one extra invocation, reassign the assignment, resume after genuinely changed input, or abandon.
 - Provider infrastructure failure: resolve the external condition and continue, reassign, or abandon. It does not consume a quality attempt.

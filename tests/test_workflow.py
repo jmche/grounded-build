@@ -1905,6 +1905,67 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(len(entry["obligation_revisions"]), 2)
         self.environment.pop("FAKE_FINDINGS")
 
+    def test_deferred_p1_rereported_as_p0_blocks_acceptance(self) -> None:
+        initialized = self.initialize("codex")
+        run_id = str(initialized["run_id"])
+        implementation = Path(str(initialized["implementation_worktree"]))
+
+        def finding(
+            finding_id: str, fingerprint: str, severity: str, justification: str = "",
+        ) -> dict[str, str]:
+            return {
+                "id": finding_id, "fingerprint": fingerprint, "severity": severity,
+                "novelty": "INITIAL_REVIEW", "why_not_detectable_earlier": "",
+                "introduced_by_sha": "", "severity_change_justification": justification,
+                "location": "module.py:10", "trigger": "the declared input",
+                "consequence": "the declared failure",
+                "required_outcome": "preserve the declared authority boundary",
+            }
+
+        self.commit_batch_change(implementation, "round one\n")
+        first_finding = finding("F-1-001", "round-one-blocker", "P1")
+        self.environment["FAKE_FINDINGS"] = json.dumps([first_finding])
+        first = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+            expected=2,
+        )
+        self.assertEqual(first["status"], "REVIEW_FAIL")
+
+        self.commit_batch_change(implementation, "round two\n")
+        deferred = finding("F-1-002", "deferred-upgrade", "P1")
+        self.environment["FAKE_FINDINGS"] = json.dumps([deferred])
+        self.environment["FAKE_RESOLVED_FINDING_IDS"] = json.dumps(["F-1-001"])
+        second = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+        )
+        self.assertEqual(second["status"], "REVIEW_PASS")
+        second_report = second["report_path"]
+
+        self.commit_batch_change(implementation, "round three\n")
+        upgraded = finding(
+            "F-1-002", "deferred-upgrade", "P0", "new evidence proves an authority bypass",
+        )
+        self.environment["FAKE_FINDINGS"] = json.dumps([upgraded])
+        self.environment["FAKE_RESOLVED_FINDING_IDS"] = "[]"
+        third = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+            expected=2,
+        )
+        self.assertEqual(third["status"], "REVIEW_FAIL")
+        self.assertEqual(third["blocking_count"], 1)
+
+        refused = self.workflow(
+            "accept", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+            "--review-file", str(second_report), expected=1,
+        )
+        self.assertIn("accept is not allowed", refused["error"])
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["finding_ledger"]["deferred-upgrade"]["status"], "OPEN")
+        self.environment.pop("FAKE_FINDINGS")
+        self.environment.pop("FAKE_RESOLVED_FINDING_IDS")
+
 
 class ConvergencePolicyTests(unittest.TestCase):
     @staticmethod
@@ -1973,6 +2034,20 @@ class ConvergencePolicyTests(unittest.TestCase):
         result = self.apply(state, self.payload("FAIL", [finding]), 1)
         self.assertEqual(result["effective_verdict"], "FAIL")
         self.assertEqual(result["blocking_count"], 1)
+
+    def test_deferred_p1_reclassified_as_p0_reopens_and_blocks(self) -> None:
+        state = self.state()
+        deferred = self.finding("B1-P1-001", "deferred-upgrade", "P1")
+        first = self.apply(state, self.payload("PASS", [deferred]), 2)
+        self.assertEqual(first["blocking_count"], 0)
+        self.assertEqual(state["finding_ledger"]["deferred-upgrade"]["status"], "DEFERRED")
+
+        upgraded = self.finding("B1-P1-001", "deferred-upgrade", "P0")
+        upgraded["severity_change_justification"] = "new evidence proves authority bypass"
+        second = self.apply(state, self.payload("FAIL", [upgraded]), 3)
+        self.assertEqual(second["effective_verdict"], "FAIL")
+        self.assertEqual(second["blocking_count"], 1)
+        self.assertEqual(state["finding_ledger"]["deferred-upgrade"]["status"], "OPEN")
 
     def test_resolved_p1_converges_to_pass(self) -> None:
         state = self.state()
@@ -2730,6 +2805,50 @@ class SharedVerificationWorktreeTests(unittest.TestCase):
         )
         self.assertEqual(executed[0], str(launcher))
         self.assertIn(str((self.project / ".venv").resolve()), sandboxed)
+
+    def test_project_venv_path_is_normalized_without_mounting_host_root(self) -> None:
+        launcher = self.project / ".venv" / "bin" / "python"
+        launcher.parent.mkdir(parents=True)
+        os.symlink("/bin/sh", launcher)
+
+        sandboxed, executed = WORKFLOW_MODULE._sandbox_command(
+            "bwrap",
+            ["./.venv/bin/python", "-c", "exit 0"],
+            self.project,
+            self.project,
+            self.root / "tmp",
+            "offline",
+        )
+
+        self.assertEqual(executed[0], str(launcher))
+        mounts = list(zip(sandboxed, sandboxed[1:]))
+        self.assertNotIn(("/", "/"), mounts)
+        self.assertFalse(WORKFLOW_MODULE.non_venv_python("./.venv/bin/python"))
+        self.assertEqual(
+            WORKFLOW_MODULE.normalized_venv_executable(".venv/../.venv/bin/python"),
+            ".venv/bin/python",
+        )
+
+    def test_project_venv_runtime_directory_symlink_cannot_hide_a_root_mount(self) -> None:
+        launcher = self.project / ".venv" / "bin" / "python"
+        launcher.parent.mkdir(parents=True)
+        disguised_root = self.root / "runtime-link"
+        os.symlink("/", disguised_root)
+        external = Path("/tmp") / f"{self.root.name}-runtime-python"
+        external.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        external.chmod(0o755)
+        self.addCleanup(external.unlink, missing_ok=True)
+        os.symlink(disguised_root / "tmp" / external.name, launcher)
+
+        with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "broad runtime prefix /"):
+            WORKFLOW_MODULE._sandbox_command(
+                "bwrap",
+                [".venv/bin/python", "-V"],
+                self.project,
+                self.project,
+                self.root / "tmp",
+                "offline",
+            )
 
     def test_the_second_verification_reuses_the_checkout_instead_of_failing(self) -> None:
         """`git worktree add` refuses an existing path, so reuse has to be a decision, not luck."""
