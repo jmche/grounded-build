@@ -415,6 +415,17 @@ class WorkflowIntegrationTests(unittest.TestCase):
         initialized = self.initialize("codex")
         self.review_accept(initialized)
         (self.project / "local-note.txt").write_text("preserve me\n", encoding="utf-8")
+        preview = self.workflow(
+            "finalize", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertTrue(preview["target_checked_out_here"])
+        self.assertFalse(preview["target_checkout_clean"])
+        self.assertTrue(preview["apply_blocked_by_dirty_target"])
+        self.assertIn("?? local-note.txt", preview["target_checkout_changes"])
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertTrue(status["finalize_apply_blocked_by_dirty_target"])
         rejected = self.workflow(
             "finalize", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--apply", expected=1,
@@ -701,6 +712,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         original_head = self.run_command(
             "git", "-C", str(self.project), "rev-parse", "HEAD"
         ).stdout.strip()
+        (self.project / "ongoing-note.txt").write_text("keep local work\n", encoding="utf-8")
         finalized = self.workflow(
             "finalize", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--apply",
@@ -719,6 +731,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(
             self.run_command("git", "-C", str(self.project), "rev-parse", "main").stdout.strip(),
             final_sha,
+        )
+        self.assertEqual(
+            (self.project / "ongoing-note.txt").read_text(encoding="utf-8"), "keep local work\n"
         )
 
     def test_similarly_prefixed_worktree_branch_does_not_block_target_update(self) -> None:
@@ -1105,6 +1120,58 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
         )
         self.assertIn("frozen instruction snapshot changed", str(status["instruction_snapshot_error"]))
+
+    def test_instruction_inputs_are_bounded_text_and_unique(self) -> None:
+        instruction = self.root / "AGENTS.md"
+        instruction.write_text("# Contract\n", encoding="utf-8")
+        duplicate = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "codex",
+            "--batches", "1", "--target-branch", "main",
+            "--instruction-file", str(instruction), "--instruction-file", str(instruction),
+            expected=1,
+        )
+        self.assertIn("duplicate --instruction-file", str(duplicate["error"]))
+
+        binary = self.root / "binary-contract"
+        binary.write_bytes(b"\xff\xfe")
+        rejected_binary = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "codex",
+            "--batches", "1", "--target-branch", "main",
+            "--instruction-file", str(binary), expected=1,
+        )
+        self.assertIn("not UTF-8 text", str(rejected_binary["error"]))
+
+        oversized = self.root / "oversized-contract.md"
+        oversized.write_bytes(b"a" * (WORKFLOW_MODULE.MAX_INSTRUCTION_BYTES + 1))
+        rejected_size = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "codex",
+            "--batches", "1", "--target-branch", "main",
+            "--instruction-file", str(oversized), expected=1,
+        )
+        self.assertIn("instruction file exceeds", str(rejected_size["error"]))
+        self.assertEqual(list(self.state_home.glob("projects/*/runs/*")), [])
+
+    def test_redirected_instruction_directory_fails_closed(self) -> None:
+        instruction = self.root / "AGENTS.md"
+        instruction.write_text("# Contract\n", encoding="utf-8")
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "codex",
+            "--batches", "1", "--target-branch", "main",
+            "--instruction-file", str(instruction),
+        )
+        instruction_dir = Path(str(initialized["run_directory"])) / "instructions"
+        outside = self.root / "redirected-instructions"
+        instruction_dir.rename(outside)
+        os.symlink(outside, instruction_dir)
+        rejected = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=1,
+        )
+        self.assertIn("frozen instruction directory changed", str(rejected["error"]))
 
     def test_batch_manifest_must_name_every_declared_batch(self) -> None:
         rejected = self.workflow(
@@ -1682,9 +1749,35 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(migrated["status"], "MIGRATED")
         current = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["schema_version"], 8)
+        self.assertEqual(current["schema_version"], 9)
         WORKFLOW_MODULE.validate_review_contract(current)
         self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema7"))
+
+    def test_schema8_run_migrates_without_replacing_frozen_reviewer_contract(self) -> None:
+        initialized = self.initialize_raw("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        original_contract = json.loads(json.dumps(state["review_contract"]))
+        state.pop("instruction_snapshots")
+        state.pop("original_worktree_clean_at_start")
+        state.pop("original_worktree_changes_at_start")
+        self.write_authenticated_legacy_state(state_path, state, 8)
+
+        preview = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(preview["from_schema"], 8)
+        self.assertFalse(preview["review_contract_migration"])
+        self.assertIsNone(preview["review_contract_candidate"])
+        migrated = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply",
+        )
+        current = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["schema_version"], 9)
+        self.assertEqual(current["review_contract"], original_contract)
+        self.assertEqual(current["instruction_snapshots"], [])
+        self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema8"))
 
     def test_sequential_migration_uses_the_actual_loaded_schema(self) -> None:
         initialized = self.initialize_raw("codex")
@@ -1777,7 +1870,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(migrated["status"], "MIGRATED")
         current = json.loads(state_path.read_text())
-        self.assertEqual(current["schema_version"], 8)
+        self.assertEqual(current["schema_version"], 9)
         self.assertEqual(current["environment_contract"]["fingerprint_version"], 3)
         self.assertEqual(current["integration"]["attempts"][0]["status"], "LEGACY_SUPERSEDED")
         self.assertEqual(current["integration"]["current_attempt"], 2)
@@ -2925,6 +3018,23 @@ class ReviewerSchemaCompatibilityTests(unittest.TestCase):
 
 
 class DocumentationContractTests(unittest.TestCase):
+    def test_dirty_init_and_explicit_instruction_contract_are_publicly_aligned(self) -> None:
+        documents = {
+            "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "readme": (SKILL_ROOT / "README.md").read_text(encoding="utf-8"),
+            "implementation": (
+                SKILL_ROOT / "references" / "implementation_workflow.md"
+            ).read_text(encoding="utf-8"),
+        }
+        for name, document in documents.items():
+            with self.subTest(document=name):
+                self.assertIn("--instruction-file", document)
+                self.assertIn("UTF-8", document)
+                self.assertIn("checkout", document.lower())
+                self.assertIn("final", document.lower())
+        self.assertIn("cannot override", documents["implementation"])
+        self.assertIn("working-tree changes excluded", documents["implementation"])
+
     def test_causality_contract_is_shared_without_turning_semantics_into_a_gate(self) -> None:
         documents = {
             "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),

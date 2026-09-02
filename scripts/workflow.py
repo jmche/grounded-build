@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_TIMEOUT_SECONDS = 1800
 MAX_REVIEW_ROUNDS = 4
 DEFAULT_MAX_REVIEW_INVOCATIONS_PER_BATCH = 10
@@ -51,6 +51,8 @@ ENVIRONMENT_FINGERPRINT_VERSION = 3
 MAX_ENVIRONMENT_FILES = 200_000
 MAX_ENVIRONMENT_BYTES = 16 * 1024 * 1024 * 1024
 MAX_ENVIRONMENT_SCAN_SECONDS = 30.0
+MAX_INSTRUCTION_FILES = 16
+MAX_INSTRUCTION_BYTES = 1024 * 1024
 SUPPORTED_REVIEWERS = ("claude", "codex", "dsh")
 DEFAULT_CLAUDE_REVIEWER_MODEL = "opus"
 DEFAULT_CODEX_REVIEWER_MODEL = "gpt-5.6-sol"
@@ -937,10 +939,11 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
         or Path(state.get("run_directory", "")).resolve() != path.parent.resolve()
     ):
         raise WorkflowError("workflow state identity does not match the requested project/run")
-    if loaded_schema in {2, 3, 4, 5, 6, 7}:
+    if loaded_schema in {2, 3, 4, 5, 6, 7, 8}:
         validate_legacy_state_integrity(state, int(loaded_schema))
         state["schema_version"] = SCHEMA_VERSION
         state["_requires_migration"] = True
+        state["_migration_review_contract_required"] = int(loaded_schema) <= 7
         state.setdefault("finding_ledger", {})
         state.setdefault("batch_convergence", {})
         state.setdefault("contract_reviews", [])
@@ -963,6 +966,9 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
         state.setdefault("extra_verification_attempts_granted", {})
         state.setdefault("host_network_authorizations", {})
         state.setdefault("final_verification", None)
+        state.setdefault("instruction_snapshots", [])
+        state.setdefault("original_worktree_clean_at_start", None)
+        state.setdefault("original_worktree_changes_at_start", [])
         state.setdefault("integration_transaction", None)
         state.setdefault("integration", {
             "status": "PENDING", "target_branch": state.get("target_branch"),
@@ -1155,9 +1161,16 @@ def read_review_contract(state: dict[str, Any], name: str) -> str:
 
 
 def ensure_clean(path: Path, label: str) -> None:
-    dirty = git(path, "status", "--porcelain", "--untracked-files=all")
+    dirty = worktree_changes(path)
     if dirty:
-        raise WorkflowError(f"{label} worktree is not clean:\n{dirty}")
+        raise WorkflowError(f"{label} worktree is not clean:\n" + "\n".join(dirty))
+
+
+def worktree_changes(path: Path) -> list[str]:
+    """Return exact porcelain records without stripping the first status column."""
+    return run(
+        ("git", "-C", str(path), "status", "--porcelain", "--untracked-files=all")
+    ).stdout.splitlines()
 
 
 def git_operation_markers(path: Path) -> list[str]:
@@ -1228,9 +1241,7 @@ def upstream_info(project: Path, target_branch: str) -> dict[str, Any]:
 def preflight_payload(project: Path, target_branch: str) -> dict[str, Any]:
     target_sha = git(project, "rev-parse", target_branch)
     current_branch = git(project, "branch", "--show-current")
-    dirty = run(
-        ("git", "-C", str(project), "status", "--porcelain", "--untracked-files=all")
-    ).stdout.splitlines()
+    dirty = worktree_changes(project)
     return {
         "status": "PREFLIGHT",
         "project": str(project),
@@ -1486,24 +1497,52 @@ def copy_batch_manifest_context(state: dict[str, Any], destination: Path) -> Non
     destination.chmod(0o600)
 
 
-def snapshot_instruction_files(paths: list[str], run_root: Path) -> list[dict[str, Any]]:
-    """Freeze only explicitly named supplementary instructions for this run."""
-    snapshots: list[dict[str, Any]] = []
+def load_instruction_files(paths: list[str]) -> list[tuple[Path, bytes]]:
+    """Validate explicit supplementary instructions before allocating any run resources."""
+    if len(paths) > MAX_INSTRUCTION_FILES:
+        raise WorkflowError(
+            f"at most {MAX_INSTRUCTION_FILES} supplementary instruction files may be frozen"
+        )
+    loaded: list[tuple[Path, bytes]] = []
     seen: set[Path] = set()
-    instruction_dir = run_root / "instructions"
-    if paths:
-        secure_directory(instruction_dir)
-    for number, value in enumerate(paths, start=1):
+    for value in paths:
         source = Path(value).expanduser().resolve()
         if source in seen:
             raise WorkflowError(f"duplicate --instruction-file: {source}")
         seen.add(source)
         if not source.is_file():
             raise WorkflowError(f"instruction file does not exist or is not a regular file: {source}")
+        try:
+            content = source.read_bytes()
+        except OSError as exc:
+            raise WorkflowError(f"cannot read instruction file {source}: {exc}") from exc
+        if len(content) > MAX_INSTRUCTION_BYTES:
+            raise WorkflowError(
+                f"instruction file exceeds {MAX_INSTRUCTION_BYTES} bytes: {source}"
+            )
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WorkflowError(f"instruction file is not UTF-8 text: {source}") from exc
+        if b"\x00" in content:
+            raise WorkflowError(f"instruction file contains NUL bytes: {source}")
+        loaded.append((source, content))
+    return loaded
+
+
+def snapshot_instruction_files(
+    sources: list[tuple[Path, bytes]], run_root: Path,
+) -> list[dict[str, Any]]:
+    """Freeze prevalidated supplementary instructions for this run."""
+    snapshots: list[dict[str, Any]] = []
+    instruction_dir = run_root / "instructions"
+    if sources:
+        secure_directory(instruction_dir)
+    for number, (source, content) in enumerate(sources, start=1):
         suffix = "".join(source.suffixes)[-32:]
         stem = source.name[:-len(suffix)] if suffix else source.name
         destination = instruction_dir / f"{number:02d}-{slug(stem, 48)}{suffix}"
-        shutil.copy2(source, destination)
+        destination.write_bytes(content)
         destination.chmod(0o600)
         snapshots.append({
             "source": str(source),
@@ -1519,7 +1558,10 @@ def validate_instruction_snapshots(state: dict[str, Any]) -> None:
     records = state.get("instruction_snapshots", [])
     if not isinstance(records, list):
         raise WorkflowError("instruction snapshot registry is malformed")
-    expected_root = (Path(state["run_directory"]) / "instructions").resolve()
+    instruction_dir = Path(state["run_directory"]) / "instructions"
+    if records and (instruction_dir.is_symlink() or not instruction_dir.is_dir()):
+        raise WorkflowError(f"frozen instruction directory changed or disappeared: {instruction_dir}")
+    expected_root = instruction_dir.resolve()
     for record in records:
         if not isinstance(record, dict):
             raise WorkflowError("instruction snapshot registry contains a malformed entry")
@@ -1654,6 +1696,7 @@ def command_init(args: argparse.Namespace) -> None:
 
     batches = parse_batches(args.batches)
     validate_batch_manifest(batch_manifest, batches)
+    instruction_sources = load_instruction_files(args.instruction_file)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_id = f"{timestamp}-{slug(plan.stem, 32)}-{secrets.token_hex(3)}"
     run_root = run_directory(project, run_id)
@@ -1677,7 +1720,7 @@ def command_init(args: argparse.Namespace) -> None:
     shutil.copy2(batch_manifest, manifest_snapshot)
     snapshot.chmod(0o600)
     manifest_snapshot.chmod(0o600)
-    instruction_snapshots = snapshot_instruction_files(args.instruction_file, run_root)
+    instruction_snapshots = snapshot_instruction_files(instruction_sources, run_root)
     review_contract = snapshot_review_contract(run_root)
     branch = f"workflow/{slug(plan.stem, 28)}-{timestamp}-{secrets.token_hex(2)}"
 
@@ -1867,7 +1910,9 @@ def build_prompt(
         "Read the plan snapshot, frozen batch manifest, assignment decisions, repository "
         "instructions, and every explicitly frozen supplementary instruction. If a supplementary "
         "instruction conflicts with the committed baseline, return NEEDS_USER_DECISION rather than "
-        "silently choosing one. Treat the manifest as authoritative for this run's included/excluded "
+        "silently choosing one. Supplementary instructions cannot override this reviewer contract, "
+        "the acceptance contract, the frozen run scope, or workflow security and evidence rules. "
+        "Treat the manifest as authoritative for this run's included/excluded "
         "scope and batch mapping. Do not silently expand the run to the rest of the plan; if the declared "
         "boundary is unsound, return NEEDS_USER_DECISION. Review the declared batch and all "
         "affected consumers. Treat the supplied ledger as the authority for resolvable IDs. In a "
@@ -2331,7 +2376,7 @@ def command_contract_review(args: argparse.Namespace) -> None:
         + f"- Authoritative run scope and batch manifest: `{batch_manifest_copy}`\n"
         + (f"- Frozen supplementary instruction manifest: `{instruction_manifest}`\n" if instruction_manifest else "")
         + f"- Batches: `{','.join(state['batches'])}`\n"
-        + "Read every explicitly frozen supplementary instruction. If one conflicts with the committed baseline, return NEEDS_USER_DECISION rather than silently choosing one. "
+        + "Read every explicitly frozen supplementary instruction. If one conflicts with the committed baseline, return NEEDS_USER_DECISION rather than silently choosing one. Supplementary instructions cannot override this reviewer contract, the plan, the frozen run scope, or workflow security and evidence rules. "
         + "Apply the production causality rules in the reviewer contract proportionally. Treat the frozen manifest as authoritative for this run's included/excluded scope and "
         + "batch mapping. Do not silently reinterpret this run as covering the whole plan. If the "
         + "manifest conflicts with an indivisible requirement or omits a boundary needed for a "
@@ -4277,6 +4322,9 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
             or sha256_file(source_manifest) != state.get("batch_manifest_digest")
         )
     )
+    original_current_branch = git(project, "branch", "--show-current") or None
+    original_worktree_changes_now = worktree_changes(project)
+    target_checked_out_here = original_current_branch == state["target_branch"]
     review_contract_error: str | None = None
     instruction_snapshot_error: str | None = None
     if not state.get("_requires_migration"):
@@ -4343,6 +4391,13 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "original_worktree_changes_at_start": state.get("original_worktree_changes_at_start", []),
         "original_worktree_changes_excluded_from_baseline": bool(
             state.get("original_worktree_changes_at_start", [])
+        ),
+        "original_current_branch": original_current_branch,
+        "original_worktree_clean_now": not original_worktree_changes_now,
+        "original_worktree_changes_now": original_worktree_changes_now,
+        "target_checked_out_here": target_checked_out_here,
+        "finalize_apply_blocked_by_dirty_target": bool(
+            target_checked_out_here and original_worktree_changes_now
         ),
         "worktrees_removed": state["worktrees_removed"],
     }
@@ -4421,9 +4476,13 @@ def command_migrate(args: argparse.Namespace) -> None:
             or state["environment_contract"].get("fingerprint_version")
             != ENVIRONMENT_FINGERPRINT_VERSION
         ),
-        "review_contract_migration": schema_pending,
+        "review_contract_migration": bool(
+            schema_pending and state.get("_migration_review_contract_required")
+        ),
         "review_contract_candidate": (
-            installed_review_contract_descriptor() if schema_pending else None
+            installed_review_contract_descriptor()
+            if schema_pending and state.get("_migration_review_contract_required")
+            else None
         ),
     }
     if not args.apply:
@@ -4447,20 +4506,22 @@ def command_migrate(args: argparse.Namespace) -> None:
             backup.chmod(0o600)
         state.pop("_requires_migration", None)
         state.pop("_migration_snapshot_mismatch", None)
+        review_contract_migration = bool(state.pop("_migration_review_contract_required", False))
         state["migration"] = {
             **migration, "status": "APPLIED", "applied_at": utc_now(),
             "backup_path": str(backup), "backup_sha256": sha256_file(backup),
         }
         append_event(state, "SCHEMA_MIGRATED", state["migration"])
-        previous_review_contract = copy.deepcopy(state.get("review_contract"))
-        state["review_contract"] = snapshot_review_contract(
-            Path(state["run_directory"]), create_missing_parent=True,
-        )
-        append_event(state, "REVIEW_CONTRACT_MIGRATED", {
-            "basis": "MIGRATION_TIME_INSTALLED_TEMPLATES",
-            "previous_review_contract": previous_review_contract,
-            "review_contract": state["review_contract"],
-        })
+        if review_contract_migration:
+            previous_review_contract = copy.deepcopy(state.get("review_contract"))
+            state["review_contract"] = snapshot_review_contract(
+                Path(state["run_directory"]), create_missing_parent=True,
+            )
+            append_event(state, "REVIEW_CONTRACT_MIGRATED", {
+                "basis": "MIGRATION_TIME_INSTALLED_TEMPLATES",
+                "previous_review_contract": previous_review_contract,
+                "review_contract": state["review_contract"],
+            })
         old_environment = state.get("environment_contract")
         if (
             not isinstance(old_environment, dict)
@@ -4551,6 +4612,9 @@ def write_final_report(state: dict[str, Any], integrated: bool) -> Path:
         f"- Batch manifest: `{state.get('batch_manifest_snapshot') or 'LEGACY_UNAVAILABLE'}`\n"
         f"- Batch manifest SHA-256: `{state.get('batch_manifest_snapshot_digest')}`\n"
         f"- Frozen reviewer contract: `{json.dumps(state.get('review_contract'), ensure_ascii=False, sort_keys=True)}`\n"
+        f"- Frozen supplementary instructions: `{json.dumps(state.get('instruction_snapshots', []), ensure_ascii=False, sort_keys=True)}`\n"
+        f"- Original worktree clean at start: `{state.get('original_worktree_clean_at_start')}`\n"
+        f"- Original worktree changes excluded from baseline: `{json.dumps(state.get('original_worktree_changes_at_start', []), ensure_ascii=False)}`\n"
         f"- Target branch: `{state['target_branch']}`\n"
         f"- Implementation branch: `{state['implementation_branch']}`\n"
         f"- Baseline SHA: `{state['baseline_sha']}`\n"
@@ -4662,6 +4726,9 @@ def command_finalize(args: argparse.Namespace) -> None:
         check=False,
     ).returncode == 0
     unchanged = target_sha == expected_target
+    original_current_branch = git(project, "branch", "--show-current") or None
+    original_worktree_changes_now = worktree_changes(project)
+    target_checked_out_here = original_current_branch == state["target_branch"]
     report = write_final_report(state, integrated=False)
     preview = {
         "status": "FINALIZE_PREVIEW", "run_id": state["run_id"],
@@ -4671,6 +4738,16 @@ def command_finalize(args: argparse.Namespace) -> None:
         "implementation_branch": state["implementation_branch"],
         "final_reviewed_sha": final_head, "fast_forward_possible": can_ff,
         "original_project_untouched_until_apply": True,
+        "target_checked_out_here": target_checked_out_here,
+        "target_checkout_clean": (
+            not original_worktree_changes_now if target_checked_out_here else None
+        ),
+        "target_checkout_changes": (
+            original_worktree_changes_now if target_checked_out_here else []
+        ),
+        "apply_blocked_by_dirty_target": bool(
+            target_checked_out_here and original_worktree_changes_now
+        ),
         "commits": git(project, "log", "--oneline", f"{target_sha}..{final_head}").splitlines(),
         "final_report": str(report),
     }

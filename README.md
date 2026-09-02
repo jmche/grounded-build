@@ -81,7 +81,9 @@ Implement mode freezes the committed SHA of the selected target branch, so a dir
 does not block initialization and is never copied into run worktrees. The init result lists those
 excluded changes. If an uncommitted `AGENTS.md`, `CLAUDE.md`, or another project contract must govern
 the run, name it explicitly with repeatable `--instruction-file`; it is frozen separately and supplied
-to contract and code reviewers. Final integration still refuses a dirty checked-out target.
+to contract and code reviewers. Supplementary instructions are bounded UTF-8 text and cannot override
+workflow security, scope, or review authority. Final integration still refuses a dirty checked-out target,
+and both status and finalize preview expose that apply blocker.
 
 ## What makes it different
 

@@ -165,7 +165,10 @@ Implementation initialization freezes the named target branch's committed SHA an
 current checkout to be clean. Uncommitted files are reported and excluded from that source baseline.
 When an uncommitted project contract must govern the run, pass it explicitly with repeatable
 `--instruction-file`; the engine freezes it separately for the host and both reviewer boundaries.
+Supplementary instructions are bounded UTF-8 text and cannot override workflow security, frozen scope,
+reviewer, or acceptance authority.
 The checked-out target must still be clean at final integration so user work cannot be overwritten.
+Finalize preview and status expose whether current target-checkout changes will block apply.
 
 The implementation host remains the current host model. Its isolated reviewer may be Claude, Codex, or
 dsh. Claude defaults to Opus, Codex to `gpt-5.6-sol`, and dsh to the model selected in

@@ -39,6 +39,7 @@ Collect or infer:
 - `target_branch`: the current branch unless the user explicitly names another branch.
 - `instruction_file`: optional, repeatable paths to uncommitted or external project contracts that
   must govern this run. These are frozen explicitly; unrelated working-tree changes are never copied.
+  Each file must be UTF-8 text, at most 1 MiB, and the run accepts at most 16 files.
 
 The agent invoking this skill is always the implementer. Do not launch another implementer. A same-family reviewer is allowed only as a fresh reviewer CLI invocation under the workflow's isolated reviewer contract; the current host conversation must never issue its own PASS. Claude and Codex use their read-only CLI modes. dsh uses workspace-write only in the detached reviewer worktree so it can persist structured output under `.review-out/`; the workflow rejects any unrelated worktree mutation.
 
@@ -202,6 +203,8 @@ Read every returned instruction snapshot before implementation. Contract review 
 invocation-local copies of the same digest-bound files. A later edit to the source instruction does not
 change the run; an edit to the frozen snapshot fails closed. A conflict between a supplementary instruction
 and the committed baseline requires a user decision rather than an implicit precedence guess.
+Supplementary instructions cannot override the frozen reviewer contract, acceptance contract, run scope,
+or workflow security and evidence rules.
 
 The run also freezes its quality-round, reviewer-invocation, contract-invocation, verification-attempt, and evidence-cycle budgets. Changing a global constant later does not silently change an existing run.
 
@@ -478,6 +481,10 @@ The preview compares the target ref with the candidate's expected target SHA. An
 fast-forward directly. A changed target returns `RECONCILIATION_REQUIRED` without changing execution
 state or invalidating the reviewed candidate.
 
+When the target is the original checkout's current branch, preview reports its current porcelain changes
+and whether they will block apply. Clean or commit that user-owned work deliberately before integration;
+the workflow never stashes or discards it.
+
 For a diverged target, preview and explicitly create a run-owned merge worktree:
 
 ```bash
@@ -510,9 +517,11 @@ Schema migration authenticates the legacy event chain and final checkpoint befor
 field. A schema-number downgrade cannot convert edited state into trusted current-schema state. Migration
 backups are reusable only when byte-identical to the still-current legacy state, allowing an interrupted
 migration to resume without accepting an unrelated backup.
-Schema v8 also validates the exact run-local paths, regular-file type, and SHA-256 digests of both
-reviewer-template snapshots before any active transition. Missing, redirected, or edited snapshots
-fail closed.
+Schema v9 validates the exact run-local paths, regular-file type, and SHA-256 digests of both
+reviewer-template snapshots and every explicitly frozen supplementary instruction before any active
+transition. Missing, redirected, or edited snapshots fail closed. Schema-v8 runs require an explicit
+migration to v9; that migration preserves their reviewer templates and records an empty supplementary
+instruction set rather than inventing authority.
 
 After approval:
 
@@ -552,4 +561,7 @@ Cleanup preserves the plan snapshot, state, reviews, logs, tests, final report, 
 
 ## Final response
 
-Report the project identity, run ID, plan digest, implementer and reviewer, baseline and final SHA, batches accepted, review rounds, verification results, remaining P2 findings, integration status, report location, and whether worktrees remain registered.
+Report the project identity, run ID, plan digest, implementer and reviewer, baseline and final SHA,
+working-tree changes excluded at initialization, frozen supplementary instruction paths and digests,
+batches accepted, review rounds, verification results, remaining P2 findings, integration status,
+report location, and whether worktrees remain registered.

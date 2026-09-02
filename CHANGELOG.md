@@ -9,8 +9,11 @@ All notable changes use semantic versioning.
   resetting, or committing it.
 - Added repeatable `--instruction-file` snapshots for explicit uncommitted project contracts, bound
   them by SHA-256, and supplied invocation-local copies to acceptance-contract and fixed-SHA reviewers.
+- Raised implementation state to schema v9 so older engines reject runs carrying supplementary
+  instruction authority; schema-v8 migration preserves existing reviewer contracts without inventing instructions.
 - Kept final integration fail-closed when the target branch is the dirty current checkout, preserving
-  the user's in-progress work at the only boundary that mutates the original project.
+  the user's in-progress work at the only boundary that mutates the original project, and exposed that
+  apply blocker in finalize previews and status.
 
 ## [0.6.1] - 2026-09-01
 
