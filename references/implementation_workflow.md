@@ -37,6 +37,8 @@ Collect or infer:
   as the model family.
 - `fix_policy`: `ask` by default, `auto` only when explicitly requested, or `never` for review without repair.
 - `target_branch`: the current branch unless the user explicitly names another branch.
+- `instruction_file`: optional, repeatable paths to uncommitted or external project contracts that
+  must govern this run. These are frozen explicitly; unrelated working-tree changes are never copied.
 
 The agent invoking this skill is always the implementer. Do not launch another implementer. A same-family reviewer is allowed only as a fresh reviewer CLI invocation under the workflow's isolated reviewer contract; the current host conversation must never issue its own PASS. Claude and Codex use their read-only CLI modes. dsh uses workspace-write only in the detached reviewer worktree so it can persist structured output under `.review-out/`; the workflow rejects any unrelated worktree mutation.
 
@@ -52,6 +54,7 @@ Store all workflow data below:
         ├── workflow.json
         ├── plan/original.md
         ├── plan/batches.md             # frozen run scope and batch mapping
+        ├── instructions/                # explicitly named supplementary contracts
         ├── worktrees/implementation/
         ├── worktrees/reviewer/
         ├── verification_runs/
@@ -120,7 +123,10 @@ Report the target SHA, working-tree state, upstream, and locally known ahead/beh
 
 If an upstream exists and current remote state matters, ask before running `git fetch`. Fetching may update observations but must not automatically merge, rebase, or pull. After any user-approved synchronization, run preflight again and initialize only from the confirmed target SHA.
 
-Uncommitted project changes are not part of a Git worktree baseline. Ask the user to commit or otherwise resolve them before initialization; do not silently omit, stash, or copy them.
+Uncommitted project changes are not part of a Git worktree baseline, but they do not block
+initialization. Report them as excluded and freeze the exact committed SHA named by `--target-branch`.
+Never stash, reset, commit, or copy the dirty checkout automatically. If an uncommitted instruction
+such as `AGENTS.md` or `CLAUDE.md` must govern the run, name it explicitly with `--instruction-file`.
 
 ## Start a new run
 
@@ -170,7 +176,8 @@ Initialize a new run:
   --reviewer <claude-or-codex-or-dsh> \
   --fix-policy <ask-auto-or-never> \
   --batches <comma-separated-batch-ids> \
-  --target-branch <branch>
+  --target-branch <branch> \
+  [--instruction-file <absolute-contract-path>]...
 ```
 
 The current host remains the implementer and is never model-overridden by this workflow. To override the
@@ -185,7 +192,16 @@ isolated reviewer's advanced default, append the same selection verified during 
 Use `cli-default` for any reviewer model to defer to its CLI or harness. These values are frozen in `reviewer_runtime`; credentials, bearer tokens, and endpoint URLs are
 never copied into workflow state.
 
-Initialization snapshots both the plan and batch manifest, records their digests, verifies that the manifest names every declared batch ID, creates a unique implementation branch and reviewer worktree, and leaves the original project's branch, HEAD, index, and files unchanged. The new run starts at `AWAITING_CONTRACT_REVIEW`.
+Initialization snapshots the plan, batch manifest, and every explicitly named instruction; records
+their digests; verifies that the manifest names every declared batch ID; creates a unique implementation
+branch and reviewer worktree from the target branch's committed SHA; and leaves the original project's
+branch, HEAD, index, and files unchanged. It reports the original working-tree changes as excluded from
+the baseline. The new run starts at `AWAITING_CONTRACT_REVIEW`.
+
+Read every returned instruction snapshot before implementation. Contract review and batch review receive
+invocation-local copies of the same digest-bound files. A later edit to the source instruction does not
+change the run; an edit to the frozen snapshot fails closed. A conflict between a supplementary instruction
+and the committed baseline requires a user decision rather than an implicit precedence guess.
 
 The run also freezes its quality-round, reviewer-invocation, contract-invocation, verification-attempt, and evidence-cycle budgets. Changing a global constant later does not silently change an existing run.
 

@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.6.1
+  version: 0.6.2
   compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude, Codex, or dsh CLI adapter
 ---
 
@@ -160,6 +160,12 @@ active, commands that omit `--run-id` refuse and list the candidates. Target-bra
 invalidates baseline execution: finish the reviewed candidate, then use preview-first `reconcile` and
 `submit-reconciliation` when the target has diverged. Re-running `reconcile` returns the active attempt;
 use preview-first `abandon-reconciliation` before intentionally starting another.
+
+Implementation initialization freezes the named target branch's committed SHA and does not require the
+current checkout to be clean. Uncommitted files are reported and excluded from that source baseline.
+When an uncommitted project contract must govern the run, pass it explicitly with repeatable
+`--instruction-file`; the engine freezes it separately for the host and both reviewer boundaries.
+The checked-out target must still be clean at final integration so user work cannot be overwritten.
 
 The implementation host remains the current host model. Its isolated reviewer may be Claude, Codex, or
 dsh. Claude defaults to Opus, Codex to `gpt-5.6-sol`, and dsh to the model selected in

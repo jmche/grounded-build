@@ -77,6 +77,12 @@ Keep the original checkout untouched until I approve final integration.
 Grounded Build does not require you to pay for Plan again before Implement. If an existing plan has
 no finite batch manifest, the host derives one and obtains confirmation before freezing it.
 
+Implement mode freezes the committed SHA of the selected target branch, so a dirty current checkout
+does not block initialization and is never copied into run worktrees. The init result lists those
+excluded changes. If an uncommitted `AGENTS.md`, `CLAUDE.md`, or another project contract must govern
+the run, name it explicitly with repeatable `--instruction-file`; it is frozen separately and supplied
+to contract and code reviewers. Final integration still refuses a dirty checked-out target.
+
 ## What makes it different
 
 | Capability | Typical direct agent workflow | Grounded Build |
@@ -187,7 +193,7 @@ deployments.
 
 ## Public beta status
 
-Version `v0.6.1` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
+Version `v0.6.2` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
 release gate are production-oriented, but broader provider and repository coverage is still needed
 before a general-availability claim.
 

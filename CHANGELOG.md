@@ -2,6 +2,16 @@
 
 All notable changes use semantic versioning.
 
+## [0.6.2] - 2026-09-02
+
+- Allowed implementation runs to initialize from an explicitly selected target-branch SHA while the
+  current checkout is dirty; recorded every excluded working-tree change without stashing, copying,
+  resetting, or committing it.
+- Added repeatable `--instruction-file` snapshots for explicit uncommitted project contracts, bound
+  them by SHA-256, and supplied invocation-local copies to acceptance-contract and fixed-SHA reviewers.
+- Kept final integration fail-closed when the target branch is the dirty current checkout, preserving
+  the user's in-progress work at the only boundary that mutates the original project.
+
 ## [0.6.1] - 2026-09-01
 
 - Added one production-causality protocol shared by planning, host synthesis, acceptance-contract

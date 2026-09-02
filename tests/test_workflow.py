@@ -411,6 +411,17 @@ class WorkflowIntegrationTests(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(implementation_head, latest)
 
+    def test_finalize_still_refuses_dirty_checked_out_target(self) -> None:
+        initialized = self.initialize("codex")
+        self.review_accept(initialized)
+        (self.project / "local-note.txt").write_text("preserve me\n", encoding="utf-8")
+        rejected = self.workflow(
+            "finalize", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply", expected=1,
+        )
+        self.assertIn("original project worktree is not clean", str(rejected["error"]))
+        self.assertEqual((self.project / "local-note.txt").read_text(encoding="utf-8"), "preserve me\n")
+
     def test_finalize_recovers_after_merge_before_state_commit(self) -> None:
         initialized = self.initialize("codex")
         final_head, _ = self.review_accept(initialized)
@@ -991,18 +1002,27 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(len(listing["runs"]), 2)
         self.assertEqual(listing["active_run"], second["run_id"])
 
-    def test_snapshot_is_authority_and_dirty_original_is_infrastructure_error(self) -> None:
-        (self.project / "dirty.txt").write_text("dirty\n", encoding="utf-8")
-        blocked = self.workflow(
+    def test_snapshot_is_authority_and_dirty_original_is_excluded_from_baseline(self) -> None:
+        (self.project / "tracked.txt").write_text("uncommitted tracked change\n", encoding="utf-8")
+        (self.project / "dirty.txt").write_text("untracked change\n", encoding="utf-8")
+        initialized = self.workflow(
             "init", "--project", str(self.project), "--plan", str(self.plan),
             "--batch-manifest", str(self.batch_manifest),
-            "--reviewer", "codex", "--batches", "1", expected=1,
+            "--reviewer", "codex", "--batches", "1", "--target-branch", "main",
         )
-        self.assertEqual(blocked["status"], "WORKFLOW_ERROR")
-        self.assertIn("not clean", str(blocked["error"]))
-        (self.project / "dirty.txt").unlink()
-        initialized = self.initialize("codex")
+        self.assertEqual(initialized["status"], "AWAITING_CONTRACT_REVIEW")
+        self.assertFalse(initialized["original_worktree_clean_at_start"])
+        self.assertTrue(initialized["original_worktree_changes_excluded_from_baseline"])
+        self.assertIn(" M tracked.txt", initialized["original_worktree_changes_at_start"])
+        self.assertIn("?? dirty.txt", initialized["original_worktree_changes_at_start"])
         implementation = Path(str(initialized["implementation_worktree"]))
+        self.assertEqual((implementation / "tracked.txt").read_text(encoding="utf-8"), "base\n")
+        self.assertFalse((implementation / "dirty.txt").exists())
+        contract = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(contract["status"], "CONTRACT_READY")
         self.commit_batch_change(implementation)
         self.plan.write_text("# Changed plan\n", encoding="utf-8")
         self.batch_manifest.write_text("# Changed source manifest\nBatch 1\n", encoding="utf-8")
@@ -1016,6 +1036,75 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--run-id", str(initialized["run_id"]), "--batch", "1",
         )
         self.assertEqual(changed["status"], "REVIEW_PASS")
+
+    def test_explicit_uncommitted_instruction_is_frozen_for_both_review_boundaries(self) -> None:
+        instruction = self.project / "CLAUDE.md"
+        instruction.write_text("# Local contract\n\nPreserve the public API.\n", encoding="utf-8")
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "codex",
+            "--batches", "1", "--target-branch", "main",
+            "--instruction-file", str(instruction),
+        )
+        records = initialized["instruction_snapshots"]
+        self.assertEqual(len(records), 1)
+        frozen = Path(str(records[0]["snapshot"]))
+        original_text = frozen.read_text(encoding="utf-8")
+        instruction.write_text("# Changed later\n", encoding="utf-8")
+
+        contract_preview = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--dry-run",
+        )
+        contract_prompt = Path(str(contract_preview["prompt_path"])).read_text(encoding="utf-8")
+        contract_match = re.search(
+            r"Frozen supplementary instruction manifest: `([^`]+)`", contract_prompt,
+        )
+        self.assertIsNotNone(contract_match)
+        contract_manifest = json.loads(Path(str(contract_match.group(1))).read_text(encoding="utf-8"))
+        contract_copy = Path(contract_manifest["instructions"][0]["snapshot"])
+        self.assertEqual(contract_copy.read_text(encoding="utf-8"), original_text)
+
+        contract = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(contract["status"], "CONTRACT_READY")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        review_preview = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", "--dry-run",
+        )
+        review_prompt = Path(str(review_preview["prompt_path"])).read_text(encoding="utf-8")
+        review_match = re.search(
+            r"Frozen supplementary instruction manifest: `([^`]+)`", review_prompt,
+        )
+        self.assertIsNotNone(review_match)
+        review_manifest = json.loads(Path(str(review_match.group(1))).read_text(encoding="utf-8"))
+        review_copy = Path(review_manifest["instructions"][0]["snapshot"])
+        self.assertEqual(review_copy.read_text(encoding="utf-8"), original_text)
+
+    def test_tampered_instruction_snapshot_fails_closed(self) -> None:
+        instruction = self.root / "AGENTS.md"
+        instruction.write_text("# Contract\n", encoding="utf-8")
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "codex",
+            "--batches", "1", "--target-branch", "main",
+            "--instruction-file", str(instruction),
+        )
+        frozen = Path(str(initialized["instruction_snapshots"][0]["snapshot"]))
+        frozen.write_text("tampered\n", encoding="utf-8")
+        rejected = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=1,
+        )
+        self.assertIn("frozen instruction snapshot changed", str(rejected["error"]))
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertIn("frozen instruction snapshot changed", str(status["instruction_snapshot_error"]))
 
     def test_batch_manifest_must_name_every_declared_batch(self) -> None:
         rejected = self.workflow(

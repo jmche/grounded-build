@@ -1228,7 +1228,9 @@ def upstream_info(project: Path, target_branch: str) -> dict[str, Any]:
 def preflight_payload(project: Path, target_branch: str) -> dict[str, Any]:
     target_sha = git(project, "rev-parse", target_branch)
     current_branch = git(project, "branch", "--show-current")
-    dirty = git(project, "status", "--porcelain", "--untracked-files=all").splitlines()
+    dirty = run(
+        ("git", "-C", str(project), "status", "--porcelain", "--untracked-files=all")
+    ).stdout.splitlines()
     return {
         "status": "PREFLIGHT",
         "project": str(project),
@@ -1484,6 +1486,83 @@ def copy_batch_manifest_context(state: dict[str, Any], destination: Path) -> Non
     destination.chmod(0o600)
 
 
+def snapshot_instruction_files(paths: list[str], run_root: Path) -> list[dict[str, Any]]:
+    """Freeze only explicitly named supplementary instructions for this run."""
+    snapshots: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    instruction_dir = run_root / "instructions"
+    if paths:
+        secure_directory(instruction_dir)
+    for number, value in enumerate(paths, start=1):
+        source = Path(value).expanduser().resolve()
+        if source in seen:
+            raise WorkflowError(f"duplicate --instruction-file: {source}")
+        seen.add(source)
+        if not source.is_file():
+            raise WorkflowError(f"instruction file does not exist or is not a regular file: {source}")
+        suffix = "".join(source.suffixes)[-32:]
+        stem = source.name[:-len(suffix)] if suffix else source.name
+        destination = instruction_dir / f"{number:02d}-{slug(stem, 48)}{suffix}"
+        shutil.copy2(source, destination)
+        destination.chmod(0o600)
+        snapshots.append({
+            "source": str(source),
+            "snapshot": str(destination),
+            "sha256": sha256_file(destination),
+            "size_bytes": destination.stat().st_size,
+        })
+    return snapshots
+
+
+def validate_instruction_snapshots(state: dict[str, Any]) -> None:
+    """Fail closed if an explicit run-local instruction snapshot is redirected or edited."""
+    records = state.get("instruction_snapshots", [])
+    if not isinstance(records, list):
+        raise WorkflowError("instruction snapshot registry is malformed")
+    expected_root = (Path(state["run_directory"]) / "instructions").resolve()
+    for record in records:
+        if not isinstance(record, dict):
+            raise WorkflowError("instruction snapshot registry contains a malformed entry")
+        raw = record.get("snapshot")
+        expected_digest = record.get("sha256")
+        if not isinstance(raw, str) or not isinstance(expected_digest, str):
+            raise WorkflowError("instruction snapshot entry lacks a path or digest")
+        snapshot = Path(raw)
+        if snapshot.is_symlink() or not snapshot.is_file():
+            raise WorkflowError(f"frozen instruction snapshot changed or disappeared: {snapshot}")
+        try:
+            snapshot.resolve().relative_to(expected_root)
+        except ValueError as exc:
+            raise WorkflowError(f"frozen instruction snapshot escaped its run directory: {snapshot}") from exc
+        if sha256_file(snapshot) != expected_digest:
+            raise WorkflowError(f"frozen instruction snapshot changed after initialization: {snapshot}")
+
+
+def copy_instruction_context(state: dict[str, Any], context: Path) -> Path | None:
+    """Copy frozen supplementary instructions into one reviewer invocation context."""
+    records = state.get("instruction_snapshots", [])
+    if not records:
+        return None
+    validate_instruction_snapshots(state)
+    destination_dir = context / "instructions"
+    secure_directory(destination_dir)
+    manifest_records: list[dict[str, Any]] = []
+    for record in records:
+        source = Path(record["snapshot"])
+        destination = destination_dir / source.name
+        shutil.copyfile(source, destination)
+        destination.chmod(0o600)
+        manifest_records.append({
+            "source_at_initialization": record["source"],
+            "snapshot": str(destination),
+            "sha256": record["sha256"],
+            "size_bytes": record["size_bytes"],
+        })
+    manifest = destination_dir / "manifest.json"
+    atomic_json(manifest, {"instructions": manifest_records})
+    return manifest
+
+
 def target_staleness(project: Path, state: dict[str, Any]) -> tuple[bool, str]:
     current = git(project, "rev-parse", state["target_branch"])
     return current != state["baseline_sha"], current
@@ -1497,6 +1576,7 @@ def validate_active_state(project: Path, state: dict[str, Any]) -> None:
     validate_controller_runtime(state)
     validate_environment_contract(project, state)
     validate_review_contract(state)
+    validate_instruction_snapshots(state)
 
 
 def validate_implementation(state: dict[str, Any]) -> Path:
@@ -1566,11 +1646,11 @@ def command_init(args: argparse.Namespace) -> None:
         raise WorkflowError(f"reviewer CLI is not available on PATH: {args.reviewer}")
     runtime = reviewer_runtime(args, args.reviewer)
     ensure_no_git_operation(project)
-    ensure_clean(project, "original project")
     target = args.target_branch or git(project, "branch", "--show-current")
     if not target:
         raise WorkflowError("detached HEAD requires --target-branch")
-    baseline = git(project, "rev-parse", target)
+    before = preflight_payload(project, target)
+    baseline = str(before["target_sha"])
 
     batches = parse_batches(args.batches)
     validate_batch_manifest(batch_manifest, batches)
@@ -1597,6 +1677,7 @@ def command_init(args: argparse.Namespace) -> None:
     shutil.copy2(batch_manifest, manifest_snapshot)
     snapshot.chmod(0o600)
     manifest_snapshot.chmod(0o600)
+    instruction_snapshots = snapshot_instruction_files(args.instruction_file, run_root)
     review_contract = snapshot_review_contract(run_root)
     branch = f"workflow/{slug(plan.stem, 28)}-{timestamp}-{secrets.token_hex(2)}"
 
@@ -1607,9 +1688,8 @@ def command_init(args: argparse.Namespace) -> None:
         # Keep any successfully registered worktree visible for explicit diagnosis/cleanup.
         raise
 
-    current_branch = git(project, "branch", "--show-current")
-    current_head = git(project, "rev-parse", "HEAD")
-    before = preflight_payload(project, target)
+    current_branch = str(before["current_branch"] or "")
+    current_head = str(before["current_sha"])
     state: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -1629,6 +1709,7 @@ def command_init(args: argparse.Namespace) -> None:
         "batch_manifest_snapshot": str(manifest_snapshot),
         "batch_manifest_digest": sha256_file(batch_manifest),
         "batch_manifest_snapshot_digest": sha256_file(manifest_snapshot),
+        "instruction_snapshots": instruction_snapshots,
         "reviewer": args.reviewer,
         "reviewer_runtime": runtime,
         "controller_runtime": controller_runtime(),
@@ -1648,6 +1729,8 @@ def command_init(args: argparse.Namespace) -> None:
         "upstream_sha_at_start": before["upstream_sha"],
         "original_branch_at_start": current_branch or None,
         "original_head_at_start": current_head,
+        "original_worktree_clean_at_start": before["working_tree_clean"],
+        "original_worktree_changes_at_start": before["working_tree_changes"],
         "batches": batches,
         "accepted_batches": [],
         "accepted_shas": {},
@@ -1690,6 +1773,9 @@ def command_init(args: argparse.Namespace) -> None:
         "controller_runtime": state["controller_runtime"],
         "project_runtime_at_start": state["project_runtime_at_start"],
         "review_contract": state["review_contract"],
+        "instruction_snapshots": state["instruction_snapshots"],
+        "original_worktree_clean_at_start": state["original_worktree_clean_at_start"],
+        "original_worktree_changes_at_start": state["original_worktree_changes_at_start"],
     })
     save_state(state)
     project_meta = {
@@ -1715,6 +1801,12 @@ def command_init(args: argparse.Namespace) -> None:
             "baseline_sha": baseline,
             "original_branch_unchanged": git(project, "branch", "--show-current") == current_branch,
             "original_head_unchanged": git(project, "rev-parse", "HEAD") == current_head,
+            "original_worktree_clean_at_start": state["original_worktree_clean_at_start"],
+            "original_worktree_changes_at_start": state["original_worktree_changes_at_start"],
+            "original_worktree_changes_excluded_from_baseline": bool(
+                state["original_worktree_changes_at_start"]
+            ),
+            "instruction_snapshots": state["instruction_snapshots"],
             "plan_digest": state["plan_digest"],
             "batch_manifest_digest": state["batch_manifest_digest"],
             "batches": batches,
@@ -1739,6 +1831,7 @@ def build_prompt(
     legacy_path: Path | None,
     evidence_path: Path | None,
     contract_path: Path,
+    instruction_manifest_path: Path | None,
 ) -> str:
     contract = read_review_contract(state, "batch_review")
     cumulative_final_review = batch == state["batches"][-1]
@@ -1766,13 +1859,16 @@ def build_prompt(
         f"- Diff range: `{base}..{head}`\n\n"
         f"- Finding ledger: `{ledger_path}`\n"
         f"- Acceptance contract: `{contract_path}`\n"
+        + (f"- Frozen supplementary instruction manifest: `{instruction_manifest_path}`\n" if instruction_manifest_path else "")
         + (f"- Legacy recovery findings: `{legacy_path}`\n" if legacy_path else "")
         + (f"- Fixed-SHA verification evidence: `{evidence_path}`\n" if evidence_path else "")
         + "\n"
         f"{round_scope}\n\n"
-        "Read the plan snapshot, frozen batch manifest, assignment decisions, and repository "
-        "instructions. Treat the manifest as authoritative for this run's included/excluded scope "
-        "and batch mapping. Do not silently expand the run to the rest of the plan; if the declared "
+        "Read the plan snapshot, frozen batch manifest, assignment decisions, repository "
+        "instructions, and every explicitly frozen supplementary instruction. If a supplementary "
+        "instruction conflicts with the committed baseline, return NEEDS_USER_DECISION rather than "
+        "silently choosing one. Treat the manifest as authoritative for this run's included/excluded "
+        "scope and batch mapping. Do not silently expand the run to the rest of the plan; if the declared "
         "boundary is unsound, return NEEDS_USER_DECISION. Review the declared batch and all "
         "affected consumers. Treat the supplied ledger as the authority for resolvable IDs. In a "
         "legacy recovery round, the explicitly supplied legacy recovery file is an additional "
@@ -1789,7 +1885,7 @@ def build_prompt(
 def prepare_review_context(
     state: dict[str, Any], batch: str, round_number: int, base: str, head: str,
     invocation_id: str,
-) -> tuple[Path, Path, Path, Path, Path, Path | None, Path | None, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path | None, Path | None, Path, Path | None]:
     """Create the minimal explicit context granted to the reviewer CLI."""
     context = (
         Path(state["run_directory"])
@@ -1809,6 +1905,7 @@ def prepare_review_context(
     shutil.copyfile(Path(state["plan_snapshot"]), plan_path)
     plan_path.chmod(0o600)
     copy_batch_manifest_context(state, batch_manifest_path)
+    instruction_manifest_path = copy_instruction_context(state, context)
     atomic_json(ledger_path, state.get("finding_ledger", {}))
     atomic_json(contract_path, state["acceptance_contract"])
     atomic_json(
@@ -1858,7 +1955,7 @@ def prepare_review_context(
         atomic_json(evidence_path, {"evidence": evidence, "rejected_requests": rejected})
     return (
         context, plan_path, batch_manifest_path, assignment_path, ledger_path,
-        legacy_path, evidence_path, contract_path,
+        legacy_path, evidence_path, contract_path, instruction_manifest_path,
     )
 
 
@@ -2226,12 +2323,15 @@ def command_contract_review(args: argparse.Namespace) -> None:
     shutil.copyfile(Path(state["plan_snapshot"]), plan_copy)
     plan_copy.chmod(0o600)
     copy_batch_manifest_context(state, batch_manifest_copy)
+    instruction_manifest = copy_instruction_context(state, context)
     prompt = (
         read_review_contract(state, "contract_review")
         + "\n\n## Contract review assignment\n\n"
         + f"- Plan snapshot: `{plan_copy}`\n- Baseline SHA: `{state['baseline_sha']}`\n"
         + f"- Authoritative run scope and batch manifest: `{batch_manifest_copy}`\n"
+        + (f"- Frozen supplementary instruction manifest: `{instruction_manifest}`\n" if instruction_manifest else "")
         + f"- Batches: `{','.join(state['batches'])}`\n"
+        + "Read every explicitly frozen supplementary instruction. If one conflicts with the committed baseline, return NEEDS_USER_DECISION rather than silently choosing one. "
         + "Apply the production causality rules in the reviewer contract proportionally. Treat the frozen manifest as authoritative for this run's included/excluded scope and "
         + "batch mapping. Do not silently reinterpret this run as covering the whole plan. If the "
         + "manifest conflicts with an indivisible requirement or omits a boundary needed for a "
@@ -3702,13 +3802,14 @@ def command_review(args: argparse.Namespace) -> None:
     (
         context_dir, context_plan, context_batch_manifest, context_assignment,
         context_ledger, context_legacy, context_evidence, context_contract,
+        context_instruction_manifest,
     ) = prepare_review_context(
         state, args.batch, round_number, base, head, invocation_id
     )
     prompt = build_prompt(
         state, args.batch, round_number, base, head,
         context_plan, context_batch_manifest, context_assignment, context_ledger,
-        context_legacy, context_evidence, context_contract,
+        context_legacy, context_evidence, context_contract, context_instruction_manifest,
     )
     prompt_path.write_text(prompt, encoding="utf-8")
     prompt_path.chmod(0o600)
@@ -4177,11 +4278,16 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         )
     )
     review_contract_error: str | None = None
+    instruction_snapshot_error: str | None = None
     if not state.get("_requires_migration"):
         try:
             validate_review_contract(state)
         except WorkflowError as exc:
             review_contract_error = str(exc)
+        try:
+            validate_instruction_snapshots(state)
+        except WorkflowError as exc:
+            instruction_snapshot_error = str(exc)
     return {
         "status": effective_status, "recorded_status": state["status"],
         "project": str(project), "project_key": state["project_key"],
@@ -4201,6 +4307,7 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "environment": environment_status(project, state),
         "review_contract": state.get("review_contract"),
         "review_contract_error": review_contract_error,
+        "instruction_snapshot_error": instruction_snapshot_error,
         "reviewer_history": state.get("reviewer_history", []),
         "implementer": state.get("implementer", "legacy-unknown"),
         "fix_policy": state["fix_policy"], "batches": state["batches"],
@@ -4231,6 +4338,12 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "batch_manifest_snapshot": state.get("batch_manifest_snapshot"),
         "batch_manifest_snapshot_digest": state.get("batch_manifest_snapshot_digest"),
         "source_batch_manifest_changed": source_batch_manifest_changed,
+        "instruction_snapshots": state.get("instruction_snapshots", []),
+        "original_worktree_clean_at_start": state.get("original_worktree_clean_at_start"),
+        "original_worktree_changes_at_start": state.get("original_worktree_changes_at_start", []),
+        "original_worktree_changes_excluded_from_baseline": bool(
+            state.get("original_worktree_changes_at_start", [])
+        ),
         "worktrees_removed": state["worktrees_removed"],
     }
 
@@ -5161,6 +5274,10 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--fix-policy", choices=("ask", "auto", "never"), default="ask")
     init.add_argument("--batches", required=True)
     init.add_argument("--target-branch")
+    init.add_argument(
+        "--instruction-file", action="append", default=[],
+        help="explicit supplementary project instruction to freeze; repeat for multiple files",
+    )
     add_reviewer_selection(init)
     init.set_defaults(func=command_init)
 

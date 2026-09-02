@@ -3,7 +3,7 @@
 # grounded-build
 
 ## Purpose
-A local coding-agent skill (v0.6.1, public beta) with two independent modes. **Plan** runs two
+A local coding-agent skill (v0.6.2, public beta) with two independent modes. **Plan** runs two
 isolated Claude/Codex/dsh CLI instances against one frozen Git SHA, has them investigate independently,
 cross-review each other's evidence, and converge on a host-synthesized implementation plan. **Implement**
 executes an approved plan batch by batch in isolated Git worktrees with fixed-SHA independent review,
@@ -16,7 +16,7 @@ next rather than reconstructing a state machine from prose.
 |------|-------------|
 | `SKILL.md` | Host-facing skill contract and entry point: routing (Plan / Implement / end-to-end), non-negotiable boundaries, and the command sequence for both workflows. Frontmatter carries `name`, `description`, and `metadata.version`. |
 | `README.md` | Human-facing overview, install location, examples, runtime notes, and coexistence rules with `implement-plan-with-review`. |
-| `VERSION` | Single source of truth for the release version (`0.6.1`). The release gate rejects drift against SKILL.md, README.md, CHANGELOG.md, and `scripts/plan_workflow.py`. |
+| `VERSION` | Single source of truth for the release version (`0.6.2`). The release gate rejects drift against SKILL.md, README.md, CHANGELOG.md, and `scripts/plan_workflow.py`. |
 | `CHANGELOG.md` | Semantic-versioned history; entries record measured behavior (e.g. limits derived from a completed 223-verification run), not intentions. |
 | `SECURITY.md` | Trust model, enforced bubblewrap/filesystem boundaries, the deliberate limit of local HMAC, and private vulnerability reporting. Content is asserted by the release gate. |
 | `LICENSE` | MIT license. The release gate requires it to start with `MIT License`. |
