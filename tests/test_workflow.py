@@ -889,11 +889,25 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(state["status"], "READY_TO_FINALIZE")
         self.assertEqual(state["integration_transaction"]["status"], "ABORTED_TARGET_MOVED")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        tree = self.run_command("git", "-C", str(implementation), "write-tree").stdout.strip()
+        later_sha = self.run_command(
+            "git", "-C", str(implementation), "commit-tree", tree,
+            "-p", final_sha, "-m", "later unreviewed commit",
+        ).stdout.strip()
+        self.run_command(
+            "git", "-C", str(implementation), "update-ref",
+            "refs/heads/" + str(initialized["implementation_branch"]), later_sha,
+        )
+        self.run_command(
+            "git", "-C", str(self.project), "worktree", "remove", str(implementation),
+        )
         preview = self.workflow(
             "reconcile", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]),
         )
         self.assertEqual(preview["status"], "RECONCILE_PREVIEW")
+        self.assertEqual(preview["source_candidate_sha"], final_sha)
 
     def test_final_integration_lock_serializes_only_target_updates(self) -> None:
         initialized = self.initialize("codex")

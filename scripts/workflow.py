@@ -4914,13 +4914,18 @@ def command_reconcile(args: argparse.Namespace) -> None:
     validate_active_state(project, state)
     if state.get("status") != "READY_TO_FINALIZE":
         raise WorkflowError(f"reconcile requires READY_TO_FINALIZE, found {state.get('status')}")
-    implementation = validate_implementation(state)
-    ensure_clean(implementation, "implementation")
-    source = git(implementation, "rev-parse", "HEAD")
     accepted = state.get("accepted_shas", {}).get(state["batches"][-1])
     final_verification = state.get("final_verification") or {}
-    if source != accepted or final_verification.get("reviewed_sha") != source:
+    if not isinstance(accepted, str) or final_verification.get("reviewed_sha") != accepted:
         raise WorkflowError("reconciliation source is not the final accepted and verified SHA")
+    # Reconciliation merges the immutable accepted candidate. The implementation branch and
+    # worktree may legitimately move or disappear after review, especially while recovering a
+    # prepared integration whose target advanced concurrently.
+    source = accepted
+    if run(
+        ("git", "-C", str(project), "cat-file", "-e", f"{source}^{{commit}}"), check=False,
+    ).returncode:
+        raise WorkflowError("final accepted reconciliation source is no longer a Git commit")
     target_branch = args.target_branch or state["target_branch"]
     if target_branch != state["target_branch"]:
         raise WorkflowError(
