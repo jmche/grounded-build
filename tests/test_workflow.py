@@ -12,6 +12,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -432,6 +433,60 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertIn("original project worktree is not clean", str(rejected["error"]))
         self.assertEqual((self.project / "local-note.txt").read_text(encoding="utf-8"), "preserve me\n")
+
+    def test_finalize_merges_the_reviewed_sha_when_implementation_branch_moves(self) -> None:
+        initialized = self.initialize("codex")
+        reviewed_sha, _ = self.review_accept(initialized)
+        implementation = Path(str(initialized["implementation_worktree"]))
+        tree = self.run_command("git", "-C", str(implementation), "write-tree").stdout.strip()
+        unreviewed_sha = self.run_command(
+            "git", "-C", str(implementation), "commit-tree", tree,
+            "-p", reviewed_sha, "-m", "unreviewed race commit",
+        ).stdout.strip()
+        real_git = shutil.which("git")
+        assert real_git
+        wrapper = self.bin_dir / "git"
+        wrapper.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import os
+                import subprocess
+                import sys
+                args = sys.argv[1:]
+                if "merge" in args and os.environ.get("GB_RACE_BRANCH"):
+                    subprocess.run([
+                        {real_git!r}, "-C", os.environ["GB_RACE_WORKTREE"], "update-ref",
+                        "refs/heads/" + os.environ["GB_RACE_BRANCH"],
+                        os.environ["GB_RACE_SHA"],
+                    ], check=True)
+                os.execv({real_git!r}, [{real_git!r}, *args])
+                """
+            ),
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        self.environment.update({
+            "GB_RACE_BRANCH": str(initialized["implementation_branch"]),
+            "GB_RACE_WORKTREE": str(implementation),
+            "GB_RACE_SHA": unreviewed_sha,
+        })
+        finalized = self.workflow(
+            "finalize", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
+        )
+        self.assertEqual(finalized["final_sha"], reviewed_sha)
+        self.assertEqual(
+            self.run_command("git", "-C", str(self.project), "rev-parse", "main").stdout.strip(),
+            reviewed_sha,
+        )
+        self.assertEqual(
+            self.run_command(
+                "git", "-C", str(self.project), "rev-parse",
+                str(initialized["implementation_branch"]),
+            ).stdout.strip(),
+            unreviewed_sha,
+        )
 
     def test_finalize_recovers_after_merge_before_state_commit(self) -> None:
         initialized = self.initialize("codex")
@@ -1172,6 +1227,50 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--run-id", str(initialized["run_id"]), expected=1,
         )
         self.assertIn("frozen instruction directory changed", str(rejected["error"]))
+
+    def test_instruction_context_copy_rechecks_the_exact_bytes(self) -> None:
+        run_root = self.root / "instruction-copy-run"
+        instruction_dir = run_root / "instructions"
+        context = run_root / "context"
+        instruction_dir.mkdir(parents=True)
+        context.mkdir()
+        snapshot = instruction_dir / "01-contract.md"
+        snapshot.write_text("trusted\n", encoding="utf-8")
+        state = {
+            "run_directory": str(run_root),
+            "instruction_snapshots": [{
+                "source": str(self.root / "AGENTS.md"),
+                "snapshot": str(snapshot),
+                "sha256": WORKFLOW_MODULE.sha256_file(snapshot),
+                "size_bytes": snapshot.stat().st_size,
+            }],
+        }
+        original_validate = WORKFLOW_MODULE.validate_instruction_snapshots
+
+        def swap_after_validation(candidate: dict[str, object]) -> None:
+            original_validate(candidate)
+            snapshot.write_text("raced\n", encoding="utf-8")
+
+        with mock.patch.object(
+            WORKFLOW_MODULE, "validate_instruction_snapshots", side_effect=swap_after_validation,
+        ):
+            with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "changed while being read"):
+                WORKFLOW_MODULE.copy_instruction_context(state, context)
+
+    def test_atomic_file_publication_never_leaves_a_partial_authority_file(self) -> None:
+        destination = self.root / "workflow.schema8.json"
+        with mock.patch.object(os, "link", side_effect=OSError("simulated crash boundary")):
+            with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "cannot create migration backup"):
+                WORKFLOW_MODULE.create_file_atomically(
+                    destination, b"authenticated state", "migration backup",
+                )
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.root.glob(".workflow.schema8.json.*")), [])
+        WORKFLOW_MODULE.create_file_atomically(
+            destination, b"authenticated state", "migration backup",
+        )
+        self.assertEqual(destination.read_bytes(), b"authenticated state")
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
 
     def test_batch_manifest_must_name_every_declared_batch(self) -> None:
         rejected = self.workflow(

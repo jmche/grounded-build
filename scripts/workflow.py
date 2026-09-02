@@ -1050,6 +1050,55 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def read_frozen_bytes(path: Path, expected_digest: str, label: str) -> bytes:
+    """Read one regular file through a no-follow descriptor and bind the bytes to its digest."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise WorkflowError(f"cannot read {label} {path}: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise WorkflowError(f"{label} must be a regular file: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            content = handle.read()
+    finally:
+        os.close(descriptor)
+    if sha256_bytes(content) != expected_digest:
+        raise WorkflowError(f"{label} changed while being read: {path}")
+    return content
+
+
+def create_file_atomically(path: Path, content: bytes, label: str) -> None:
+    """Publish mode-0600 bytes atomically without replacing an existing authority file."""
+    descriptor: int | None = None
+    temporary: str | None = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.close(descriptor)
+        descriptor = None
+        os.link(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except FileExistsError as exc:
+        raise WorkflowError(f"{label} already exists: {path}") from exc
+    except OSError as exc:
+        raise WorkflowError(f"cannot create {label} {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def snapshot_review_contract(
     run_root: Path, *, create_missing_parent: bool = False,
 ) -> dict[str, dict[str, str]]:
@@ -1592,8 +1641,10 @@ def copy_instruction_context(state: dict[str, Any], context: Path) -> Path | Non
     for record in records:
         source = Path(record["snapshot"])
         destination = destination_dir / source.name
-        shutil.copyfile(source, destination)
-        destination.chmod(0o600)
+        content = read_frozen_bytes(source, record["sha256"], "frozen instruction snapshot")
+        create_file_atomically(destination, content, "reviewer instruction copy")
+        if sha256_file(destination) != record["sha256"]:
+            raise WorkflowError(f"reviewer instruction copy digest mismatch: {destination}")
         manifest_records.append({
             "source_at_initialization": record["source"],
             "snapshot": str(destination),
@@ -4502,8 +4553,10 @@ def command_migrate(args: argparse.Namespace) -> None:
             backup.chmod(0o600)
             backup_reused = True
         else:
-            shutil.copy2(path, backup)
-            backup.chmod(0o600)
+            legacy_bytes = read_frozen_bytes(
+                path, sha256_file(path), "authenticated legacy workflow state",
+            )
+            create_file_atomically(backup, legacy_bytes, "migration backup")
         state.pop("_requires_migration", None)
         state.pop("_migration_snapshot_mismatch", None)
         review_contract_migration = bool(state.pop("_migration_review_contract_required", False))
@@ -4784,7 +4837,7 @@ def command_finalize(args: argparse.Namespace) -> None:
         append_event(state, "INTEGRATION_PREPARED", state["integration_transaction"])
         save_state(state)
     if current_branch == state["target_branch"]:
-        git(project, "merge", "--ff-only", state["implementation_branch"])
+        git(project, "merge", "--ff-only", final_head)
         merged = git(project, "rev-parse", "HEAD")
     else:
         git(project, "update-ref", target_ref, final_head, target_sha)
