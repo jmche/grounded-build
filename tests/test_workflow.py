@@ -491,6 +491,12 @@ class WorkflowIntegrationTests(unittest.TestCase):
     def test_finalize_recovers_after_merge_before_state_commit(self) -> None:
         initialized = self.initialize("codex")
         final_head, _ = self.review_accept(initialized)
+        implementation = Path(str(initialized["implementation_worktree"]))
+        tree = self.run_command("git", "-C", str(implementation), "write-tree").stdout.strip()
+        later_sha = self.run_command(
+            "git", "-C", str(implementation), "commit-tree", tree,
+            "-p", final_head, "-m", "later unreviewed commit",
+        ).stdout.strip()
         prior_home = os.environ.get("GROUNDED_BUILD_IMPLEMENT_HOME")
         os.environ["GROUNDED_BUILD_IMPLEMENT_HOME"] = str(self.state_home)
         try:
@@ -514,6 +520,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "git", "-C", str(self.project), "merge", "--ff-only",
             str(initialized["implementation_branch"]),
         )
+        self.run_command(
+            "git", "-C", str(implementation), "update-ref",
+            "refs/heads/" + str(initialized["implementation_branch"]), later_sha,
+        )
         preview = self.workflow(
             "finalize", "--project", str(self.project), "--run-id", str(initialized["run_id"])
         )
@@ -521,6 +531,40 @@ class WorkflowIntegrationTests(unittest.TestCase):
         recovered = self.workflow(
             "finalize", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
             "--apply",
+        )
+        self.assertEqual(recovered["status"], "FINALIZED")
+        self.assertEqual(recovered["final_sha"], final_head)
+
+    def test_finalize_continues_after_prepared_implementation_worktree_disappears(self) -> None:
+        initialized = self.initialize("codex")
+        final_head, _ = self.review_accept(initialized)
+        prior_home = os.environ.get("GROUNDED_BUILD_IMPLEMENT_HOME")
+        os.environ["GROUNDED_BUILD_IMPLEMENT_HOME"] = str(self.state_home)
+        try:
+            state = WORKFLOW_MODULE.load_state(self.project, str(initialized["run_id"]))
+            state["status"] = "FINALIZING"
+            state["integration_transaction"] = {
+                "status": "PREPARED", "target_branch": "main",
+                "baseline_sha": state["baseline_sha"],
+                "expected_target_sha": state["baseline_sha"],
+                "final_sha": final_head, "prepared_at": WORKFLOW_MODULE.utc_now(),
+            }
+            WORKFLOW_MODULE.append_event(
+                state, "INTEGRATION_PREPARED", state["integration_transaction"]
+            )
+            WORKFLOW_MODULE.save_state(state)
+        finally:
+            if prior_home is None:
+                os.environ.pop("GROUNDED_BUILD_IMPLEMENT_HOME", None)
+            else:
+                os.environ["GROUNDED_BUILD_IMPLEMENT_HOME"] = prior_home
+        self.run_command(
+            "git", "-C", str(self.project), "worktree", "remove",
+            str(initialized["implementation_worktree"]),
+        )
+        recovered = self.workflow(
+            "finalize", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--apply",
         )
         self.assertEqual(recovered["status"], "FINALIZED")
         self.assertEqual(recovered["final_sha"], final_head)

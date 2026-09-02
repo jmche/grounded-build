@@ -4707,31 +4707,40 @@ def command_finalize(args: argparse.Namespace) -> None:
     if current_batch(state) is not None:
         raise WorkflowError(f"cannot finalize before accepting batch {current_batch(state)!r}")
     validate_plan_unchanged(state)
-    implementation = validate_implementation(state)
-    ensure_clean(implementation, "implementation")
-    final_head = git(implementation, "rev-parse", "HEAD")
     accepted_final = state["accepted_shas"].get(state["batches"][-1])
-    if accepted_final != final_head:
-        # Commits made after acceptance are outside the batch contract, so refusing is correct --
-        # but the operator still has to be told which two SHAs disagree and what the legal moves are.
-        raise WorkflowError(
-            f"implementation HEAD is {final_head[:12]} but the accepted final SHA is "
-            f"{str(accepted_final)[:12]}; commits made after acceptance are outside this batch's "
-            "contract. Reset the implementation worktree to the accepted SHA to finalize it, or "
-            "supersede this run and review the extra commits in a new one."
-        )
     final_verification = state.get("final_verification")
     if not isinstance(final_verification, dict) or final_verification.get("status") not in {"PASS", "NOT_APPLICABLE"}:
         raise WorkflowError("final fixed-SHA verification has not completed")
+    transaction = state.get("integration_transaction")
+    if state.get("status") == "FINALIZING":
+        if not isinstance(transaction, dict) or not isinstance(transaction.get("final_sha"), str):
+            raise WorkflowError("FINALIZING state lacks a valid integration transaction")
+        # Once preparation is durable, the transaction's reviewed SHA is the integration
+        # authority. The implementation branch and worktree are mutable operational resources;
+        # neither may strand recovery after the target ref has already advanced.
+        final_head = transaction["final_sha"]
+        if accepted_final != final_head:
+            raise WorkflowError("integration transaction does not belong to the final accepted SHA")
+    else:
+        implementation = validate_implementation(state)
+        ensure_clean(implementation, "implementation")
+        final_head = git(implementation, "rev-parse", "HEAD")
+        if accepted_final != final_head:
+            # Commits made after acceptance are outside the batch contract, so refusing is correct --
+            # but the operator still has to be told which two SHAs disagree and what the legal moves are.
+            raise WorkflowError(
+                f"implementation HEAD is {final_head[:12]} but the accepted final SHA is "
+                f"{str(accepted_final)[:12]}; commits made after acceptance are outside this batch's "
+                "contract. Reset the implementation worktree to the accepted SHA to finalize it, or "
+                "supersede this run and review the extra commits in a new one."
+            )
     if final_verification.get("reviewed_sha") != final_head:
         raise WorkflowError("final verification does not belong to the final accepted SHA")
     target_sha = git(project, "rev-parse", state["target_branch"])
     integration = state.get("integration") or {}
     expected_target = integration.get("approved_target_sha") or state["baseline_sha"]
-    transaction = state.get("integration_transaction")
     if state.get("status") == "FINALIZING":
-        if not isinstance(transaction, dict) or transaction.get("final_sha") != final_head:
-            raise WorkflowError("FINALIZING state lacks a valid integration transaction")
+        assert isinstance(transaction, dict)
         if target_sha == final_head:
             recovery = {
                 "status": "FINALIZE_RECOVERY_PREVIEW", "run_id": state["run_id"],
