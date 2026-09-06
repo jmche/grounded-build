@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.6.2
+  version: 0.6.3
   compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude, Codex, or dsh CLI adapter
 ---
 
@@ -20,7 +20,8 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
 ## Non-negotiable boundaries
 
 - Work from the absolute Git repository root and freeze its exact SHA.
-- Planning requires a clean checkout. Never stash, reset, clean, or commit user work to satisfy this.
+- Planning freezes the committed SHA selected by `--base-ref`; a dirty source checkout is reported
+  and excluded. Never stash, reset, clean, commit, or copy user work to manufacture a baseline.
 - Freeze each run at its baseline SHA; after initialization the original checkout may move independently until explicit final integration.
 - A CLI adapter is not a model identity. Record `agent_runtime`, `provider_diversity`, and `model_diversity` exactly as reported. Every run freezes the workflow engine, model selection, and invocation argv; reject silent engine drift.
 - Agreement is not evidence. Bind claims to files, symbols, tests, commands, or authoritative sources.
@@ -45,7 +46,8 @@ Use `scripts/plan_workflow.py`. Detailed state and failure semantics are in [ref
 
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py preflight \
-  --project <absolute-project> --backend <auto|claude|codex|dsh>
+  --project <absolute-project> --base-ref <ref> \
+  --backend <auto|claude|codex|dsh>
 ```
 
 Use `--probe` when provider authentication/configuration is uncertain; it makes one small paid, sandboxed schema call per selected adapter.
@@ -85,16 +87,24 @@ and third-party summaries are never evidence.
 
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py init \
-  --project <project> --request <request.md> \
+  --project <project> --request <request.md> --base-ref <ref> \
   --backend <backend> --final-reviewer <both|claude|codex|dsh> \
   --planning-depth <standard|deep> \
   --research-policy <local-only|authoritative-web> \
   [Codex selection options from preflight]
 ```
 
-Record `run_id`, `agent_runtime`, and the returned `next_action`.
+`--base-ref` defaults to `HEAD`. Planning freezes that ref's committed SHA in its own detached
+worktree; staged, modified, and untracked files in the source checkout neither block initialization
+nor enter the planning snapshot. Pass an explicit ref whenever the checked-out branch is not the
+intended planning authority.
+
+Record `run_id`, `base_ref`, `baseline_sha`, the excluded source-worktree changes,
+`agent_runtime`, and the returned `next_action`.
 If a later skill update causes an engine-drift rejection, never bypass it by editing state. Preview and obtain
 approval for `migrate-engine --reason <reason> --actor <actor> --apply`; this preserves the old and new identities.
+If an interrupted controller leaves one assignment marked `RUNNING`, preview and explicitly apply
+`recover-invocation` for that assignment before retrying or migrating. Its spent attempt remains charged.
 
 ### 3. Follow the deterministic next action
 

@@ -41,7 +41,7 @@ Collect or infer:
   must govern this run. These are frozen explicitly; unrelated working-tree changes are never copied.
   Each file must be UTF-8 text, at most 1 MiB, and the run accepts at most 16 files.
 
-The agent invoking this skill is always the implementer. Do not launch another implementer. A same-family reviewer is allowed only as a fresh reviewer CLI invocation under the workflow's isolated reviewer contract; the current host conversation must never issue its own PASS. Claude and Codex use their read-only CLI modes. dsh uses workspace-write only in the detached reviewer worktree so it can persist structured output under `.review-out/`; the workflow rejects any unrelated worktree mutation.
+The agent invoking this skill is always the implementer. Do not launch another implementer. A same-family reviewer is allowed only as a fresh reviewer CLI invocation under the workflow's isolated reviewer contract; the current host conversation must never issue its own PASS. Claude and Codex use their read-only CLI modes. dsh uses path-bounded read-only file tools, reads a controller-captured fixed-SHA diff, and returns one complete structured result through its final output; it receives no writable reviewer channel and does not alter shared Git configuration.
 
 ## Storage and isolation
 
@@ -83,7 +83,7 @@ review. Target movement is integration divergence, not execution staleness.
 - Do not use `git reset --hard`, `git clean`, automatic stash, silent rebase, or automatic conflict resolution.
 - Do not delete worktree directories directly; use the script's cleanup operation.
 - Continue fixed-baseline execution if the target advances. Previously issued review approvals do not authorize the combined code; use reviewed reconciliation before integration.
-- Use at most four valid review rounds per batch: one full discovery review and three bounded re-reviews. Reviewer infrastructure errors do not consume a round.
+- The ordinary cap is four valid review rounds per batch: one full discovery review and three bounded re-reviews. Reviewer infrastructure errors do not consume a round. Three separately audited exceptions may each add at most one round: a convergence-boundary grant, a review-budget grant, and a new-commit re-review after an effective PASS. Thus the absolute non-legacy maximum is seven; none is automatic except the single new-commit re-review, and that exemption requires a controller-effective PASS for the prior SHA.
 - Count every real reviewer invocation separately from valid quality rounds. Infrastructure failures consume invocation budget and remain auditable even though they do not consume repair budget.
 - Treat `plan/original.md` and `plan/batches.md` with their recorded digests as the run authority. The manifest defines this run's total included/excluded scope and batch mapping. A later edit or move of either source is informational; a changed snapshot is corruption.
 - Never overwrite a contract, review, or verification attempt. Every invocation receives a unique append-only directory and event record.

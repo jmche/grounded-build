@@ -4,17 +4,18 @@
 # scripts
 
 ## Purpose
-The executable core of the skill: two independent, resumable workflow engines plus the deterministic
-release gate. Each engine is a single-file `argparse` CLI over an integrity-checked JSON state machine —
-the host issues one command, reads one JSON object, and asks for the next legal action. There is no
-shared module between the two engines by design: planning state and implementation state must never
-cross.
+The executable core of the skill: two independent, resumable workflow state machines plus the
+deterministic release gate. Each engine is an `argparse` CLI over integrity-checked JSON state — the
+host issues one command, reads one JSON object, and asks for the next legal action. Planning state and
+implementation state never cross; implementation review deliberately reuses the planning engine's
+provider-sandbox constructor so both phases enforce one filesystem and credential boundary.
 
 ## Key Files
 | File | Description |
 |------|-------------|
-| `plan_workflow.py` | Planning engine (~3.2k lines, `VERSION = "0.6.2"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
+| `plan_workflow.py` | Planning engine (~3.2k lines, `VERSION = "0.6.3"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
 | `workflow.py` | Implementation engine (`SCHEMA_VERSION = 9`). Concurrent run discovery, worktree isolation, frozen reviewer contracts, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
+| `dsh_read_boundary.mjs` | Fail-closed DSH model-tool allowlist. Only bounded read/search tools under the frozen worktree and invocation context may execute; bubblewrap remains the outer enforcement boundary. |
 | `release_check.py` | No-network release gate: validates `evals/evals.json` shape, required public-release files, LICENSE/SECURITY content, cross-file version synchronization, and the English-only rule; then compiles both engines and runs the unit suites. Optional `--quick-validator <path>` chains an external skill validator. |
 | `package_release.py` | Deterministic standard-library packager for versioned `.tar.gz` release archives and SHA-256 checksum files. |
 
@@ -31,7 +32,7 @@ cross.
 - Both resolve `SKILL_ROOT = Path(__file__).resolve().parent.parent`. Moving a script one level changes
   every template and reference path.
 - Preserve preview-before-apply. Commands that mutate history, spend money, or discard evidence
-  (`adjudicate`, `abandon`, `cleanup`, `finalize`, `migrate`, `migrate-engine`) must keep requiring
+  (`adjudicate`, `abandon`, `cleanup`, `finalize`, `migrate`, `migrate-engine`, `recover-invocation`) must keep requiring
   `--apply`, and agent invocations must keep their `--dry-run` preview.
 - Sandbox policy is expressed as CLI overrides (`CODEX_POLICY_OVERRIDES`), deliberately layered with
   `-c` rather than by writing a synthetic `config.toml` — writing the file once silently replaced a
@@ -69,7 +70,7 @@ without paid calls.
 ### Command Surface
 `plan_workflow.py`: `preflight`, `init`, `investigate`, `draft`, `cross-review`, `diverge`,
 `synthesis-context`, `check-synthesis`, `submit-synthesis`, `convergence-review`, `final-review`,
-`adjudicate`, `status`, `next`, `export`, `audit-export`, `abandon`, `cleanup`, `migrate-engine`.
+`adjudicate`, `status`, `next`, `export`, `audit-export`, `abandon`, `cleanup`, `migrate-engine`, `recover-invocation`.
 
 `workflow.py`: `preflight`, `list`, `init`, `contract-review`, `contract-adjudicate`, `review`,
 `verify`, `adjudicate`, `accept`, `status`, `migrate`, `finalize`, `reconcile`, `submit-reconciliation`, `abandon-reconciliation`, `supersede`, `change-reviewer`,

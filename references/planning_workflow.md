@@ -39,6 +39,11 @@ suffix, such as `TARGET-001` or `EVIDENCE_ONLY-003`; bare class names are invali
 `OUT_OF_SCOPE` cannot enter a candidate. A later round may deepen evidence or causal/verification coverage,
 but it cannot enlarge the objective.
 
+`preflight` and `init` accept `--base-ref <ref>` (default `HEAD`) and resolve it once to a committed
+SHA. A dirty source checkout is reported but does not block either command; staged, modified, and
+untracked content is excluded from the detached planning worktree. Use an explicit ref when `HEAD`
+is not the intended planning authority.
+
 Both slots investigate independently before either may draft. Each draft must re-check its material repository
 facts. Evidence first discovered during drafting is emitted through `new_evidence` with full provenance before
 the draft may cite it. Local repository evidence is primary. With
@@ -109,7 +114,9 @@ semantic quality; final reviewers still inspect repository evidence.
 
 ## Typed decisions
 
-Read `pending_decision` from status. Show its evidence and allowed choices to the user. Run `adjudicate` once without `--apply`, then apply the exact approved choice with actor and reason.
+Read the decision and its stable key from `pending_decisions` in status. Show its evidence and allowed choices to the user. Pass that key as `--decision-id` when running `adjudicate` once without `--apply`, then apply the exact same decision ID, approved choice, actor, and reason. A stale preview must be refreshed rather than applied to a different pending decision.
+
+If the controller is interrupted while an invocation record says `RUNNING`, reacquire that exact assignment through `recover-invocation`, preview it, and apply with an actor and reason. Recovery preserves the spent quality attempt and audit record. It is also the required escape before `migrate-engine` when engine drift and a stale invocation coincide; never delete or edit the record by hand.
 
 - Planning, convergence, or final boundary: resolve and continue, or abandon. Resolving a
   convergence boundary returns to synthesis; it never treats the interrupted review as approval.
