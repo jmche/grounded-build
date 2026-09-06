@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex", "dsh")
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
@@ -262,6 +262,46 @@ class NoFinalAnswer(WorkflowError):
     """
 
 
+def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
+    """Validate the structural JSON-schema subset used by provider contracts."""
+    expected = schema.get("type")
+    matches = {
+        "object": lambda item: isinstance(item, dict),
+        "array": lambda item: isinstance(item, list),
+        "string": lambda item: isinstance(item, str),
+        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+        "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+        "boolean": lambda item: isinstance(item, bool),
+        "null": lambda item: item is None,
+    }
+    if expected not in matches:
+        raise WorkflowError(f"unsupported JSON schema type at {path}: {expected!r}")
+    if not matches[expected](value):
+        raise WorkflowError(f"provider result schema mismatch at {path}: expected {expected}")
+    if "enum" in schema and not any(
+            type(value) is type(candidate) and value == candidate for candidate in schema["enum"]):
+        raise WorkflowError(f"provider result schema mismatch at {path}: value is not in enum")
+    if expected == "object":
+        required = schema.get("required", [])
+        missing = [name for name in required if name not in value]
+        if missing:
+            raise WorkflowError(
+                f"provider result schema mismatch at {path}: missing {','.join(missing)}")
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            extras = sorted(set(value) - set(properties))
+            if extras:
+                raise WorkflowError(
+                    f"provider result schema mismatch at {path}: unexpected {','.join(extras)}")
+        for name, item in value.items():
+            child_schema = properties.get(name)
+            if child_schema is not None:
+                validate_json_schema(item, child_schema, f"{path}.{name}")
+    elif expected == "array" and "items" in schema:
+        for index, item in enumerate(value):
+            validate_json_schema(item, schema["items"], f"{path}[{index}]")
+
+
 def describe_unparseable(provider: str, source: str, exc: json.JSONDecodeError) -> str:
     """Say which of the two things happened: the object was cut off, or it was never an object.
 
@@ -337,6 +377,13 @@ def probe_provider(
     """
     with tempfile.TemporaryDirectory(prefix="grounded-build-probe-") as scratch:
         root = Path(scratch)
+        # A capability probe has no repository-shaped question. Giving it the caller's checkout
+        # merely exposes dirty and untracked material to a model before a baseline is frozen.
+        workspace = root / "workspace"
+        workspace.mkdir(mode=0o700)
+        initialized = run(["git", "init", "-q"], cwd=workspace, timeout=30)
+        if initialized.returncode != 0:
+            raise WorkflowError("could not create the empty capability-probe repository")
         context = root / "context"
         context.mkdir(mode=0o700)
         raw = root / "raw.json"
@@ -344,18 +391,22 @@ def probe_provider(
             f"Reply with the schema object only: provider={provider}, ready=true. "
             "Do not inspect anything. This is a capability check."
         )
-        command = agent_command(provider, project, context, PROBE_SCHEMA, raw, prompt, runtime)
+        command = agent_command(provider, workspace, context, PROBE_SCHEMA, raw, prompt, runtime)
         command = isolated_agent_command(
-            command, {"agent_runtime": {provider: runtime or {}}}, root, project, context)
-        result = run(command, cwd=project, timeout=timeout, env=agent_environment())
+            command, {"agent_runtime": {provider: runtime or {}}}, root, workspace, context)
+        result = run(command, cwd=workspace, timeout=timeout, env=agent_environment())
         if result.returncode != 0:
             return {"provider": provider, "ok": False,
                     "reason": f"invocation failed ({result.returncode})",
                     "detail": (result.stderr or "").strip()[-400:]}
         try:
             payload = extract_payload(provider, result, raw)
+            validate_json_schema(payload, PROBE_SCHEMA)
         except NoFinalAnswer as exc:
             return {"provider": provider, "ok": False, "reason": "no schema object",
+                    "detail": str(exc)}
+        except WorkflowError as exc:
+            return {"provider": provider, "ok": False, "reason": "invalid schema object",
                     "detail": str(exc)}
         return {"provider": provider, "ok": isinstance(payload, dict) and payload.get("ready") is True,
                 "reason": "delivered a schema object"}
@@ -531,7 +582,36 @@ def load_state(
     return state
 
 
+def pending_decision_identity(decision: dict[str, Any]) -> str:
+    """Stable identity for independently produced decisions; timestamps are not identity."""
+    parts = [str(decision.get("type", "UNKNOWN"))]
+    for field in ("assignment", "source", "candidate_sha256"):
+        if decision.get(field) is not None:
+            parts.append(f"{field}={decision[field]}")
+    return "|".join(parts)
+
+
+def add_pending_decision(state: dict[str, Any], decision: dict[str, Any]) -> None:
+    decisions = state.setdefault("pending_decisions", {})
+    decisions[pending_decision_identity(decision)] = decision
+    state["pending_decision"] = decisions[sorted(decisions)[0]]
+
+
+def normalize_pending_decisions(state: dict[str, Any]) -> None:
+    """Keep the legacy singular view while preserving every concurrent decision."""
+    decisions = state.setdefault("pending_decisions", {})
+    current = state.get("pending_decision")
+    if state.get("status") == "NEEDS_USER_DECISION":
+        if current:
+            decisions.setdefault(pending_decision_identity(current), current)
+        state["pending_decision"] = decisions[sorted(decisions)[0]] if decisions else None
+    elif state.get("status") not in TERMINAL_STATUSES:
+        decisions.clear()
+        state["pending_decision"] = None
+
+
 def save_state(state: dict[str, Any]) -> None:
+    normalize_pending_decisions(state)
     state["updated_at"] = utc_now()
     state["revision"] = state.get("revision", 0) + 1
     state["integrity_hmac"] = state_signature(state)
@@ -572,6 +652,33 @@ def active_invocation_records(state: dict[str, Any]) -> dict[str, Any]:
     return active
 
 
+def recover_interrupted_assignment(
+    state: dict[str, Any], assignment: str, actor: str, reason: str,
+) -> list[str]:
+    """Terminalize stale records for one assignment after its process lock has been reacquired."""
+    recovered: list[str] = []
+    root = Path(state["run_directory"]) / "invocations" / assignment
+    for path in root.glob("*/invocation.json") if root.exists() else []:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkflowError(f"cannot recover malformed invocation record {path}: {exc}") from exc
+        if record.get("status") != "RUNNING":
+            continue
+        record.update({
+            "status": "CONTROLLER_INTERRUPTED", "completed_at": utc_now(),
+            "recovered_by": actor, "recovery_reason": reason,
+        })
+        atomic_json(path, record)
+        recovered.append(str(path))
+    if recovered:
+        state.setdefault("invocation_recoveries", []).append({
+            "assignment": assignment, "actor": actor, "reason": reason,
+            "invocations": recovered, "recovered_at": utc_now(),
+        })
+    return recovered
+
+
 def persist_invocation_state(
     state: dict[str, Any], assignment: str, *, clear_fault: bool = False,
 ) -> None:
@@ -582,12 +689,14 @@ def persist_invocation_state(
         for field in ("usage", "infrastructure_usage", "extra_invocation_grants"):
             if assignment in state.get(field, {}):
                 latest.setdefault(field, {})[assignment] = state[field][assignment]
-        incoming_digests = state.get("charged_context_digests", {}).get(assignment, [])
-        if incoming_digests:
-            destination = latest.setdefault("charged_context_digests", {}).setdefault(assignment, [])
-            for digest in incoming_digests:
-                if digest not in destination:
-                    destination.append(digest)
+        if assignment in state.get("_reimbursed_assignments", set()):
+            latest.setdefault("usage", {}).pop(assignment, None)
+        if assignment in state.get("charged_context_digests", {}):
+            latest.setdefault("charged_context_digests", {})[assignment] = list(
+                state["charged_context_digests"][assignment])
+        if assignment in state.get("invocation_reservations", {}):
+            latest.setdefault("invocation_reservations", {})[assignment] = dict(
+                state["invocation_reservations"][assignment])
         latest.setdefault("artifacts", {}).update({
             key: value for key, value in state.get("artifacts", {}).items()
             if key.startswith(f"invocation-{assignment}-")
@@ -597,9 +706,15 @@ def persist_invocation_state(
             latest.setdefault("delivery_faults", {})[assignment] = fault
         elif clear_fault:
             latest.get("delivery_faults", {}).pop(assignment, None)
-        if (state.get("pending_decision") or {}).get("assignment") == assignment:
-            latest["status"] = "NEEDS_USER_DECISION"
-            latest["pending_decision"] = state["pending_decision"]
+        incoming_decisions = dict(state.get("pending_decisions") or {})
+        current = state.get("pending_decision")
+        if current and current.get("assignment") == assignment:
+            incoming_decisions[pending_decision_identity(current)] = current
+        if latest.get("status") not in TERMINAL_STATUSES:
+            for decision in incoming_decisions.values():
+                add_pending_decision(latest, decision)
+            if incoming_decisions:
+                latest["status"] = "NEEDS_USER_DECISION"
         recompute_resource_usage(latest)
         save_state(latest)
         state.clear()
@@ -611,6 +726,26 @@ def save_parallel_stage(state: dict[str, Any], stage: str) -> None:
     project = Path(state["project"])
     with run_lock(project, state["run_id"]):
         latest = load_state(project, state["run_id"])
+        binding = state.get("_completed_invocation_binding") or {}
+        if binding and (binding.get("engine_epoch", 0) != latest.get("engine_epoch", 0)
+                or binding.get("engine_contract") != latest.get("engine_contract")):
+            raise WorkflowError(
+                f"stale {stage} result produced under a different engine epoch or contract")
+        if latest.get("status") in TERMINAL_STATUSES:
+            new_artifacts = {
+                key: value for key, value in state.get("artifacts", {}).items()
+                if key not in latest.setdefault("artifacts", {})
+            }
+            latest["artifacts"].update(new_artifacts)
+            latest.setdefault("late_parallel_results", []).append({
+                "stage": stage, "terminal_status": latest["status"], "retained_at": utc_now(),
+                "invocation": binding.get("invocation"),
+                "artifact_keys": sorted(new_artifacts),
+            })
+            save_state(latest)
+            state.clear()
+            state.update(latest)
+            return
         candidate_bound_field = {
             "convergence-review": "convergence_reviews",
             "final-review": "final_reviews",
@@ -646,9 +781,13 @@ def save_parallel_stage(state: dict[str, Any], stage: str) -> None:
                 latest["finding_ledger"][key]["observations"].extend(
                     item for item in record["observations"]
                     if (item.get("source"), item.get("source_id")) not in seen)
-        if latest.get("status") == "NEEDS_USER_DECISION" or state.get("status") == "NEEDS_USER_DECISION":
+        incoming_decisions = dict(state.get("pending_decisions") or {})
+        if state.get("pending_decision"):
+            incoming_decisions[pending_decision_identity(state["pending_decision"])] = state["pending_decision"]
+        for decision in incoming_decisions.values():
+            add_pending_decision(latest, decision)
+        if latest.get("status") == "NEEDS_USER_DECISION" or incoming_decisions:
             latest["status"] = "NEEDS_USER_DECISION"
-            latest["pending_decision"] = state.get("pending_decision") or latest.get("pending_decision")
         elif stage == "investigate":
             latest["status"] = "EVIDENCE_READY" if set(latest["investigations"]) == {"A", "B"} else "INVESTIGATING"
         elif stage == "draft":
@@ -760,6 +899,7 @@ def engine_contract() -> dict[str, Any]:
     """Identity of the local semantics that a run is allowed to use."""
     files = {
         "plan_workflow.py": Path(__file__).resolve(),
+        "dsh_read_boundary.mjs": SKILL_ROOT / "scripts" / "dsh_read_boundary.mjs",
         "SKILL.md": SKILL_ROOT / "SKILL.md",
         "planning_workflow.md": SKILL_ROOT / "references" / "planning_workflow.md",
         "causal_analysis.md": CAUSAL_ANALYSIS,
@@ -793,9 +933,6 @@ def record_findings(state: dict[str, Any], findings: list[dict[str, Any]], sourc
             ledger[key] = {"fingerprint": key, "canonical": finding, "observations": [observation]}
         else:
             ledger[key]["observations"].append(observation)
-    path = Path(state["finding_ledger_path"])
-    atomic_json(path, {"findings": ledger})
-    record_artifact(state, "finding-ledger", path)
 
 
 def available(provider: str) -> bool:
@@ -980,18 +1117,77 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
         help_args = [executable, "exec", "--help"]
         required = ["--output-schema", "--output-last-message", "--ephemeral", "--sandbox", "--config"]
     elif provider == "dsh":
-        # Booting the headless profile and printing its help is the honest capability check: it
-        # proves the node runtime, the bundled profile, and the harness home all resolve.
-        help_args = [executable, "--profile", "headless", "--help"]
-        required = ["--profile", "headless"]
+        # Launcher flags belong to global help. The headless profile's own help is checked below;
+        # conflating the two made supported global flags appear absent.
+        help_args = [executable, "--help"]
+        required = ["--profile", "--patch", "--dump-config"]
     else:
         help_args = [executable, "--help"]
         required = ["--json-schema", "--output-format", "--permission-mode", "--no-session-persistence"]
     result = run(help_args, timeout=30)
     text = (result.stdout or "") + "\n" + (result.stderr or "")
     missing = [flag for flag in required if flag not in text]
-    return {"ok": result.returncode == 0 and not missing, "missing": missing,
-            "help_exit": result.returncode}
+    capability = {"ok": result.returncode == 0 and not missing, "missing": missing,
+                  "help_exit": result.returncode}
+    if provider == "dsh" and capability["ok"]:
+        profile_help = run([executable, "--profile", "headless", "--help"], timeout=30)
+        profile_ready = profile_help.returncode == 0
+        capability["headless_profile_probe"] = {
+            "ok": profile_ready, "exit": profile_help.returncode,
+        }
+        capability["ok"] = bool(capability["ok"] and profile_ready)
+        if not profile_ready:
+            capability["missing"].append("working headless profile")
+        try:
+            with Path(executable).resolve().open("rb") as handle:
+                first_line = handle.readline(64).decode("utf-8", "replace")
+        except OSError:
+            first_line = ""
+        # The production adapter is the Node CLI. Test doubles and future native launchers still
+        # have their argv surface checked above; the current Node shape additionally proves that
+        # the overlay is composed, instead of trusting an advertised but ignored --patch flag.
+        if "node" in first_line:
+            with tempfile.TemporaryDirectory(prefix="grounded-build-dsh-capability-") as scratch:
+                root = Path(scratch)
+                dsh_home = root / "dsh-home"
+                dsh_home.mkdir(mode=0o700)
+                patch = root / "capability.patch.yml"
+                patch.write_text(
+                    "- id: tool-bash\n  disabled: true\n"
+                    "- insert:\n"
+                    "    - id: grounded-build-capability-marker\n"
+                    "      name: cordis:group\n"
+                    "      group: true\n"
+                    "      config: []\n",
+                    encoding="utf-8",
+                )
+                environment = agent_environment()
+                environment.update({
+                    "HOME": str(root / "home"), "DSH_HOME": str(dsh_home),
+                    "DSH_PERMISSION_MODE": "read-only", "DSH_TOOLS_MODE": "native",
+                    "PATH": ":".join(dict.fromkeys([
+                        str(Path(shutil.which("node") or "/usr/bin/node").parent),
+                        "/usr/bin", "/bin",
+                    ])),
+                })
+                composed = run(
+                    [executable, "--profile", "headless", "--patch", str(patch),
+                     "--dump-config"],
+                    timeout=30, env=environment,
+                )
+                loaded = (
+                    composed.returncode == 0
+                    and "grounded-build-capability-marker" in composed.stdout
+                    and "id: tool-bash" in composed.stdout
+                    and "disabled: true" in composed.stdout
+                )
+                capability["patch_composition_probe"] = {
+                    "ok": loaded, "exit": composed.returncode,
+                }
+                capability["ok"] = bool(capability["ok"] and loaded)
+                if not loaded:
+                    capability["missing"].append("working --patch composition")
+    return capability
 
 
 def resolve_topology(backend: str) -> dict[str, str]:
@@ -1345,7 +1541,7 @@ def codex_catalog_path(config: Path) -> Path | None:
 
 def isolated_agent_command(
     command: list[str], state: dict[str, Any], invocation_root: Path,
-    worktree: Path, context: Path,
+    worktree: Path, context: Path, allow_web: bool = False,
 ) -> list[str]:
     bwrap = shutil.which("bwrap")
     if not bwrap:
@@ -1358,6 +1554,8 @@ def isolated_agent_command(
     private_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
     provider = Path(command[0]).name
+    controller_inputs: list[Path] = []
+    writable_outputs: list[Path] = []
     credential_mounts: list[tuple[Path, Path]] = []
     profile = ((state.get("agent_runtime") or {}).get("codex") or {}).get("profile")
     for source in provider_trust_store(provider, profile):
@@ -1372,6 +1570,71 @@ def isolated_agent_command(
             f"{tool}({private_root}/**)" for tool in ("Read", "Grep", "Glob")
         )
         command[disallowed_index] = command[disallowed_index] + "," + private_denies
+        sandbox_settings = {
+            "sandbox": {
+                "enabled": True,
+                "failIfUnavailable": True,
+                "autoAllowBashIfSandboxed": True,
+                "excludedCommands": [],
+                "allowUnsandboxedCommands": False,
+                "filesystem": {"denyRead": [str(private_home)]},
+            }
+        }
+        command[1:1] = ["--settings", json.dumps(sandbox_settings, separators=(",", ":"))]
+    elif provider == "codex":
+        raw_index = command.index("-o") + 1
+        raw_output = Path(command[raw_index])
+        descriptor = os.open(
+            raw_output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.close(descriptor)
+        writable_outputs.append(raw_output)
+    elif provider == "dsh":
+        boundary_source = SKILL_ROOT / "scripts" / "dsh_read_boundary.mjs"
+        boundary_path = invocation_root / "dsh-read-boundary.mjs"
+        shutil.copyfile(boundary_source, boundary_path)
+        boundary_path.chmod(0o600)
+        patch_path = invocation_root / "dsh-no-shell.patch.yml"
+        descriptor = os.open(
+            patch_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(
+                "- insert:\n"
+                "    - id: grounded-build-read-boundary\n"
+                f"      name: {json.dumps(boundary_path.as_uri())}\n"
+                "      inject: [tools]\n"
+                "      config:\n"
+                f"        workspaceRoot: {json.dumps(str(worktree))}\n"
+                f"        allowWeb: {'true' if allow_web else 'false'}\n"
+                "        allowedRoots:\n"
+                f"          - {json.dumps(str(worktree))}\n"
+                f"          - {json.dumps(str(context))}\n"
+                "- id: tool-bash\n  disabled: true\n"
+                "- id: tool-pwsh\n  disabled: true\n"
+                "- id: jobs\n  disabled: true\n"
+                "- id: tool-jobs\n  disabled: true\n"
+                "- id: tool-skill\n  disabled: true\n"
+                "- id: tool-todo\n  disabled: true\n"
+                "- id: tool-goal\n  disabled: true\n"
+                "- id: code-runtime\n  disabled: true\n"
+                "- id: subagent\n  disabled: true\n"
+                "- id: subagent-spawn-in-process\n  disabled: true\n"
+                "- id: subagent-fork-in-process\n  disabled: true\n"
+                "- id: tool-subagent-control\n  disabled: true\n"
+                "- id: tool-subagent-list-agents\n  disabled: true\n"
+                "- id: tool-subagent\n  disabled: true\n"
+                "- id: tool-subagent-fork\n  disabled: true\n"
+                "- id: tool-subagent-report\n  disabled: true\n"
+                "- id: workflow-worker-thread\n  disabled: true\n"
+                "- id: tool-workflow\n  disabled: true\n"
+                "- id: tool-ralph\n  disabled: true\n"
+                "- id: tool-str-replace-editor\n  disabled: true\n"
+                + ("" if allow_web else
+                   "- id: web\n  disabled: true\n"
+                   "- id: web-search-deepseek\n  disabled: true\n"
+                   "- id: tool-web\n  disabled: true\n")
+            )
+        command[-1:-1] = ["--patch", str(patch_path)]
+        controller_inputs.extend([patch_path, boundary_path])
     common_value = git(worktree, "rev-parse", "--git-common-dir")
     common_git = Path(common_value)
     if not common_git.is_absolute():
@@ -1412,15 +1675,24 @@ def isolated_agent_command(
             runtime_mounts = [(node_prefix, node_prefix), (dsh_package, dsh_package)]
         # read-only tells the agent it cannot modify files; the bwrap ro-binds are the enforcement.
         # Approval stays "ask" under read-only and fails closed in headless (no answerer).
-        extra_setenv = ["--setenv", "DSH_PERMISSION_MODE", "read-only"]
+        extra_setenv = [
+            "--setenv", "DSH_PERMISSION_MODE", "read-only",
+            "--setenv", "DSH_TOOLS_MODE", "native",
+        ]
     wrapper = [
         bwrap, "--die-with-parent", "--new-session", "--unshare-pid",
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-        "--dir", str(invocation_root), "--bind", str(invocation_root), str(invocation_root),
+        "--dir", str(invocation_root),
+        "--bind", str(private_home), str(private_home),
+        "--bind", str(private_tmp), str(private_tmp),
         "--dir", str(worktree), "--ro-bind", str(worktree), str(worktree),
         "--ro-bind", str(context), str(context),
         "--dir", str(common_git), "--ro-bind", str(common_git), str(common_git),
     ]
+    for path in controller_inputs:
+        wrapper.extend(["--ro-bind", str(path), str(path)])
+    for path in writable_outputs:
+        wrapper.extend(["--bind", str(path), str(path)])
     if provider != "dsh" or not dsh_node_mode:
         wrapper.extend(["--dir", "/opt", "--ro-bind", str(executable), "/opt/grounded-build-agent"])
     for source, destination in runtime_mounts:
@@ -1642,6 +1914,7 @@ def invoke(
         used = 0
         granted = 0
         persist_invocation_state(state, assignment, clear_fault=True)
+        charged = state.setdefault("charged_context_digests", {}).setdefault(assignment, [])
     if not dry_run and used >= MAX_INVOCATIONS_PER_ASSIGNMENT + granted:
         # "Out of tries" and "this provider does not deliver a verdict for this assignment" both
         # end here, and only one of them is fixed by granting another try. Say which, so the
@@ -1690,7 +1963,9 @@ def invoke(
     )
     command = agent_command(
         provider, worktree, context, schema, raw, prompt.format(context=context), runtime, allow_web)
-    command = isolated_agent_command(command, state, root, worktree, context)
+    command = isolated_agent_command(
+        command, state, root, worktree, context, allow_web=allow_web
+    )
     rendered_prompt = prompt.format(context=context)
     (root / "prompt.md").write_text(rendered_prompt, encoding="utf-8")
     invocation_path = root / "invocation.json"
@@ -1702,15 +1977,38 @@ def invoke(
         "context_digest": digest,
         "context_files": {name: sha256_file(path) for name, path in context_files.items()},
         "requested_runtime": runtime,
+        "engine_epoch": state.get("engine_epoch", 0),
         "engine_contract": state.get("engine_contract") or engine_contract(),
         "argv": command[:-1] + ["<PROMPT>"],
         "started_at": utc_now(),
         "status": "PREVIEW" if dry_run else "RUNNING",
     }
-    atomic_json(invocation_path, invocation_record)
     if dry_run:
+        atomic_json(invocation_path, invocation_record)
         return {"dry_run": True, "command": invocation_record["argv"],
                 "context": str(context), "invocation": str(invocation_path)}
+    # Reserve before the paid process starts. A controller crash or BaseException after this
+    # point leaves a RUNNING record and a consumed quality attempt; only a classified
+    # infrastructure failure reimburses it.
+    state["usage"][assignment] = used + 1
+    digest_added = digest not in charged
+    if digest_added:
+        charged.append(digest)
+    state.setdefault("invocation_reservations", {})[assignment] = {
+        "assignment": assignment, "provider": provider, "slot": slot,
+        "quality_attempt": used + 1, "invocation": str(invocation_path),
+        "reserved_at": invocation_record["started_at"],
+    }
+    persist_invocation_state(state, assignment)
+    charged = state.setdefault("charged_context_digests", {}).setdefault(assignment, [])
+    # Publish RUNNING only after the durable budget reservation. A crash on either side cannot
+    # create an uncharged paid call; a published-but-interrupted record has an explicit recovery.
+    atomic_json(invocation_path, invocation_record)
+    launch_binding = {
+        "engine_epoch": invocation_record["engine_epoch"],
+        "engine_contract": invocation_record["engine_contract"],
+        "invocation": str(invocation_path),
+    }
     started = time.monotonic()
     try:
         result = run(command, cwd=worktree, timeout=timeout, env=agent_environment())
@@ -1724,6 +2022,13 @@ def invoke(
             provider, "ADAPTER_EXECUTION", str(exc), retryable=True)
         count = state.setdefault("infrastructure_usage", {}).get(assignment, 0) + 1
         state["infrastructure_usage"][assignment] = count
+        if used:
+            state["usage"][assignment] = used
+        else:
+            state["usage"].pop(assignment, None)
+            state.setdefault("_reimbursed_assignments", set()).add(assignment)
+        if digest_added and digest in state["charged_context_digests"][assignment]:
+            state["charged_context_digests"][assignment].remove(digest)
         resume_status = state.get("status", "SYNTHESIS_REQUIRED")
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
@@ -1770,15 +2075,10 @@ def invoke(
         if infrastructure_error:
             raise infrastructure_error
         payload = extract_payload(provider, result, raw)
-        state["usage"][assignment] = used + 1
-        if digest not in charged:
-            charged.append(digest)
+        validate_json_schema(payload, schema)
         if validator is not None:
             validator(payload)
     except NoFinalAnswer as exc:
-        state["usage"][assignment] = used + 1
-        if digest not in charged:
-            charged.append(digest)
         state.setdefault("delivery_faults", {})[assignment] = str(exc)
         invocation_record["status"] = "NO_FINAL_ANSWER"
         invocation_record["diagnostic"] = str(exc)
@@ -1790,6 +2090,13 @@ def invoke(
     except ProviderInfrastructureError as exc:
         count = state.setdefault("infrastructure_usage", {}).get(assignment, 0) + 1
         state["infrastructure_usage"][assignment] = count
+        if used:
+            state["usage"][assignment] = used
+        else:
+            state["usage"].pop(assignment, None)
+            state.setdefault("_reimbursed_assignments", set()).add(assignment)
+        if digest_added and digest in state["charged_context_digests"][assignment]:
+            state["charged_context_digests"][assignment].remove(digest)
         resume_status = state["status"]
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
@@ -1810,9 +2117,6 @@ def invoke(
         persist_invocation_state(state, assignment)
         raise
     except WorkflowError as exc:
-        state["usage"][assignment] = used + 1
-        if digest not in charged:
-            charged.append(digest)
         diagnostic = f"deterministic contract rejection: {exc}"
         state.setdefault("delivery_faults", {})[assignment] = diagnostic
         invocation_record["status"] = "VALIDATION_REJECTED"
@@ -1834,6 +2138,7 @@ def invoke(
     record_artifact(state, f"{artifact_prefix}-record", invocation_path)
     update_resource_usage(state, metrics)
     persist_invocation_state(state, assignment, clear_fault=True)
+    state["_completed_invocation_binding"] = launch_binding
     return payload
 
 
@@ -2199,10 +2504,12 @@ def command_preflight(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     topology = resolve_topology(args.backend)
     runtime = agent_runtime(args)
+    baseline = git(project, "rev-parse", "--verify", f"{args.base_ref}^{{commit}}")
     payload = {
         "status": "PREFLIGHT_OK",
         "project": str(project),
-        "baseline_sha": git(project, "rev-parse", "HEAD"),
+        "base_ref": args.base_ref,
+        "baseline_sha": baseline,
         "clean": not bool(git(project, "status", "--porcelain")),
         "planners": topology,
         "provider_diversity": len(set(topology.values())) > 1,
@@ -2218,9 +2525,8 @@ def command_preflight(args: argparse.Namespace) -> None:
             },
         },
     }
-    static_ok = (
-        payload["clean"] and payload["capabilities"]["bubblewrap"]
-        and all(item["ok"] for item in payload["capabilities"]["adapters"].values())
+    static_ok = payload["capabilities"]["bubblewrap"] and all(
+        item["ok"] for item in payload["capabilities"]["adapters"].values()
     )
     if not static_ok:
         payload["status"] = "PREFLIGHT_STATIC_REQUIREMENT_FAILED"
@@ -2242,13 +2548,12 @@ def command_init(args: argparse.Namespace) -> None:
     request = Path(args.request).expanduser().resolve()
     if not request.is_file():
         raise WorkflowError(f"request file does not exist: {request}")
-    if git(project, "status", "--porcelain"):
-        raise WorkflowError("project must be clean so both planners inspect the same Git snapshot")
     topology = resolve_topology(args.backend)
     runtime = agent_runtime(args)
     if args.final_reviewer != "both" and not available(args.final_reviewer):
         raise WorkflowError(f"final reviewer is unavailable: {args.final_reviewer}")
-    baseline = git(project, "rev-parse", "HEAD")
+    baseline = git(project, "rev-parse", "--verify", f"{args.base_ref}^{{commit}}")
+    original_changes = git(project, "status", "--porcelain").splitlines()
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
     root = run_directory(project, run_id)
     if root.exists():
@@ -2283,10 +2588,14 @@ def command_init(args: argparse.Namespace) -> None:
         "schema_version": SCHEMA_VERSION,
         "software_version": VERSION,
         "engine_contract": engine_contract(),
+        "engine_epoch": 0,
         "run_id": run_id,
         "run_directory": str(root),
         "project": str(project),
         "baseline_sha": baseline,
+        "base_ref": args.base_ref,
+        "original_worktree_clean_at_start": not bool(original_changes),
+        "original_worktree_changes_at_start": original_changes,
         "request_snapshot": str(request_snapshot),
         "scope_contract": str(scope_contract),
         "scope_digest": scope_digest,
@@ -2316,6 +2625,7 @@ def command_init(args: argparse.Namespace) -> None:
         "candidate": None,
         "final_reviews": {},
         "pending_decision": None,
+        "pending_decisions": {},
         "usage": {},
         "infrastructure_usage": {},
         "resource_usage": {"wall_seconds": 0.0, "reported_cost_usd": 0.0,
@@ -2332,6 +2642,9 @@ def command_init(args: argparse.Namespace) -> None:
     save_state(state)
     emit({
         "status": state["status"], "run_id": run_id, "run_directory": str(root),
+        "base_ref": state["base_ref"], "baseline_sha": state["baseline_sha"],
+        "original_worktree_clean_at_start": state["original_worktree_clean_at_start"],
+        "original_worktree_changes_at_start": state["original_worktree_changes_at_start"],
         "planners": topology, "final_reviewer": args.final_reviewer,
         "provider_diversity": state["provider_diversity"],
         "model_diversity": state["model_diversity"], "agent_runtime": runtime,
@@ -2737,7 +3050,10 @@ def command_convergence_review(args: argparse.Namespace) -> None:
     }
     if payload["verdict"] == "NEEDS_USER_DECISION":
         state["status"] = "NEEDS_USER_DECISION"
-        state["pending_decision"] = {"type": "CONVERGENCE_BOUNDARY", "created_at": utc_now()}
+        state["pending_decision"] = {
+            "type": "CONVERGENCE_BOUNDARY", "source": f"convergence-1-{slot}",
+            "candidate_sha256": state["candidate"]["plan_sha256"], "created_at": utc_now(),
+        }
     else:
         state["status"] = "CONVERGENCE_REVIEWING"
     save_parallel_stage(state, "convergence-review")
@@ -2803,7 +3119,10 @@ def command_final_review(args: argparse.Namespace) -> None:
     }
     if payload["verdict"] == "NEEDS_USER_DECISION":
         state["status"] = "NEEDS_USER_DECISION"
-        state["pending_decision"] = {"type": "FINAL_PLAN_BOUNDARY", "created_at": utc_now()}
+        state["pending_decision"] = {
+            "type": "FINAL_PLAN_BOUNDARY", "source": f"final-{state['candidate']['round']}-{slot}",
+            "candidate_sha256": state["candidate"]["plan_sha256"], "created_at": utc_now(),
+        }
     else:
         state["status"] = "FINAL_REVIEWING"
     save_parallel_stage(state, "final-review")
@@ -2813,8 +3132,14 @@ def command_final_review(args: argparse.Namespace) -> None:
 def command_adjudicate(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     state = load_state(project, args.run_id)
-    if state["status"] != "NEEDS_USER_DECISION" or not state.get("pending_decision"):
+    normalize_pending_decisions(state)
+    if state["status"] != "NEEDS_USER_DECISION" or not state.get("pending_decisions"):
         raise WorkflowError("there is no pending planning decision")
+    selected = state["pending_decisions"].get(args.decision_id)
+    if selected is None:
+        raise WorkflowError(
+            f"pending decision {args.decision_id!r} no longer exists; refresh status before applying")
+    state["pending_decision"] = selected
     preview = {
         "status": "DECISION_PREVIEW", "pending_decision": state["pending_decision"],
         "choice": args.choice, "decision": args.decision, "actor": args.actor,
@@ -2845,6 +3170,7 @@ def command_adjudicate(args: argparse.Namespace) -> None:
     if args.choice not in allowed:
         raise WorkflowError(f"choice {args.choice} is not allowed for {decision_type}: {','.join(sorted(allowed))}")
     pending = dict(state["pending_decision"])
+    pending_key = pending_decision_identity(pending)
     if args.choice == "GRANT_ONE_SYNTHESIS" and state.get("extra_synthesis_grants", 0) >= 1:
         raise WorkflowError("the one explicit extra synthesis has already been granted")
     if args.choice == "GRANT_ONE_INVOCATION":
@@ -2882,6 +3208,7 @@ def command_adjudicate(args: argparse.Namespace) -> None:
     atomic_json(path, record)
     record_artifact(state, f"decision-{path.stem}", path)
     state["pending_decision"] = None
+    state.setdefault("pending_decisions", {}).pop(pending_key, None)
     if args.choice == "ABANDON":
         state["status"] = "ABANDONED"
         state["abandoned"] = {
@@ -2923,8 +3250,13 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         state["status"] = "CROSS_REVIEWING"
     else:
         state["status"] = "SYNTHESIS_REQUIRED"
+    if args.choice != "ABANDON" and state.get("pending_decisions"):
+        state["status"] = "NEEDS_USER_DECISION"
+        state["pending_decision"] = state["pending_decisions"][
+            sorted(state["pending_decisions"])[0]]
     save_state(state)
-    emit({"status": state["status"], "decision_record": str(path)})
+    emit({"status": state["status"], "decision_record": str(path),
+          "pending_decision": state.get("pending_decision")})
 
 
 def command_status(args: argparse.Namespace) -> None:
@@ -2941,6 +3273,7 @@ def command_status(args: argparse.Namespace) -> None:
         "final_reviewer": state["final_reviewer"], "drafts": state["drafts"],
         "cross_reviews": state["cross_reviews"], "synthesis_submissions": state["synthesis_submissions"],
         "final_reviews": state["final_reviews"], "pending_decision": state["pending_decision"],
+        "pending_decisions": state.get("pending_decisions") or {},
         "investigations": state.get("investigations") or {},
         "draft_rounds": state.get("draft_rounds") or {},
         "convergence_reviews": state.get("convergence_reviews") or {},
@@ -3000,6 +3333,11 @@ def command_migrate_engine(args: argparse.Namespace) -> None:
     state = load_state(project, args.run_id, allow_engine_drift=True)
     frozen = state.get("engine_contract")
     current = engine_contract()
+    active = active_invocation_records(state)
+    if active:
+        raise WorkflowError(
+            "engine migration is refused while invocation records are RUNNING: "
+            + ",".join(sorted(active)))
     if frozen == current:
         emit({"status": "ENGINE_CURRENT", "run_id": state["run_id"], "engine_contract": current})
     preview = {
@@ -3014,10 +3352,30 @@ def command_migrate_engine(args: argparse.Namespace) -> None:
     atomic_json(path, {**preview, "applied_at": utc_now()})
     record_artifact(state, f"decision-{path.stem}", path)
     state["engine_contract"] = current
+    state["engine_epoch"] = state.get("engine_epoch", 0) + 1
     state["software_version"] = VERSION
     save_state(state)
     emit({"status": state["status"], "run_id": state["run_id"],
           "engine_contract": current, "decision_record": str(path)})
+
+
+def command_recover_invocation(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id, allow_engine_drift=True)
+    preview = {
+        "status": "INTERRUPTED_INVOCATION_RECOVERY_PREVIEW", "run_id": state["run_id"],
+        "assignment": args.assignment, "actor": args.actor, "reason": args.reason,
+        "active": active_invocation_records(state).get(args.assignment),
+        "warning": "Apply only after the named assignment process has ended; its spent attempt remains charged.",
+    }
+    if not args.apply:
+        emit(preview)
+    recovered = recover_interrupted_assignment(
+        state, args.assignment, args.actor, args.reason)
+    if not recovered:
+        raise WorkflowError(f"no RUNNING invocation exists for assignment {args.assignment!r}")
+    save_state(state)
+    emit({**preview, "status": state["status"], "recovered_invocations": recovered})
 
 
 def command_abandon(args: argparse.Namespace) -> None:
@@ -3084,6 +3442,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     preflight = commands.add_parser("preflight")
     preflight.add_argument("--project", required=True)
+    preflight.add_argument(
+        "--base-ref", default="HEAD",
+        help="Git ref whose committed SHA will be frozen; source worktree changes are excluded",
+    )
     preflight.add_argument("--backend", choices=["auto", *SUPPORTED_PROVIDERS], default="auto")
     preflight.add_argument(
         "--probe", action="store_true",
@@ -3095,6 +3457,10 @@ def build_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init")
     init.add_argument("--project", required=True)
     init.add_argument("--request", required=True)
+    init.add_argument(
+        "--base-ref", default="HEAD",
+        help="Git branch, tag, or commit to freeze; uncommitted source-worktree changes are ignored",
+    )
     init.add_argument("--backend", choices=["auto", *SUPPORTED_PROVIDERS], default="auto")
     init.add_argument("--final-reviewer", choices=["both", *SUPPORTED_PROVIDERS], required=True)
     init.add_argument(
@@ -3153,6 +3519,9 @@ def build_parser() -> argparse.ArgumentParser:
     adjudicate = commands.add_parser("adjudicate")
     adjudicate.add_argument("--project", required=True)
     adjudicate.add_argument("--run-id", required=True)
+    adjudicate.add_argument(
+        "--decision-id", required=True,
+        help="stable key from status.pending_decisions; binds preview and apply to one decision")
     adjudicate.add_argument("--decision", required=True)
     adjudicate.add_argument(
         "--choice",
@@ -3197,6 +3566,16 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_engine.add_argument("--actor", required=True)
     migrate_engine.add_argument("--apply", action="store_true")
     migrate_engine.set_defaults(func=command_migrate_engine)
+
+    recover = commands.add_parser(
+        "recover-invocation", help="audit and terminalize a controller-interrupted planning call")
+    recover.add_argument("--project", required=True)
+    recover.add_argument("--run-id", required=True)
+    recover.add_argument("--assignment", required=True)
+    recover.add_argument("--reason", required=True)
+    recover.add_argument("--actor", required=True)
+    recover.add_argument("--apply", action="store_true")
+    recover.set_defaults(func=command_recover_invocation)
     return parser
 
 
@@ -3207,7 +3586,11 @@ def main() -> None:
             "investigate", "draft", "cross-review", "diverge",
             "convergence-review", "final-review",
         }
-        if args.command in parallel_commands:
+        if args.command == "recover-invocation":
+            project = resolve_project(args.project)
+            with assignment_lock(project, args.run_id, args.assignment):
+                args.func(args)
+        elif args.command in parallel_commands:
             project = resolve_project(args.project)
             slot = getattr(args, "slot", None) or getattr(args, "reviewer", None)
             with assignment_lock(project, args.run_id, f"{args.command}-{slot}"):

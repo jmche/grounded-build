@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-TEXT_SUFFIXES = {"", ".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
+TEXT_SUFFIXES = {"", ".json", ".md", ".mjs", ".py", ".toml", ".txt", ".yaml", ".yml"}
 # Mirrors .gitignore: these are local runtime artifacts, not distributed skill sources. `.omc`
 # holds oh-my-claudecode session state, which records prompt text in the operator's own language.
 IGNORED_PARTS = {
@@ -67,6 +67,7 @@ def validate_public_release() -> None:
         ROOT / "LICENSE", ROOT / "SECURITY.md", ROOT / "README.md", ROOT / "CHANGELOG.md",
         ROOT / "CONTRIBUTING.md", ROOT / "SUPPORT.md", ROOT / "CODE_OF_CONDUCT.md",
         ROOT / "scripts" / "package_release.py",
+        ROOT / "scripts" / "dsh_read_boundary.mjs",
         ROOT / ".github" / "workflows" / "ci.yml",
         ROOT / ".github" / "workflows" / "release.yml",
         ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md",

@@ -2,6 +2,30 @@
 
 All notable changes use semantic versioning.
 
+## [0.6.3] - 2026-09-06
+
+- Hardened planning-provider isolation: model tools cannot read mounted credentials, invocation
+  outputs no longer make the whole run directory writable, DSH loses shell/runtime/subagent escape
+  paths, and nested DSH responses receive deterministic schema validation before semantic review.
+- Made planning barriers concurrency-safe by reserving paid attempts before launch, merging findings
+  only while holding the run lock, preserving simultaneous typed decisions, rejecting stale engine
+  epochs, and making terminal states absorb late worker results.
+- Allowed planning preflight and initialization from an explicit `--base-ref` even when the source
+  checkout is dirty; only the selected committed SHA enters the detached planning worktree.
+- Separated convergence and round-budget review grants, added one audited fixed-SHA re-review after a
+  PASS is superseded by a correction, and fixed reviewer timeout handling so infrastructure failures
+  are durably recorded instead of crashing the controller.
+- Replaced DSH's writable incremental review channel with a path-bounded read-only tool profile and
+  final structured output. Unknown DSH tools fail closed, the real DSH overlay composition is checked
+  during preflight, and every implementation reviewer now runs inside the same outer bubblewrap
+  boundary as planning agents. Reviewer setup never mutates shared repository configuration.
+- Bound adjudication previews to stable decision IDs, made interrupted planning calls explicitly
+  recoverable without refunding their reserved attempt, and fixed reimbursement after an input-scoped
+  budget reset. Planning init now records the selected ref, frozen SHA, and every excluded dirty path.
+- Bounded controller-side Git diff capture with a changed-path fallback for oversized binary patches;
+  restricted the automatic post-PASS re-review to controller-effective PASS results; and made exhausted
+  review-budget choices reflect which exceptional grants remain available.
+
 ## [0.6.2] - 2026-09-02
 
 - Allowed implementation runs to initialize from an explicitly selected target-branch SHA while the

@@ -40,6 +40,7 @@ RUNTIME_MANIFEST = (
     "references/planning_workflow.md",
     "references/reviewer_prompt.md",
     "scripts/package_release.py",
+    "scripts/dsh_read_boundary.mjs",
     "scripts/plan_workflow.py",
     "scripts/release_check.py",
     "scripts/workflow.py",

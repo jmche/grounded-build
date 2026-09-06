@@ -53,6 +53,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.environment = os.environ.copy()
         self.environment["PATH"] = f"{self.bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["GROUNDED_BUILD_IMPLEMENT_HOME"] = str(self.state_home)
+        self.environment["GROUNDED_BUILD_TESTING"] = "1"
         dsh_home = self.root / "dsh-home"
         dsh_home.mkdir()
         (dsh_home / "settings.yaml").write_text(
@@ -72,13 +73,23 @@ class WorkflowIntegrationTests(unittest.TestCase):
         path.write_text(
             textwrap.dedent(
                 f"""\
-                #!{sys.executable}
+                #!/usr/bin/env python3
                 import json
                 import os
                 import re
                 import sys
+                import time
 
+                if "--version" in sys.argv:
+                    print("fake-{name} 1.0")
+                    raise SystemExit(0)
+                if "--help" in sys.argv:
+                    print("--profile headless --patch --dump-config --json-schema --output-format "
+                          "--permission-mode --no-session-persistence")
+                    raise SystemExit(0)
                 prompt = sys.argv[-1]
+                if os.environ.get("FAKE_{name.upper()}_SLEEP"):
+                    time.sleep(float(os.environ["FAKE_{name.upper()}_SLEEP"]))
                 if os.environ.get("FAKE_{name.upper()}_EXIT") == "1":
                     raise SystemExit(42)
                 def field(label):
@@ -293,6 +304,42 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(review["reviewed_sha"], reviewed_sha)
         report = json.loads(Path(str(review["report_path"])).read_text(encoding="utf-8"))
         self.assertEqual(report["reviewer"], "dsh")
+
+    def test_dsh_review_does_not_mutate_shared_git_configuration(self) -> None:
+        initialized = self.initialize("dsh")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        before = self.run_command(
+            "git", "-C", str(self.project), "config", "--local", "--list"
+        ).stdout
+        self.commit_batch_change(implementation)
+        self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        after = self.run_command(
+            "git", "-C", str(self.project), "config", "--local", "--list"
+        ).stdout
+        self.assertEqual(after, before)
+        self.assertNotIn("core.excludesfile", after.lower())
+
+    def test_review_timeout_is_recorded_as_infrastructure_error(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        self.environment["FAKE_CODEX_SLEEP"] = "2"
+        failed = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+            "--timeout", "1", expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_SLEEP")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        self.assertIn("timed out", str(failed["reason"]))
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text()
+        )
+        self.assertEqual(state["review_invocations"][-1]["status"], "INFRA_ERROR")
+        self.assertIn("timed out", state["review_invocations"][-1]["error"])
 
     def test_reviewer_switch_is_audited_without_resetting_state_or_budget(self) -> None:
         initialized = self.initialize_raw("codex", implementer="claude")
@@ -1409,7 +1456,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
             {path.name for path in context.iterdir()},
             {
                 "acceptance_contract.json", "assignment.json", "batch_manifest.md",
-                "finding_ledger.json", "plan.md",
+                "changes.patch", "finding_ledger.json", "plan.md", "review_schema.json",
             },
         )
         prompt = (
@@ -1418,7 +1465,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertIn(str(context / "plan.md"), prompt)
         self.assertIn(str(context / "batch_manifest.md"), prompt)
         self.assertIn(str(context / "assignment.json"), prompt)
+        self.assertIn(str(context / "changes.patch"), prompt)
         self.assertIn(str(context / "finding_ledger.json"), prompt)
+        self.assertIn("implemented", (context / "changes.patch").read_text())
         self.assertNotIn(str(run_dir / "reviews"), prompt)
         (context / "batch_manifest.md").write_text("tampered reviewer input\n", encoding="utf-8")
         tampered = self.workflow(
@@ -2210,6 +2259,114 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(second["status"], "REVIEW_PASS")
         self.assertEqual(second["round"], 2)
         self.assertEqual(second["reviewed_sha"], later_head)
+
+    def test_exactly_one_post_pass_review_can_cross_the_round_limit(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        run_id = str(initialized["run_id"])
+        for round_number in range(1, 5):
+            self.commit_batch_change(implementation, f"implemented round {round_number}\n")
+            review = self.workflow(
+                "review", "--project", str(self.project),
+                "--run-id", run_id, "--batch", "1",
+            )
+            self.assertEqual(review["status"], "REVIEW_PASS")
+            self.assertEqual(review["round"], round_number)
+
+        exempt_head = self.commit_batch_change(implementation, "post-pass correction\n")
+        exempt = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", run_id, "--batch", "1",
+        )
+        self.assertEqual(exempt["status"], "REVIEW_PASS")
+        self.assertEqual(exempt["round"], 5)
+        self.assertEqual(exempt["reviewed_sha"], exempt_head)
+
+        self.commit_batch_change(implementation, "another post-pass change\n")
+        parked = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", run_id, "--batch", "1", expected=3,
+        )
+        self.assertEqual(parked["reason"], "MAX_REVIEW_ROUNDS_EXCEEDED")
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text()
+        )
+        self.assertEqual(state["post_pass_review_exemptions_used"]["1"]["round"], 5)
+
+    def test_convergence_and_round_budget_grants_are_independent(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        run_id = str(initialized["run_id"])
+        for round_number in range(1, 4):
+            self.commit_batch_change(implementation, f"implemented round {round_number}\n")
+            self.workflow(
+                "review", "--project", str(self.project),
+                "--run-id", run_id, "--batch", "1",
+            )
+
+        self.commit_batch_change(implementation, "round four needs a decision\n")
+        self.environment["FAKE_REVIEW_NEEDS_DECISION"] = "1"
+        convergence = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", run_id, "--batch", "1", expected=3,
+        )
+        self.environment.pop("FAKE_REVIEW_NEEDS_DECISION")
+        convergence_status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", run_id,
+        )
+        convergence_decision = convergence_status["pending_decision"]
+        self.assertIn("GRANT_ONE_REVIEW", convergence_decision["allowed_choices"])
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(convergence_decision["decision_id"]),
+            "--choice", "GRANT_ONE_REVIEW", "--reason", "resolve convergence",
+            "--actor", "test-user", "--apply",
+        )
+        self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", run_id, "--batch", "1",
+        )
+        self.commit_batch_change(implementation, "post-pass correction\n")
+        self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", run_id, "--batch", "1",
+        )
+        self.commit_batch_change(implementation, "budget-granted correction\n")
+        budget = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", run_id, "--batch", "1", expected=3,
+        )
+        budget_status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", run_id,
+        )
+        budget_decision = budget_status["pending_decision"]
+        self.assertEqual(budget_decision["type"], "REVIEW_BUDGET_EXHAUSTED")
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(budget_decision["decision_id"]),
+            "--choice", "GRANT_ONE_REVIEW", "--reason", "one budget extension",
+            "--actor", "test-user", "--apply",
+        )
+        final = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", run_id, "--batch", "1",
+        )
+        self.assertEqual(final["status"], "REVIEW_PASS")
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text()
+        )
+        self.assertEqual(state["extra_review_rounds_granted"]["1"], 1)
+        self.assertEqual(state["budget_review_rounds_granted"]["1"], 1)
+        self.commit_batch_change(implementation, "after every review extension\n")
+        exhausted_again = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", run_id, "--batch", "1", expected=3,
+        )
+        self.assertEqual(exhausted_again["reason"], "MAX_REVIEW_ROUNDS_EXCEEDED")
+        decision = self.workflow(
+            "status", "--project", str(self.project), "--run-id", run_id,
+        )["pending_decision"]
+        self.assertNotIn("GRANT_ONE_REVIEW", decision["allowed_choices"])
 
     def test_pass_without_a_new_commit_refuses_a_second_paid_review(self) -> None:
         initialized = self.initialize("codex")
@@ -3506,6 +3663,90 @@ class SharedVerificationWorktreeTests(unittest.TestCase):
 
 
 class ReviewerRuntimeTest(unittest.TestCase):
+    def test_reported_pass_without_effective_pass_gets_no_post_pass_exemption(self) -> None:
+        head = "b" * 40
+        self.assertFalse(WORKFLOW_MODULE.qualifies_for_post_pass_review(
+            {"reported_verdict": "PASS", "verdict": "FAIL", "reviewed_sha": "a" * 40},
+            head, False,
+        ))
+        self.assertTrue(WORKFLOW_MODULE.qualifies_for_post_pass_review(
+            {"reported_verdict": "PASS", "verdict": "PASS", "reviewed_sha": "a" * 40},
+            head, False,
+        ))
+
+    def test_large_review_diff_falls_back_to_bounded_changed_path_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            project = Path(scratch) / "project"
+            project.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=project, check=True)
+            large = project / "large.bin"
+            large.write_bytes(os.urandom(WORKFLOW_MODULE.MAX_REVIEW_DIFF_BYTES + 1024))
+            subprocess.run(["git", "add", large.name], cwd=project, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=project, check=True)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project, text=True).strip()
+            large.write_bytes(os.urandom(WORKFLOW_MODULE.MAX_REVIEW_DIFF_BYTES + 1024))
+            subprocess.run(["git", "add", large.name], cwd=project, check=True)
+            subprocess.run(["git", "commit", "-qm", "head"], cwd=project, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project, text=True).strip()
+            destination = Path(scratch) / "changes.patch"
+
+            WORKFLOW_MODULE.write_bounded_review_diff(project, base, head, destination)
+
+            captured = destination.read_text(encoding="utf-8")
+            self.assertIn("REVIEW PATCH OMITTED", captured)
+            self.assertIn("large.bin", captured)
+            self.assertLess(destination.stat().st_size, WORKFLOW_MODULE.MAX_REVIEW_DIFF_BYTES)
+
+    def test_dsh_read_boundary_denies_credentials_and_all_file_mutation(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is unavailable")
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            allowed = root / "allowed"
+            outside = root / "outside"
+            allowed.mkdir()
+            outside.mkdir()
+            (allowed / "ok.txt").write_text("ok\n", encoding="utf-8")
+            (outside / "secret.txt").write_text("secret\n", encoding="utf-8")
+            plugin = SKILL_ROOT / "scripts" / "dsh_read_boundary.mjs"
+            program = textwrap.dedent(
+                f"""\
+                import {{ apply }} from {json.dumps(plugin.as_uri())};
+                let guard;
+                const ctx = {{ on: (_name, callback) => {{ guard = callback; }} }};
+                apply(ctx, {{workspaceRoot: {json.dumps(str(allowed))}, allowWeb: false,
+                            allowedRoots: [{json.dumps(str(allowed))}]}});
+                const next = async () => ({{kind: "allow"}});
+                const results = [];
+                results.push(await guard({{name: "read", arguments: {{file_path: "ok.txt"}}}}, next));
+                results.push(await guard({{name: "read", arguments: {{file_path: {json.dumps(str(outside / 'secret.txt'))}}}}}, next));
+                results.push(await guard({{name: "write", arguments: {{file_path: "new.txt"}}}}, next));
+                results.push(await guard({{name: "edit", arguments: {{file_path: "ok.txt"}}}}, next));
+                results.push(await guard({{name: "future_unknown_tool", arguments: {{}}}}, next));
+                results.push(await guard({{name: "glob", arguments: {{path: ".", pattern: "../**/*"}}}}, next));
+                results.push(await guard({{name: "web_search", arguments: {{query: "official docs"}}}}, next));
+                let webGuard;
+                apply({{on: (_name, callback) => {{ webGuard = callback; }}}},
+                      {{workspaceRoot: {json.dumps(str(allowed))}, allowWeb: true,
+                       allowedRoots: [{json.dumps(str(allowed))}]}});
+                results.push(await webGuard(
+                    {{name: "web_search", arguments: {{query: "official docs"}}}}, next));
+                console.log(JSON.stringify(results));
+                """
+            )
+            result = subprocess.run(
+                [node, "--input-type=module", "-e", program], text=True,
+                capture_output=True, check=True,
+            )
+        decisions = json.loads(result.stdout)
+        self.assertEqual(
+            [item["kind"] for item in decisions],
+            ["allow", "deny", "deny", "deny", "deny", "deny", "deny", "allow"],
+        )
+
     def test_advanced_reviewer_models_are_defaults_and_user_can_defer(self) -> None:
         default_args = argparse.Namespace(
             claude_model=None, codex_model=None, codex_model_provider=None, codex_profile=None)
@@ -3536,7 +3777,58 @@ class ReviewerRuntimeTest(unittest.TestCase):
         self.assertEqual(command[command.index("-m") + 1], "deepseek-reasoner")
         self.assertEqual(command[command.index("-p") + 1], "deepseek")
         self.assertIn('model_provider="deepseek-gateway"', command)
-        self.assertNotIn("token", " ".join(command).lower())
+        line = " ".join(command).lower()
+        self.assertNotIn("api_key", line)
+        self.assertNotIn("bearer_token", line)
+        self.assertNotIn("auth.json", line)
+
+    def test_codex_implementation_reviewer_denies_model_access_to_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            command = WORKFLOW_MODULE.reviewer_command(
+                "codex", root, root, root / "schema.json", root / "raw.json", "prompt",
+                runtime={})
+        line = " ".join(command)
+        self.assertIn('default_permissions="grounded_build"', line)
+        self.assertIn('"~/.codex"="deny"', line)
+        self.assertIn("tools.web_search=false", line)
+
+    def test_review_diff_disables_repository_textconv(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            project = root / "project"
+            project.mkdir()
+            marker = root / "textconv-executed"
+            converter = root / "converter"
+            converter.write_text(
+                "#!/bin/sh\nprintf executed > \"$MARKER\"\ncat \"$1\"\n", encoding="utf-8")
+            converter.chmod(0o755)
+            environment = {**os.environ, "MARKER": str(marker)}
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=project, check=True)
+            subprocess.run(["git", "config", "diff.hostexec.textconv", str(converter)], cwd=project, check=True)
+            (project / ".gitattributes").write_text("*.payload diff=hostexec\n", encoding="utf-8")
+            payload = project / "sample.payload"
+            payload.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=project, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=project, check=True)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project, text=True).strip()
+            payload.write_text("head\n", encoding="utf-8")
+            subprocess.run(["git", "add", payload.name], cwd=project, check=True)
+            subprocess.run(["git", "commit", "-qm", "head"], cwd=project, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project, text=True).strip()
+
+            with mock.patch.dict(os.environ, environment, clear=True):
+                subprocess.run(
+                    ["git", "diff", "--textconv", base, head, "--"], cwd=project,
+                    stdout=subprocess.DEVNULL, check=True,
+                )
+                self.assertTrue(marker.exists(), "fixture must prove the configured textconv executes")
+                marker.unlink()
+                WORKFLOW_MODULE.write_bounded_review_diff(project, base, head, root / "changes.patch")
+
+            self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

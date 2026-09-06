@@ -8,12 +8,15 @@ import copy
 import fcntl
 import functools
 import hashlib
+import importlib.util
 import json
 import os
 import platform
 import re
 import resource
+import selectors
 import secrets
+import signal
 import shutil
 import stat
 import subprocess
@@ -53,6 +56,7 @@ MAX_ENVIRONMENT_BYTES = 16 * 1024 * 1024 * 1024
 MAX_ENVIRONMENT_SCAN_SECONDS = 30.0
 MAX_INSTRUCTION_FILES = 16
 MAX_INSTRUCTION_BYTES = 1024 * 1024
+MAX_REVIEW_DIFF_BYTES = 4 * 1024 * 1024
 SUPPORTED_REVIEWERS = ("claude", "codex", "dsh")
 DEFAULT_CLAUDE_REVIEWER_MODEL = "opus"
 DEFAULT_CODEX_REVIEWER_MODEL = "gpt-5.6-sol"
@@ -336,6 +340,11 @@ def controller_runtime() -> dict[str, Any]:
     invoked = Path(sys.executable).absolute()
     resolved = invoked.resolve()
     path_python = shutil.which("python3")
+    engine_files = {
+        "workflow.py": Path(__file__).resolve(),
+        "plan_workflow.py": SKILL_ROOT / "scripts" / "plan_workflow.py",
+        "dsh_read_boundary.mjs": SKILL_ROOT / "scripts" / "dsh_read_boundary.mjs",
+    }
     return {
         "implementation": platform.python_implementation(),
         "version": platform.python_version(),
@@ -345,6 +354,7 @@ def controller_runtime() -> dict[str, Any]:
         "path_python3_matches": bool(path_python and Path(path_python).resolve() == resolved),
         "supported": sys.version_info >= (3, 11),
         "command_prefix": [str(invoked), str(Path(__file__).resolve())],
+        "engine_files": {name: sha256_file(path) for name, path in engine_files.items()},
     }
 
 
@@ -361,6 +371,10 @@ def validate_controller_runtime(state: dict[str, Any]) -> None:
             "workflow controller runtime changed after initialization; resume with the recorded "
             f"command prefix {json.dumps(prefix)} or explicitly supersede the run"
         )
+    if recorded.get("engine_files") is not None and recorded["engine_files"] != current["engine_files"]:
+        raise WorkflowError(
+            "workflow engine or shared reviewer-isolation code changed after initialization; "
+            "resume with the frozen installed skill or explicitly supersede the run")
 
 
 def project_runtime_payload(project: Path) -> dict[str, Any]:
@@ -1738,6 +1752,12 @@ def command_init(args: argparse.Namespace) -> None:
     if not shutil.which(args.reviewer):
         raise WorkflowError(f"reviewer CLI is not available on PATH: {args.reviewer}")
     runtime = reviewer_runtime(args, args.reviewer)
+    if args.reviewer == "dsh":
+        capability = planning_isolation_module().adapter_capabilities("dsh")
+        if not capability.get("ok"):
+            raise WorkflowError(
+                "dsh cannot prove the required headless overlay contract: "
+                + json.dumps(capability, sort_keys=True))
     ensure_no_git_operation(project)
     target = args.target_branch or git(project, "branch", "--show-current")
     if not target:
@@ -1845,6 +1865,8 @@ def command_init(args: argparse.Namespace) -> None:
         "usage": default_usage(),
         "pending_decision": None,
         "extra_review_rounds_granted": {},
+        "budget_review_rounds_granted": {},
+        "post_pass_review_exemptions_used": {},
         "extra_review_invocations_granted": {},
         "extra_verification_attempts_granted": {},
         "host_network_authorizations": {},
@@ -1921,6 +1943,7 @@ def build_prompt(
     plan_path: Path,
     batch_manifest_path: Path,
     assignment_path: Path,
+    diff_path: Path,
     ledger_path: Path,
     legacy_path: Path | None,
     evidence_path: Path | None,
@@ -1951,6 +1974,7 @@ def build_prompt(
         f"- Base SHA: `{base}`\n"
         f"- Head SHA: `{head}`\n"
         f"- Diff range: `{base}..{head}`\n\n"
+        f"- Controller-captured diff: `{diff_path}`\n"
         f"- Finding ledger: `{ledger_path}`\n"
         f"- Acceptance contract: `{contract_path}`\n"
         + (f"- Frozen supplementary instruction manifest: `{instruction_manifest_path}`\n" if instruction_manifest_path else "")
@@ -1981,7 +2005,7 @@ def build_prompt(
 def prepare_review_context(
     state: dict[str, Any], batch: str, round_number: int, base: str, head: str,
     invocation_id: str,
-) -> tuple[Path, Path, Path, Path, Path, Path | None, Path | None, Path, Path | None]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path | None, Path | None, Path, Path | None]:
     """Create the minimal explicit context granted to the reviewer CLI."""
     context = (
         Path(state["run_directory"])
@@ -1995,6 +2019,7 @@ def prepare_review_context(
     batch_manifest_path = context / "batch_manifest.md"
     ledger_path = context / "finding_ledger.json"
     assignment_path = context / "assignment.json"
+    diff_path = context / "changes.patch"
     contract_path = context / "acceptance_contract.json"
     legacy_path: Path | None = None
     evidence_path: Path | None = None
@@ -2004,6 +2029,8 @@ def prepare_review_context(
     instruction_manifest_path = copy_instruction_context(state, context)
     atomic_json(ledger_path, state.get("finding_ledger", {}))
     atomic_json(contract_path, state["acceptance_contract"])
+    write_bounded_review_diff(Path(state["project"]), base, head, diff_path)
+    diff_path.chmod(0o600)
     atomic_json(
         assignment_path,
         {
@@ -2050,9 +2077,81 @@ def prepare_review_context(
         evidence_path = context / "verification_evidence.json"
         atomic_json(evidence_path, {"evidence": evidence, "rejected_requests": rejected})
     return (
-        context, plan_path, batch_manifest_path, assignment_path, ledger_path,
+        context, plan_path, batch_manifest_path, assignment_path, diff_path, ledger_path,
         legacy_path, evidence_path, contract_path, instruction_manifest_path,
     )
+
+
+def bounded_git_output(project: Path, arguments: list[str], limit: int) -> tuple[bytes, bool]:
+    """Capture git output without allowing repository-controlled data to exhaust controller RAM."""
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(
+            ["git", "-C", str(project), *arguments], stdout=subprocess.PIPE, stderr=errors,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        chunks: list[bytes] = []
+        size = 0
+        overflow = False
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + 120
+        try:
+            with process.stdout:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(arguments, 120)
+                    if not selector.select(remaining):
+                        raise subprocess.TimeoutExpired(arguments, 120)
+                    chunk = os.read(process.stdout.fileno(), 64 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > limit:
+                        overflow = True
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        break
+                    chunks.append(chunk)
+            returncode = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise WorkflowError("timed out while capturing the fixed-SHA review diff") from exc
+        finally:
+            selector.close()
+        errors.seek(0)
+        detail = errors.read(4096).decode("utf-8", errors="replace").strip()
+    if not overflow and returncode != 0:
+        raise WorkflowError(f"git diff failed ({returncode}): {detail}")
+    return b"".join(chunks), overflow
+
+
+def write_bounded_review_diff(project: Path, base: str, head: str, destination: Path) -> None:
+    """Write a bounded patch, falling back to a bounded path manifest for large changes."""
+    patch, overflow = bounded_git_output(
+        project, ["diff", "--no-ext-diff", "--no-textconv", "--binary", base, head, "--"],
+        MAX_REVIEW_DIFF_BYTES,
+    )
+    if overflow:
+        paths, paths_overflow = bounded_git_output(
+            project, ["diff", "--no-ext-diff", "--no-textconv", "--name-status", base, head, "--"],
+            MAX_REVIEW_DIFF_BYTES,
+        )
+        if paths_overflow:
+            raise WorkflowError(
+                f"REVIEW_DIFF_TOO_LARGE: changed-path manifest exceeds {MAX_REVIEW_DIFF_BYTES} bytes")
+        patch = (
+            f"# REVIEW PATCH OMITTED: binary patch exceeded {MAX_REVIEW_DIFF_BYTES} bytes.\n"
+            "# Inspect the fixed-SHA reviewer worktree; changed paths follow.\n"
+        ).encode("utf-8") + paths
+    destination.write_bytes(patch)
 
 
 def reviewer_command(
@@ -2069,42 +2168,16 @@ def reviewer_command(
         # dsh-headless has no structured-output flag, so the schema travels IN the prompt and the
         # host parses the printed final message. Contract review needs no writable output channel.
         schema_text = json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
-        if "assessment" in schema.get("properties", {}):
-            dsh_prompt = (
-                prompt
-                + "\n\nOUTPUT CONTRACT. Your FINAL assistant message must be ONLY one complete "
-                + "JSON object matching this schema — no prose, no fences, and no file writes. "
-                + "Verify it is complete and valid before stopping.\n"
-                + schema_text
-            )
-            return ["env", "DSH_PERMISSION_MODE=read-only", "dsh", "--profile", "headless", dsh_prompt]
-        # Code review persists incremental findings because a long review may lose its final stream.
-        # dsh receives workspace-write only in the detached reviewer worktree; post-run cleanliness
-        # rejects every write outside the ignored `.review-out/` channel.
         dsh_prompt = (
             prompt
-            + "\n\nOUTPUT CONTRACT. Working directory for all file writes is the current working "
-            + "directory. PERSIST YOUR REVIEW INCREMENTALLY — never rely on a single final "
-            + "message, which may be lost. Use the Bash tool as you go:\n"
-            + "1. As soon as you FINISH judging one acceptance-contract criterion, APPEND one JSON "
-            + "object per line to `.review-out/criteria.jsonl` with exactly the keys `criterion_id`, "
-            + "`status`, `evidence_ids`, `rationale` (printf '%s\\n' ... >> .review-out/criteria.jsonl, "
-            + "or `cat >>` with one object per line). Never rewrite the file; append only.\n"
-            + "2. As soon as you CONFIRM a finding, append its complete finding object to "
-            + "`.review-out/findings.jsonl`, one per line (append only).\n"
-            + "3. Only after every criterion and finding above is persisted, write "
-            + "`.review-out/meta.json` with `{\"verdict\": ..., \"summary\": ..., "
-            + "\"resolved_finding_ids\": [...], \"verification_requests\": [...]}` (empty arrays "
-            + "when none).\n"
-            + "4. Then write the COMPLETE assembled review object (the full schema below) to "
-            + "`.review-out/review.json`.\n"
-            + "5. Your FINAL assistant message must be ONLY that same complete JSON object — no "
-            + "prose, no fences. If anything stops you before step 5, the files from steps 1-4 "
-            + "already carry the review; the task fails only if neither the files nor the message "
-            + "delivers it. Verify JSON is complete and valid before stopping.\n"
+            + "\n\nOUTPUT CONTRACT. Your FINAL assistant message must be ONLY one complete "
+            + "JSON object matching this schema — no prose, no fences, and no file writes. "
+            + "Verify it is complete and valid before stopping.\n"
             + schema_text
         )
-        return ["env", "DSH_PERMISSION_MODE=workspace-write", "dsh", "--profile", "headless", dsh_prompt]
+        return [
+            "dsh", "--profile", "headless", dsh_prompt,
+        ]
     if reviewer == "codex":
         runtime = runtime or {}
         selection: list[str] = []
@@ -2117,6 +2190,7 @@ def reviewer_command(
         return [
             "codex", "-a", "never", "exec", "--ephemeral", "-s", "read-only",
             *selection,
+            *planning_isolation_module().CODEX_POLICY_OVERRIDES,
             "-C", str(reviewer_path), "--add-dir", str(context_dir),
             "--output-schema", str(schema_path), "-o", str(raw_path), prompt,
         ]
@@ -2180,69 +2254,41 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
     raise WorkflowError("Claude output did not contain a structured review result")
 
 
-def _read_json_objects(path: Path) -> list[dict[str, Any]]:
-    """Read a file of JSON objects (one per line, or adjacent), tolerantly.
-
-    The reviewer writes incrementally; tolerate pretty-printed or multi-line objects by
-    decoding consecutive JSON values and skipping stray non-JSON fragments.
-    """
-    if not path.is_file():
-        return []
-    decoder = json.JSONDecoder()
-    text = path.read_text(encoding="utf-8", errors="replace")
-    items: list[dict[str, Any]] = []
-    index = 0
-    while index < len(text):
-        while index < len(text) and text[index] in " \t\r\n,":
-            index += 1
-        if index >= len(text):
-            break
-        try:
-            obj, end = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
-            newline = text.find("\n", index)
-            if newline < 0:
-                break
-            index = newline + 1
-            continue
-        if isinstance(obj, dict):
-            items.append(obj)
-        index = end
-    return items
-
-
-def read_dsh_review(reviewer_path: Path) -> dict[str, Any] | None:
-    """Read the review the dsh reviewer wrote to its ``.review-out`` channel.
-
-    The reviewer persists its work INCREMENTALLY (.review-out/criteria.jsonl and
-    findings.jsonl) so a stopped, truncated, or timed-out run does not lose what it had
-    already decided, then writes the assembled ``review.json`` (and ``meta.json``) when
-    complete. The complete object wins when present; otherwise the fragments are assembled
-    into a review payload with whatever was recorded before the run stopped.
-    """
-    out = Path(reviewer_path) / ".review-out"
-    if not out.is_dir():
-        return None
-    final = out / "review.json"
-    if final.is_file():
-        try:
-            payload = json.loads(final.read_text(encoding="utf-8"))
-        except Exception:
-            payload = None
-        if isinstance(payload, dict):
-            return payload
-    criteria = _read_json_objects(out / "criteria.jsonl")
-    findings = _read_json_objects(out / "findings.jsonl")
-    if not criteria and not findings:
-        return None
+@functools.lru_cache(maxsize=1)
+def planning_isolation_module() -> Any:
+    """Load the shared provider sandbox implementation from the installed planning engine."""
+    path = SKILL_ROOT / "scripts" / "plan_workflow.py"
+    spec = importlib.util.spec_from_file_location("grounded_build_plan_isolation", path)
+    if spec is None or spec.loader is None:
+        raise WorkflowError("could not load the shared reviewer isolation module")
+    module = importlib.util.module_from_spec(spec)
     try:
-        meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
-    except Exception:
-        meta = None
-    payload = dict(meta) if isinstance(meta, dict) else {}
-    payload["criterion_results"] = criteria
-    payload["findings"] = findings
-    return payload
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise WorkflowError(f"could not load the shared reviewer isolation module: {exc}") from exc
+    return module
+
+
+def isolated_reviewer_command(
+    command: list[str], reviewer: str, runtime: dict[str, Any] | None,
+    invocation_root: Path, reviewer_path: Path, context_dir: Path,
+) -> tuple[list[str], dict[str, str]]:
+    """Reuse the planning engine's tested provider sandbox for implementation review."""
+    module = planning_isolation_module()
+    try:
+        state = {"agent_runtime": {reviewer: runtime or {}}}
+        wrapped = module.isolated_agent_command(
+            command, state, invocation_root, reviewer_path, context_dir, allow_web=False)
+        environment = module.agent_environment()
+        if os.environ.get("GROUNDED_BUILD_TESTING") == "1":
+            environment.update({
+                key: value for key, value in os.environ.items() if key.startswith("FAKE_")
+            })
+        return wrapped, environment
+    except Exception as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise WorkflowError(f"could not construct the fail-closed reviewer sandbox: {exc}") from exc
 
 
 def contract_digest(criteria: list[dict[str, Any]]) -> str:
@@ -2438,7 +2484,7 @@ def command_contract_review(args: argparse.Namespace) -> None:
     raw_path = root / "raw.json"
     report_path = root / "report.json"
     stderr_path = root / "stderr.log"
-    schema_path = root / "schema.json"
+    schema_path = context / "schema.json"
     prompt_path.write_text(prompt, encoding="utf-8")
     # Bind `batch` to the declared identifiers for THIS run. Left as a free string, a reviewer can
     # answer "B01,B02,B03,B04" for one criterion -- which the validator then rejects, after the
@@ -2453,10 +2499,15 @@ def command_contract_review(args: argparse.Namespace) -> None:
     command = reviewer_command(
         state["reviewer"], reviewer_path, context, schema_path, raw_path, prompt,
         contract_schema, state.get("reviewer_runtime"))
+    command, review_env = isolated_reviewer_command(
+        command, state["reviewer"], state.get("reviewer_runtime"),
+        root, reviewer_path, context,
+    )
     if args.dry_run:
         emit({"status": "CONTRACT_REVIEW_DRY_RUN", "run_id": state["run_id"], "command": command[:-1] + ["<PROMPT>"], "prompt_path": str(prompt_path)})
     try:
-        result = run(command, cwd=reviewer_path, check=False, timeout=args.timeout)
+        result = run(
+            command, cwd=reviewer_path, check=False, timeout=args.timeout, env=review_env)
     except WorkflowError as exc:
         invocation.update({"status": "INFRA_ERROR", "error": str(exc), "completed_at": utc_now()})
         append_event(state, "INVOCATION_INFRA_ERROR", {"invocation_id": invocation_id, "error": str(exc)})
@@ -3742,6 +3793,18 @@ def require_target_unchanged(project: Path, state: dict[str, Any]) -> None:
         integration["status"] = "DIVERGED" if stale else "FAST_FORWARD_READY"
 
 
+def qualifies_for_post_pass_review(
+    last_review: dict[str, Any] | None, implementation_head: str, already_used: bool,
+) -> bool:
+    """Only a controller-effective PASS for an older SHA earns the automatic re-review."""
+    return bool(
+        isinstance(last_review, dict)
+        and last_review.get("verdict") == "PASS"
+        and last_review.get("reviewed_sha") != implementation_head
+        and not already_used
+    )
+
+
 def command_review(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     state = load_state(project, args.run_id)
@@ -3767,15 +3830,31 @@ def command_review(args: argparse.Namespace) -> None:
     legacy_recovery_round = legacy_recovery_round_allowed(
         state, args.batch, round_number
     )
-    round_limit = int(state["budgets"]["max_quality_rounds_per_batch"]) + int(
-        state["extra_review_rounds_granted"].get(args.batch, 0)
+    round_limit = (
+        int(state["budgets"]["max_quality_rounds_per_batch"])
+        + int(state.get("extra_review_rounds_granted", {}).get(args.batch, 0))
+        + int(state.get("budget_review_rounds_granted", {}).get(args.batch, 0))
+        + int(bool(state.get("post_pass_review_exemptions_used", {}).get(args.batch)))
     )
-    if round_number > round_limit and not legacy_recovery_round:
+    implementation_head = git(implementation, "rev-parse", "HEAD")
+    last_review = prior[-1] if prior else None
+    post_pass_exemption = bool(
+        round_number > round_limit
+        and not legacy_recovery_round
+        and qualifies_for_post_pass_review(
+            last_review, implementation_head,
+            bool(state.get("post_pass_review_exemptions_used", {}).get(args.batch)),
+        )
+    )
+    if round_number > round_limit and not legacy_recovery_round and not post_pass_exemption:
+        allowed_choices = ["DEFER_ELIGIBLE_P1", "ABORT_RUN"]
+        if not state.get("budget_review_rounds_granted", {}).get(args.batch):
+            allowed_choices.insert(0, "GRANT_ONE_REVIEW")
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
             "decision_id": f"decision-{slug(args.batch)}-{len(state['decisions']) + 1:03d}",
             "type": "REVIEW_BUDGET_EXHAUSTED", "batch": args.batch,
-            "allowed_choices": ["GRANT_ONE_REVIEW", "DEFER_ELIGIBLE_P1", "ABORT_RUN"],
+            "allowed_choices": allowed_choices,
             "created_at": utc_now(),
         }
         append_event(state, "DECISION_REQUIRED", state["pending_decision"])
@@ -3793,18 +3872,7 @@ def command_review(args: argparse.Namespace) -> None:
     if not reviewer_path.is_dir():
         raise WorkflowError(f"reviewer worktree is missing: {reviewer_path}")
     ensure_clean(reviewer_path, "reviewer")
-    if state["reviewer"] == "dsh":
-        # The dsh reviewer writes the review to `.review-out/review.json` via its Bash tool
-        # (workspace-write permission). `core.excludesFile` hides that directory from
-        # `git status`, so the post-review cleanliness check still passes with the file present.
-        dsh_review_out = reviewer_path / ".review-out"
-        shutil.rmtree(dsh_review_out, ignore_errors=True)
-        dsh_review_out.mkdir(exist_ok=True)
-        dsh_exclude = Path(state["run_directory"]) / "reviews" / "dsh_reviewer.exclude"
-        dsh_exclude.write_text(".review-out/\n", encoding="utf-8")
-        run(["git", "-C", str(reviewer_path), "config", "core.excludesFile", str(dsh_exclude)],
-            check=False)
-    head = git(implementation, "rev-parse", "HEAD")
+    head = implementation_head
     previous = state["accepted_batches"][-1] if state["accepted_batches"] else None
     previous_sha = state["accepted_shas"].get(previous, state["baseline_sha"])
     if run(("git", "-C", str(implementation), "merge-base", "--is-ancestor", previous_sha, head), check=False).returncode != 0:
@@ -3891,20 +3959,20 @@ def command_review(args: argparse.Namespace) -> None:
     raw_path = batch_dir / "raw.json"
     stderr_path = batch_dir / "stderr.log"
     metadata_path = batch_dir / "metadata.json"
-    schema_path = Path(state["run_directory"]) / "review_schema.json"
     validate_portable_review_schema()
-    atomic_json(schema_path, REVIEW_SCHEMA)
     atomic_json(Path(state["run_directory"]) / "finding_ledger.json", state["finding_ledger"])
     (
         context_dir, context_plan, context_batch_manifest, context_assignment,
-        context_ledger, context_legacy, context_evidence, context_contract,
+        context_diff, context_ledger, context_legacy, context_evidence, context_contract,
         context_instruction_manifest,
     ) = prepare_review_context(
         state, args.batch, round_number, base, head, invocation_id
     )
+    schema_path = context_dir / "review_schema.json"
+    atomic_json(schema_path, REVIEW_SCHEMA)
     prompt = build_prompt(
         state, args.batch, round_number, base, head,
-        context_plan, context_batch_manifest, context_assignment, context_ledger,
+        context_plan, context_batch_manifest, context_assignment, context_diff, context_ledger,
         context_legacy, context_evidence, context_contract, context_instruction_manifest,
     )
     prompt_path.write_text(prompt, encoding="utf-8")
@@ -3912,6 +3980,10 @@ def command_review(args: argparse.Namespace) -> None:
     command = reviewer_command(
         state["reviewer"], reviewer_path, context_dir,
         schema_path, raw_path, prompt, runtime=state.get("reviewer_runtime"),
+    )
+    command, review_env = isolated_reviewer_command(
+        command, state["reviewer"], state.get("reviewer_runtime"),
+        invocation_dir, reviewer_path, context_dir,
     )
     if args.dry_run:
         emit(
@@ -3928,23 +4000,19 @@ def command_review(args: argparse.Namespace) -> None:
             }
         )
     started = time.monotonic()
+    launch_error: str | None = None
     try:
-        result = run(command, cwd=reviewer_path, check=False, timeout=args.timeout)
-        timed_out = False
+        result = run(
+            command, cwd=reviewer_path, check=False, timeout=args.timeout, env=review_env)
     except WorkflowError as exc:
-        timed_out = True
+        launch_error = str(exc)
         result = None
-    # dsh reviewer: the OUTPUT CONTRACT persists the review incrementally under
-    # .review-out/ (criteria.jsonl / findings.jsonl / meta.json / review.json), so a truncated,
-    # stopped, or timed-out final stream still yields whatever was already decided. Read the
-    # channel only AFTER the run: a file present before the run would be a stale artifact.
-    file_payload = read_dsh_review(reviewer_path) if state["reviewer"] == "dsh" else None
-    if timed_out and file_payload is None:
-        invocation.update({"status": "INFRA_ERROR", "error": str(exc), "completed_at": utc_now()})
-        append_event(state, "INVOCATION_INFRA_ERROR", {"invocation_id": invocation_id, "error": str(exc)})
+    if launch_error is not None:
+        invocation.update({"status": "INFRA_ERROR", "error": launch_error, "completed_at": utc_now()})
+        append_event(state, "INVOCATION_INFRA_ERROR", {"invocation_id": invocation_id, "error": launch_error})
         save_state(state)
         emit({
-            "status": "REVIEWER_ERROR", "reason": str(exc), "run_id": state["run_id"],
+            "status": "REVIEWER_ERROR", "reason": launch_error, "run_id": state["run_id"],
             "batch": args.batch, "round": round_number,
         }, 4)
     if result is not None:
@@ -3962,7 +4030,7 @@ def command_review(args: argparse.Namespace) -> None:
                 "duration_seconds": duration, "started_at": utc_now(),
             },
         )
-        if result.returncode != 0 and file_payload is None:
+        if result.returncode != 0:
             invocation.update({"status": "INFRA_ERROR", "returncode": result.returncode, "completed_at": utc_now()})
             append_event(state, "INVOCATION_INFRA_ERROR", {
                 "invocation_id": invocation_id, "returncode": result.returncode,
@@ -3977,16 +4045,9 @@ def command_review(args: argparse.Namespace) -> None:
                 },
                 4,
             )
-    else:
-        atomic_json(metadata_path, {
-            "reviewer": state["reviewer"], "batch": args.batch, "round": round_number,
-            "base_sha": base, "reviewed_sha": head, "returncode": None,
-            "duration_seconds": round(time.monotonic() - started, 3),
-            "started_at": utc_now(), "file_channel": True,
-        })
     try:
-        payload = file_payload if file_payload is not None else extract_review(
-            state["reviewer"], result.stdout, raw_path)
+        assert result is not None
+        payload = extract_review(state["reviewer"], result.stdout, raw_path)
         validate_review_payload(payload, state["reviewer"], args.batch, base, head, state)
         ensure_clean(reviewer_path, "reviewer")
         if payload["verdict"] == "NEEDS_VERIFICATION":
@@ -4077,6 +4138,16 @@ def command_review(args: argparse.Namespace) -> None:
             "invocation_id": invocation_id, "reviewer": state["reviewer"],
         }
     )
+    if post_pass_exemption:
+        state.setdefault("post_pass_review_exemptions_used", {})[args.batch] = {
+            "round": round_number,
+            "prior_pass_sha": last_review.get("reviewed_sha") if last_review else None,
+            "reviewed_sha": head,
+            "used_at": utc_now(),
+        }
+        append_event(state, "POST_PASS_REVIEW_EXEMPTION_USED", {
+            "batch": args.batch, "round": round_number, "reviewed_sha": head,
+        })
     state["status"] = {
         "PASS": "AWAITING_ACCEPTANCE",
         "FAIL": "CHANGES_REQUESTED",
@@ -4097,8 +4168,19 @@ def command_review(args: argparse.Namespace) -> None:
         ):
             allowed.insert(0, "RESUME_WITH_DECISION")
         maximum = state["budgets"]["max_quality_rounds_per_batch"]
-        granted = int(state["extra_review_rounds_granted"].get(args.batch, 0))
-        if round_number >= maximum + granted and granted < 1:
+        convergence_granted = int(
+            state.get("extra_review_rounds_granted", {}).get(args.batch, 0)
+        )
+        budget_granted = int(
+            state.get("budget_review_rounds_granted", {}).get(args.batch, 0)
+        )
+        post_pass_granted = int(bool(
+            state.get("post_pass_review_exemptions_used", {}).get(args.batch)
+        ))
+        if (
+            round_number >= maximum + convergence_granted + budget_granted + post_pass_granted
+            and convergence_granted < 1
+        ):
             allowed.insert(0, "GRANT_ONE_REVIEW")
         if any(
             item["batch"] == args.batch and item["status"] == "OPEN" and item["severity"] == "P1"
@@ -4244,8 +4326,15 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         batch = pending.get("batch")
         if not isinstance(batch, str):
             raise WorkflowError("review grant requires a batch-scoped decision")
-        if int(state["extra_review_rounds_granted"].get(batch, 0)) >= 1:
-            raise WorkflowError("the single extra review grant was already used for this batch")
+        grant_key = (
+            "budget_review_rounds_granted"
+            if pending.get("type") == "REVIEW_BUDGET_EXHAUSTED"
+            else "extra_review_rounds_granted"
+        )
+        if int(state.get(grant_key, {}).get(batch, 0)) >= 1:
+            raise WorkflowError(
+                "the single extra review grant was already used for this decision class"
+            )
     elif args.choice == "GRANT_ONE_REVIEW_INVOCATION":
         batch = pending.get("batch")
         if not isinstance(batch, str):
@@ -4281,7 +4370,12 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         emit({"status": "ADJUDICATION_PREVIEW", "run_id": state["run_id"], "decision": decision})
     if args.choice == "GRANT_ONE_REVIEW":
         batch = str(pending["batch"])
-        state["extra_review_rounds_granted"][batch] = 1
+        grant_key = (
+            "budget_review_rounds_granted"
+            if pending.get("type") == "REVIEW_BUDGET_EXHAUSTED"
+            else "extra_review_rounds_granted"
+        )
+        state.setdefault(grant_key, {})[batch] = 1
         state["status"] = "CHANGES_REQUESTED"
     elif args.choice == "GRANT_ONE_REVIEW_INVOCATION":
         state.setdefault("extra_review_invocations_granted", {})[str(pending["batch"])] = 1
