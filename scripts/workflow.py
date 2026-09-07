@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_TIMEOUT_SECONDS = 1800
 MAX_REVIEW_ROUNDS = 4
 DEFAULT_MAX_REVIEW_INVOCATIONS_PER_BATCH = 10
@@ -953,7 +953,7 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
         or Path(state.get("run_directory", "")).resolve() != path.parent.resolve()
     ):
         raise WorkflowError("workflow state identity does not match the requested project/run")
-    if loaded_schema in {2, 3, 4, 5, 6, 7, 8}:
+    if loaded_schema in {2, 3, 4, 5, 6, 7, 8, 9}:
         validate_legacy_state_integrity(state, int(loaded_schema))
         state["schema_version"] = SCHEMA_VERSION
         state["_requires_migration"] = True
@@ -1940,6 +1940,9 @@ def build_prompt(
     round_number: int,
     base: str,
     head: str,
+    diff_base: str,
+    review_mode: str,
+    review_mode_reason: str,
     plan_path: Path,
     batch_manifest_path: Path,
     assignment_path: Path,
@@ -1971,9 +1974,12 @@ def build_prompt(
         f"- Batch: `{batch}`\n"
         f"- Cumulative final review: `{'yes' if cumulative_final_review else 'no'}`\n"
         f"- Review round: `{round_number}`\n"
+        f"- Review mode: `{review_mode}`\n"
+        f"- Review mode reason: `{review_mode_reason}`\n"
         f"- Base SHA: `{base}`\n"
         f"- Head SHA: `{head}`\n"
-        f"- Diff range: `{base}..{head}`\n\n"
+        f"- Authoritative coverage range: `{base}..{head}`\n"
+        f"- Supplied diff range: `{diff_base}..{head}`\n\n"
         f"- Controller-captured diff: `{diff_path}`\n"
         f"- Finding ledger: `{ledger_path}`\n"
         f"- Acceptance contract: `{contract_path}`\n"
@@ -1998,13 +2004,18 @@ def build_prompt(
         "List verified prior IDs in resolved_finding_ids. Return JSON matching the supplied schema, "
         "and return exactly one criterion_results entry for every acceptance-contract criterion "
         + ("across all batches because this is the cumulative final review. " if cumulative_final_review else "in this batch. ")
+        + "The supplied patch is a transport optimization, not review authority: the acceptance "
+        "contract and authoritative coverage range still apply to exact HEAD. In DELTA mode, start "
+        "with the supplied fix delta and prior ledger obligations. Expand inspection in the fixed-SHA "
+        "worktree whenever the delta changes or invalidates an authority, public contract, state or "
+        "security boundary, batch scope, prior assumption, or affected consumer. "
         + "Set reviewer, reviewed_sha, base_sha, and batch exactly as assigned. Do not wrap JSON in Markdown.\n"
     )
 
 
 def prepare_review_context(
     state: dict[str, Any], batch: str, round_number: int, base: str, head: str,
-    invocation_id: str,
+    diff_base: str, review_mode: str, review_mode_reason: str, invocation_id: str,
 ) -> tuple[Path, Path, Path, Path, Path, Path, Path | None, Path | None, Path, Path | None]:
     """Create the minimal explicit context granted to the reviewer CLI."""
     context = (
@@ -2029,7 +2040,7 @@ def prepare_review_context(
     instruction_manifest_path = copy_instruction_context(state, context)
     atomic_json(ledger_path, state.get("finding_ledger", {}))
     atomic_json(contract_path, state["acceptance_contract"])
-    write_bounded_review_diff(Path(state["project"]), base, head, diff_path)
+    write_bounded_review_diff(Path(state["project"]), diff_base, head, diff_path)
     diff_path.chmod(0o600)
     atomic_json(
         assignment_path,
@@ -2039,6 +2050,10 @@ def prepare_review_context(
             "round": round_number,
             "base_sha": base,
             "reviewed_sha": head,
+            "review_mode": review_mode,
+            "review_mode_reason": review_mode_reason,
+            "authoritative_coverage_base_sha": base,
+            "supplied_diff_base_sha": diff_base,
             "user_decisions": state.get("decisions", []),
         },
     )
@@ -3805,6 +3820,31 @@ def qualifies_for_post_pass_review(
     )
 
 
+def select_review_transport(
+    implementation: Path,
+    authoritative_base: str,
+    head: str,
+    prior_reviews: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    """Choose transported bytes without narrowing the reviewer's semantic authority.
+
+    Round one carries the complete authoritative range. A later round normally carries only commits
+    after the immediately preceding reviewed SHA; the fixed-SHA worktree, acceptance contract,
+    ledger, and authoritative base remain available for broader inspection. Rewritten history makes
+    the prior review unsuitable as a delta base, so transport returns to the full range. This uses
+    Git ancestry only, never filenames, thresholds, or semantic heuristics.
+    """
+    if not prior_reviews:
+        return "FULL", authoritative_base, "INITIAL_DISCOVERY"
+    previous_head = prior_reviews[-1].get("reviewed_sha")
+    if isinstance(previous_head, str) and run(
+        ("git", "-C", str(implementation), "merge-base", "--is-ancestor", previous_head, head),
+        check=False,
+    ).returncode == 0:
+        return "DELTA", previous_head, "FOLLOW_UP_FROM_PRIOR_REVIEWED_SHA"
+    return "FULL", authoritative_base, "PRIOR_REVIEWED_SHA_NOT_ANCESTOR"
+
+
 def command_review(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     state = load_state(project, args.run_id)
@@ -3890,6 +3930,9 @@ def command_review(args: argparse.Namespace) -> None:
             f"{head[:12]} already holds a PASS review; run accept for batch {args.batch!r} "
             "instead of paying for another review"
         )
+    review_mode, diff_base, review_mode_reason = select_review_transport(
+        implementation, base, head, prior
+    )
     contract_requests = register_missing_contract_verification(
         state, args.batch, round_number, base, head
     )
@@ -3966,12 +4009,14 @@ def command_review(args: argparse.Namespace) -> None:
         context_diff, context_ledger, context_legacy, context_evidence, context_contract,
         context_instruction_manifest,
     ) = prepare_review_context(
-        state, args.batch, round_number, base, head, invocation_id
+        state, args.batch, round_number, base, head,
+        diff_base, review_mode, review_mode_reason, invocation_id,
     )
     schema_path = context_dir / "review_schema.json"
     atomic_json(schema_path, REVIEW_SCHEMA)
     prompt = build_prompt(
         state, args.batch, round_number, base, head,
+        diff_base, review_mode, review_mode_reason,
         context_plan, context_batch_manifest, context_assignment, context_diff, context_ledger,
         context_legacy, context_evidence, context_contract, context_instruction_manifest,
     )
@@ -4027,6 +4072,9 @@ def command_review(args: argparse.Namespace) -> None:
             {
                 "reviewer": state["reviewer"], "batch": args.batch, "round": round_number,
                 "base_sha": base, "reviewed_sha": head, "returncode": result.returncode,
+                "review_mode": review_mode, "review_mode_reason": review_mode_reason,
+                "authoritative_coverage_base_sha": base, "supplied_diff_base_sha": diff_base,
+                "supplied_diff_bytes": context_diff.stat().st_size,
                 "duration_seconds": duration, "started_at": utc_now(),
             },
         )
@@ -4136,6 +4184,10 @@ def command_review(args: argparse.Namespace) -> None:
             "no_progress_streak": policy["no_progress_streak"],
             "report_path": str(report_path), "metadata_path": str(metadata_path),
             "invocation_id": invocation_id, "reviewer": state["reviewer"],
+            "review_mode": review_mode, "review_mode_reason": review_mode_reason,
+            "supplied_diff_base_sha": diff_base,
+            "supplied_diff_bytes": context_diff.stat().st_size,
+            "duration_seconds": duration,
         }
     )
     if post_pass_exemption:
@@ -4216,6 +4268,12 @@ def command_review(args: argparse.Namespace) -> None:
             "decision_reasons": policy["decision_reasons"],
             "warnings": policy["warnings"],
             "fix_policy": state["fix_policy"],
+            "review_mode": review_mode,
+            "review_mode_reason": review_mode_reason,
+            "authoritative_coverage_base_sha": base,
+            "supplied_diff_base_sha": diff_base,
+            "supplied_diff_bytes": context_diff.stat().st_size,
+            "duration_seconds": duration,
             "final_review_round": round_number >= MAX_REVIEW_ROUNDS,
             "legacy_recovery_round": legacy_recovery_round,
         },
@@ -4429,6 +4487,37 @@ def command_adjudicate(args: argparse.Namespace) -> None:
     emit({"status": "ADJUDICATED", "run_id": state["run_id"], "decision": decision, "run_status": state["status"]})
 
 
+def review_performance(state: dict[str, Any]) -> dict[str, Any]:
+    reviews = state.get("reviews", [])
+    classified = sum(item.get("review_mode") in {"FULL", "DELTA"} for item in reviews)
+    latest = reviews[-1] if reviews else {}
+    return {
+        "completed_reviews": len(reviews),
+        "full_reviews": sum(item.get("review_mode") == "FULL" for item in reviews),
+        "delta_reviews": sum(item.get("review_mode") == "DELTA" for item in reviews),
+        "legacy_unclassified_reviews": len(reviews) - classified,
+        "wall_seconds": round(sum(
+            float(item.get("duration_seconds", 0.0))
+            for item in reviews
+            if isinstance(item.get("duration_seconds"), (int, float))
+        ), 3),
+        "supplied_diff_bytes": sum(
+            int(item.get("supplied_diff_bytes", 0))
+            for item in reviews
+            if isinstance(item.get("supplied_diff_bytes"), int)
+        ),
+        "latest_review": {
+            key: latest.get(key)
+            for key in (
+                "batch", "round", "review_mode", "review_mode_reason", "base_sha",
+                "supplied_diff_base_sha", "reviewed_sha", "supplied_diff_bytes",
+                "duration_seconds",
+            )
+            if key in latest
+        },
+    }
+
+
 def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
     target_sha = git(project, "rev-parse", state["target_branch"])
     current_controller = controller_runtime()
@@ -4506,6 +4595,7 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "fix_policy": state["fix_policy"], "batches": state["batches"],
         "accepted_batches": state["accepted_batches"], "next_batch": current_batch(state),
         "review_count": len(state["reviews"]), "finalized": state["finalized"],
+        "review_performance": review_performance(state),
         "open_blocking_findings": [
             item for item in state["finding_ledger"].values() if item["status"] == "OPEN"
         ],

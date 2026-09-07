@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.6.3
+  version: 0.6.4
   compatibility: Linux, Git, Python 3.11+, bubblewrap, and at least one Claude, Codex, or dsh CLI adapter
 ---
 
@@ -70,8 +70,11 @@ Use `cli-default` as a model value to defer to that CLI/harness. A Codex provide
 ### 2. Freeze request and initialize
 
 Write the objective, constraints, exclusions, priorities, success conditions, and known decisions to a local
-Markdown request file. Use `final-reviewer=both` by default for independently verified planning; use one
-adapter only when requested or when cost/availability requires it.
+Markdown request file. Standard planning uses one fresh final reviewer by default; select the adapter
+that best fits the task's quality, latency, and availability requirements. Reserve
+`final-reviewer=both` for deep planning, an explicitly requested dual review, or a demonstrated
+high-consequence reason. Process and context isolation establish reviewer independence; paying two
+final reviewers is not required merely to make a standard run independent.
 
 Choose the planning depth explicitly:
 

@@ -1450,6 +1450,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--run-id", str(initialized["run_id"]), "--batch", "1",
         )
         self.assertEqual(review["status"], "REVIEW_PASS")
+        self.assertEqual(review["review_mode"], "FULL")
+        self.assertEqual(review["review_mode_reason"], "INITIAL_DISCOVERY")
+        self.assertEqual(review["supplied_diff_base_sha"], review["base_sha"])
         run_dir = Path(str(initialized["run_directory"]))
         context = run_dir / "review_context" / "batch_1" / "round_01" / "review-1-001"
         self.assertEqual(
@@ -1468,6 +1471,11 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertIn(str(context / "changes.patch"), prompt)
         self.assertIn(str(context / "finding_ledger.json"), prompt)
         self.assertIn("implemented", (context / "changes.patch").read_text())
+        assignment = json.loads((context / "assignment.json").read_text())
+        self.assertEqual(assignment["review_mode"], "FULL")
+        self.assertEqual(
+            assignment["authoritative_coverage_base_sha"], review["base_sha"]
+        )
         self.assertNotIn(str(run_dir / "reviews"), prompt)
         (context / "batch_manifest.md").write_text("tampered reviewer input\n", encoding="utf-8")
         tampered = self.workflow(
@@ -1955,7 +1963,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(migrated["status"], "MIGRATED")
         current = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["schema_version"], 9)
+        self.assertEqual(current["schema_version"], WORKFLOW_MODULE.SCHEMA_VERSION)
         WORKFLOW_MODULE.validate_review_contract(current)
         self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema7"))
 
@@ -1980,10 +1988,36 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--apply",
         )
         current = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["schema_version"], 9)
+        self.assertEqual(current["schema_version"], WORKFLOW_MODULE.SCHEMA_VERSION)
         self.assertEqual(current["review_contract"], original_contract)
         self.assertEqual(current["instruction_snapshots"], [])
         self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema8"))
+
+    def test_schema9_run_requires_explicit_review_transport_migration(self) -> None:
+        initialized = self.initialize_raw("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        original_contract = json.loads(json.dumps(state["review_contract"]))
+        self.write_authenticated_legacy_state(state_path, state, 9)
+
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
+        )
+        self.assertEqual(status["status"], "MIGRATION_REQUIRED")
+        preview = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"])
+        )
+        self.assertEqual(preview["from_schema"], 9)
+        self.assertEqual(preview["to_schema"], WORKFLOW_MODULE.SCHEMA_VERSION)
+        self.assertFalse(preview["review_contract_migration"])
+        migrated = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply",
+        )
+        current = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["schema_version"], WORKFLOW_MODULE.SCHEMA_VERSION)
+        self.assertEqual(current["review_contract"], original_contract)
+        self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema9"))
 
     def test_sequential_migration_uses_the_actual_loaded_schema(self) -> None:
         initialized = self.initialize_raw("codex")
@@ -2076,7 +2110,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(migrated["status"], "MIGRATED")
         current = json.loads(state_path.read_text())
-        self.assertEqual(current["schema_version"], 9)
+        self.assertEqual(current["schema_version"], WORKFLOW_MODULE.SCHEMA_VERSION)
         self.assertEqual(current["environment_contract"]["fingerprint_version"], 3)
         self.assertEqual(current["integration"]["attempts"][0]["status"], "LEGACY_SUPERSEDED")
         self.assertEqual(current["integration"]["current_attempt"], 2)
@@ -2251,7 +2285,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         return initialized, first, later_head
 
     def test_a_commit_after_pass_is_reviewable_instead_of_wedging_the_run(self) -> None:
-        initialized, _, later_head = self._pass_then_commit()
+        initialized, first, later_head = self._pass_then_commit()
         second = self.workflow(
             "review", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--batch", "1",
@@ -2259,6 +2293,32 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(second["status"], "REVIEW_PASS")
         self.assertEqual(second["round"], 2)
         self.assertEqual(second["reviewed_sha"], later_head)
+        self.assertEqual(second["review_mode"], "DELTA")
+        self.assertEqual(second["review_mode_reason"], "FOLLOW_UP_FROM_PRIOR_REVIEWED_SHA")
+        self.assertEqual(second["supplied_diff_base_sha"], first["reviewed_sha"])
+        run_dir = Path(str(initialized["run_directory"]))
+        context = run_dir / "review_context" / "batch_1" / "round_02" / "review-1-002"
+        assignment = json.loads((context / "assignment.json").read_text())
+        self.assertEqual(assignment["authoritative_coverage_base_sha"], second["base_sha"])
+        self.assertEqual(assignment["supplied_diff_base_sha"], first["reviewed_sha"])
+        expected = self.run_command(
+            "git", "-C", str(initialized["implementation_worktree"]),
+            "diff", "--no-ext-diff", "--no-textconv", "--binary",
+            str(first["reviewed_sha"]), later_head, "--",
+        ).stdout
+        self.assertEqual((context / "changes.patch").read_text(), expected)
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
+        )
+        self.assertEqual(status["review_performance"]["full_reviews"], 1)
+        self.assertEqual(status["review_performance"]["delta_reviews"], 1)
+        self.assertEqual(status["review_performance"]["legacy_unclassified_reviews"], 0)
+        self.assertGreaterEqual(status["review_performance"]["wall_seconds"], 0)
+        self.assertGreater(status["review_performance"]["supplied_diff_bytes"], 0)
+        self.assertEqual(
+            status["review_performance"]["latest_review"]["supplied_diff_base_sha"],
+            first["reviewed_sha"],
+        )
 
     def test_exactly_one_post_pass_review_can_cross_the_round_limit(self) -> None:
         initialized = self.initialize("codex")
@@ -3376,6 +3436,23 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertIn("valid outputs", protocol.lower())
         self.assertIn("Keep verification proportional to risk", protocol)
 
+    def test_review_latency_contract_preserves_authority_while_reducing_transport(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        implementation = (
+            SKILL_ROOT / "references" / "implementation_workflow.md"
+        ).read_text(encoding="utf-8")
+        reviewer = (SKILL_ROOT / "references" / "reviewer_prompt.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("one fresh final reviewer by default", skill)
+        self.assertIn("Reserve", skill)
+        for document in (implementation, reviewer):
+            self.assertIn("transport", document)
+            self.assertIn("optimization", document)
+            self.assertIn("authoritative coverage range", document)
+            self.assertIn("exact-HEAD", document)
+        self.assertIn("Never use filenames, line counts, or keyword rules", implementation)
+
     def test_public_contract_documents_dsh_as_an_implementation_reviewer(self) -> None:
         documents = {
             "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
@@ -3673,6 +3750,39 @@ class ReviewerRuntimeTest(unittest.TestCase):
             {"reported_verdict": "PASS", "verdict": "PASS", "reviewed_sha": "a" * 40},
             head, False,
         ))
+
+    def test_rewritten_review_history_returns_to_full_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            project = Path(scratch)
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=project, check=True)
+            tracked = project / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", tracked.name], cwd=project, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=project, check=True)
+            base = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=project, text=True
+            ).strip()
+            tracked.write_text("old review head\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-qam", "old"], cwd=project, check=True)
+            old_head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=project, text=True
+            ).strip()
+            subprocess.run(["git", "reset", "--hard", base], cwd=project, check=True)
+            tracked.write_text("replacement head\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-qam", "replacement"], cwd=project, check=True)
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=project, text=True
+            ).strip()
+
+            mode, diff_base, reason = WORKFLOW_MODULE.select_review_transport(
+                project, base, head, [{"reviewed_sha": old_head}]
+            )
+
+            self.assertEqual(mode, "FULL")
+            self.assertEqual(diff_base, base)
+            self.assertEqual(reason, "PRIOR_REVIEWED_SHA_NOT_ANCESTOR")
 
     def test_large_review_diff_falls_back_to_bounded_changed_path_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

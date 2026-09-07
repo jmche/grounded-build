@@ -2,6 +2,18 @@
 
 All notable changes use semantic versioning.
 
+## [0.6.4] - 2026-09-07
+
+- Made one fresh final reviewer the standard planning recommendation while retaining dual final
+  review for deep, explicitly requested, or demonstrated high-consequence work.
+- Added ancestry-bound delta transport for implementation re-reviews. Round one and rewritten
+  histories still carry the full authoritative range; later rounds carry only the change since the
+  prior reviewed SHA without narrowing the acceptance contract or exact-HEAD review authority.
+- Exposed review mode, coverage and delta bases, supplied patch bytes, and wall time in review
+  results, durable records, metadata, and status summaries so latency improvements are measurable.
+- Raised implementation state to schema v10 so active schema-v9 runs require an explicit audited
+  migration before adopting the new review-transport semantics.
+
 ## [0.6.3] - 2026-09-06
 
 - Hardened planning-provider isolation: model tools cannot read mounted credentials, invocation
