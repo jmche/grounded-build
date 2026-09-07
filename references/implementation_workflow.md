@@ -92,6 +92,12 @@ review. Target movement is integration divergence, not execution staleness.
 - Grant reviewer CLIs only a round-specific context containing the plan snapshot, current finding ledger, and assignment metadata. Historical reviews remain audit records, not reviewer input.
 - Include the frozen batch manifest in both contract-review and code-review contexts. A reviewer may challenge its boundary through `NEEDS_USER_DECISION`, but may not silently expand the run or remap batch identifiers.
 - Permit implementer and reviewer to use the same agent family, but preserve process, context, worktree, permission, and output isolation. Model diversity is useful but is not the source of review authority.
+- Transport the full authoritative Git range for round one. On later rounds, transport only the delta
+  since the immediately preceding reviewed SHA when that SHA remains an ancestor, while retaining the
+  full acceptance contract, finding ledger, plan authority, and exact-HEAD worktree. If review history
+  is no longer ancestral, the review follows a user decision without a new commit, or the batch is the
+  cumulative final review, return to full transport. Never use filenames, line counts, or keyword rules
+  to decide semantic review scope.
 
 ## Shared review contract
 
@@ -346,7 +352,19 @@ Pause despite `auto` when a fix expands scope, conflicts with the plan, changes 
 
 Fix in `implementation_worktree`, commit, and call `review` again for the same batch. The script requires a new fix commit after `REVIEW_FAIL` and reuses the reviewer worktree at the new SHA.
 
-A PASS describes one exact SHA, not the batch. If you commit again after `REVIEW_PASS` — a deferred finding fixed anyway, say — `accept` will refuse because the report no longer authorizes HEAD; run `review` again instead and the new commit gets its own round. Reviewing the same SHA twice is refused, so a PASS that still describes HEAD cannot buy a second paid review. After acceptance the contract is closed: commits beyond the accepted SHA cannot be finalized, and the choice is to reset the implementation worktree back to that SHA or to supersede the run and review the extra commits in a new one.
+The first review carries the complete authoritative range. A subsequent review carries a controller-
+captured patch beginning at the prior reviewed SHA when Git ancestry proves that it is a continuation.
+This is a transport optimization, not a semantic boundary.
+The authoritative coverage range continues to bind the verdict at exact HEAD.
+The review output and status expose `review_mode`, both coverage and supplied-diff bases, patch bytes,
+and duration. `DELTA` never means "review only these lines": the reviewer retains the exact-HEAD
+worktree and expands inspection when a changed authority, contract, state/security boundary, scope,
+prior assumption, or consumer invalidates earlier evidence. A rewritten branch automatically returns
+to `FULL` transport. A same-SHA review after user adjudication also remains `FULL`, because the changed
+decision context—not a Git delta—is the new evidence. Cumulative final reviews remain `FULL` because
+they must issue criterion results across every batch.
+
+A PASS describes one exact SHA, not the batch. If you commit again after `REVIEW_PASS` — a deferred finding fixed anyway, say — `accept` will refuse because the report no longer authorizes HEAD; run `review` again instead and the new commit gets its own round. A PASS or FAIL cannot buy another paid review of the same SHA. A typed user decision may legitimately return the same SHA for reconsideration; that review uses full transport because the decision context, rather than a code delta, changed. After acceptance the contract is closed: commits beyond the accepted SHA cannot be finalized, and the choice is to reset the implementation worktree back to that SHA or to supersede the run and review the extra commits in a new one.
 
 Read `warnings` and `decision_reasons` on every review result:
 
@@ -517,11 +535,13 @@ Schema migration authenticates the legacy event chain and final checkpoint befor
 field. A schema-number downgrade cannot convert edited state into trusted current-schema state. Migration
 backups are reusable only when byte-identical to the still-current legacy state, allowing an interrupted
 migration to resume without accepting an unrelated backup.
-Schema v9 validates the exact run-local paths, regular-file type, and SHA-256 digests of both
+Schema v10 adds explicit migration before a schema-v9 run adopts ancestry-bound delta review
+transport; it preserves the run's frozen reviewer templates and earlier review evidence. Schema v9
+validates the exact run-local paths, regular-file type, and SHA-256 digests of both
 reviewer-template snapshots and every explicitly frozen supplementary instruction before any active
 transition. Missing, redirected, or edited snapshots fail closed. Schema-v8 runs require an explicit
-migration to v9; that migration preserves their reviewer templates and records an empty supplementary
-instruction set rather than inventing authority.
+migration to the current schema; that migration preserves their reviewer templates and records an
+empty supplementary instruction set rather than inventing authority.
 
 After approval:
 

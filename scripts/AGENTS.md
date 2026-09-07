@@ -13,8 +13,8 @@ provider-sandbox constructor so both phases enforce one filesystem and credentia
 ## Key Files
 | File | Description |
 |------|-------------|
-| `plan_workflow.py` | Planning engine (~3.2k lines, `VERSION = "0.6.3"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
-| `workflow.py` | Implementation engine (`SCHEMA_VERSION = 9`). Concurrent run discovery, worktree isolation, frozen reviewer contracts, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
+| `plan_workflow.py` | Planning engine (~3.2k lines, `VERSION = "0.6.4"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
+| `workflow.py` | Implementation engine (`SCHEMA_VERSION = 10`). Concurrent run discovery, worktree isolation, frozen reviewer contracts, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
 | `dsh_read_boundary.mjs` | Fail-closed DSH model-tool allowlist. Only bounded read/search tools under the frozen worktree and invocation context may execute; bubblewrap remains the outer enforcement boundary. |
 | `release_check.py` | No-network release gate: validates `evals/evals.json` shape, required public-release files, LICENSE/SECURITY content, cross-file version synchronization, and the English-only rule; then compiles both engines and runs the unit suites. Optional `--quick-validator <path>` chains an external skill validator. |
 | `package_release.py` | Deterministic standard-library packager for versioned `.tar.gz` release archives and SHA-256 checksum files. |

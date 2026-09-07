@@ -64,7 +64,15 @@ If severity changes, provide `severity_change_justification`. Upgrading a deferr
 
 ## Round scope
 
-Round 1 is the complete discovery review. Later rounds are bounded re-reviews: verify prior findings, inspect regressions introduced by fixes, and consider genuinely masked defects. Do not restart a fresh unlimited architecture review each round.
+Round 1 is the complete discovery review. Later rounds are bounded re-reviews: verify prior findings,
+inspect regressions introduced by fixes, and consider genuinely masked defects. The controller may
+supply only the Git delta since the immediately preceding reviewed SHA, but that is a transport
+optimization rather than a semantic boundary. The acceptance contract, authoritative coverage range,
+and exact-HEAD worktree remain controlling. Expand inspection when the delta changes or invalidates an
+authority, public contract, state or security boundary, scope, prior assumption, or affected consumer.
+The controller retains full transport for same-SHA reviews after user adjudication and for cumulative
+final reviews whose criterion results cover every batch. Do not otherwise restart a fresh unlimited
+architecture review each round.
 
 Verdicts:
 

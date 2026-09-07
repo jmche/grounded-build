@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex", "dsh")
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
@@ -3462,7 +3462,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git branch, tag, or commit to freeze; uncommitted source-worktree changes are ignored",
     )
     init.add_argument("--backend", choices=["auto", *SUPPORTED_PROVIDERS], default="auto")
-    init.add_argument("--final-reviewer", choices=["both", *SUPPORTED_PROVIDERS], required=True)
+    init.add_argument(
+        "--final-reviewer", choices=["both", *SUPPORTED_PROVIDERS], required=True,
+        help="use one fresh reviewer for standard planning; reserve 'both' for deep or explicitly requested high assurance",
+    )
     init.add_argument(
         "--planning-depth", choices=["standard", "deep"], default="standard",
         help="standard stops after draft_02; deep adds draft_03 and an extra convergence review")

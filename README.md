@@ -114,7 +114,8 @@ Plan and Implement are independent workflows with separate state and review boun
 ### Plan
 
 Two isolated planning slots inspect one frozen Git commit. They investigate independently, draft
-independently, cross-review evidence, and review a host-synthesized implementation plan.
+independently, and cross-review evidence. Standard mode sends the host-synthesized plan to one fresh
+final reviewer; deep or explicitly high-assurance runs may send it to both.
 
 ```text
 frozen request + Git SHA
@@ -138,6 +139,12 @@ Allow authoritative upstream documentation during investigation, but do not wide
 The current host implements an approved plan in a run-owned worktree. A fresh CLI reviewer first
 derives the acceptance contract, then evaluates fixed commits through a bounded review,
 verification, and repair loop.
+
+The first code review receives the complete authoritative range. Follow-up reviews receive the patch
+since the preceding reviewed SHA while retaining the full contract, finding ledger, and exact-HEAD
+worktree. Rewritten history falls back to full transport, and semantic impact can always widen the
+reviewer's inspection beyond the supplied patch. Same-SHA reviews after a user decision and cumulative
+final reviews retain full transport because their new evidence is not bounded by a code delta.
 
 ```text
 frozen plan + batch manifest + Git SHA
@@ -200,7 +207,7 @@ deployments.
 
 ## Public beta status
 
-Version `v0.6.3` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
+Version `v0.6.4` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
 release gate are production-oriented, but broader provider and repository coverage is still needed
 before a general-availability claim.
 
