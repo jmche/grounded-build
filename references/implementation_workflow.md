@@ -95,7 +95,8 @@ review. Target movement is integration divergence, not execution staleness.
 - Transport the full authoritative Git range for round one. On later rounds, transport only the delta
   since the immediately preceding reviewed SHA when that SHA remains an ancestor, while retaining the
   full acceptance contract, finding ledger, plan authority, and exact-HEAD worktree. If review history
-  is no longer ancestral, return to full transport. Never use filenames, line counts, or keyword rules
+  is no longer ancestral, the review follows a user decision without a new commit, or the batch is the
+  cumulative final review, return to full transport. Never use filenames, line counts, or keyword rules
   to decide semantic review scope.
 
 ## Shared review contract
@@ -359,9 +360,11 @@ The review output and status expose `review_mode`, both coverage and supplied-di
 and duration. `DELTA` never means "review only these lines": the reviewer retains the exact-HEAD
 worktree and expands inspection when a changed authority, contract, state/security boundary, scope,
 prior assumption, or consumer invalidates earlier evidence. A rewritten branch automatically returns
-to `FULL` transport.
+to `FULL` transport. A same-SHA review after user adjudication also remains `FULL`, because the changed
+decision context—not a Git delta—is the new evidence. Cumulative final reviews remain `FULL` because
+they must issue criterion results across every batch.
 
-A PASS describes one exact SHA, not the batch. If you commit again after `REVIEW_PASS` — a deferred finding fixed anyway, say — `accept` will refuse because the report no longer authorizes HEAD; run `review` again instead and the new commit gets its own round. Reviewing the same SHA twice is refused, so a PASS that still describes HEAD cannot buy a second paid review. After acceptance the contract is closed: commits beyond the accepted SHA cannot be finalized, and the choice is to reset the implementation worktree back to that SHA or to supersede the run and review the extra commits in a new one.
+A PASS describes one exact SHA, not the batch. If you commit again after `REVIEW_PASS` — a deferred finding fixed anyway, say — `accept` will refuse because the report no longer authorizes HEAD; run `review` again instead and the new commit gets its own round. A PASS or FAIL cannot buy another paid review of the same SHA. A typed user decision may legitimately return the same SHA for reconsideration; that review uses full transport because the decision context, rather than a code delta, changed. After acceptance the contract is closed: commits beyond the accepted SHA cannot be finalized, and the choice is to reset the implementation worktree back to that SHA or to supersede the run and review the extra commits in a new one.
 
 Read `warnings` and `decision_reasons` on every review result:
 

@@ -2270,6 +2270,12 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--batch", "1",
         )
         self.assertEqual(reviewed["status"], "REVIEW_PASS")
+        self.assertEqual(reviewed["review_mode"], "FULL")
+        self.assertEqual(reviewed["review_mode_reason"], "SAME_SHA_AFTER_USER_DECISION")
+        self.assertEqual(reviewed["supplied_diff_base_sha"], reviewed["base_sha"])
+        run_dir = Path(str(initialized["run_directory"]))
+        context = run_dir / "review_context" / "batch_1" / "round_02" / "review-1-002"
+        self.assertIn("implemented", (context / "changes.patch").read_text(encoding="utf-8"))
 
     def _pass_then_commit(self) -> tuple[dict, dict, str]:
         """Reach a PASS, then commit again -- the state B10 wedged in."""
@@ -2285,7 +2291,31 @@ class WorkflowIntegrationTests(unittest.TestCase):
         return initialized, first, later_head
 
     def test_a_commit_after_pass_is_reviewable_instead_of_wedging_the_run(self) -> None:
-        initialized, first, later_head = self._pass_then_commit()
+        self.plan.write_text(
+            "# Plan\n\n## Batch 1\n\nChange tracked.txt.\n\n## Batch 2\n\nClose out.\n",
+            encoding="utf-8",
+        )
+        self.batch_manifest.write_text(
+            "# Run scope\n\nIncluded: plan batches 1 and 2.\n\nExcluded: none.\n",
+            encoding="utf-8",
+        )
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "codex",
+            "--implementer", "current-host-agent", "--fix-policy", "ask",
+            "--batches", "1,2", "--target-branch", "main",
+        )
+        self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation, "implemented\n")
+        first = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        later_head = self.commit_batch_change(implementation, "implemented once more\n")
         second = self.workflow(
             "review", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--batch", "1",
@@ -2313,8 +2343,12 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(status["review_performance"]["full_reviews"], 1)
         self.assertEqual(status["review_performance"]["delta_reviews"], 1)
         self.assertEqual(status["review_performance"]["legacy_unclassified_reviews"], 0)
-        self.assertGreaterEqual(status["review_performance"]["wall_seconds"], 0)
-        self.assertGreater(status["review_performance"]["supplied_diff_bytes"], 0)
+        self.assertGreaterEqual(
+            status["review_performance"]["valid_review_wall_seconds"], 0
+        )
+        self.assertGreater(
+            status["review_performance"]["valid_review_supplied_diff_bytes"], 0
+        )
         self.assertEqual(
             status["review_performance"]["latest_review"]["supplied_diff_base_sha"],
             first["reviewed_sha"],
@@ -2455,6 +2489,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "review", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--batch", "1",
         )
+        self.assertEqual(second["review_mode"], "FULL")
+        self.assertEqual(second["review_mode_reason"], "CUMULATIVE_FINAL_REVIEW")
+        self.assertEqual(second["supplied_diff_base_sha"], second["base_sha"])
         accepted = self.workflow(
             "accept", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--batch", "1",
@@ -3777,12 +3814,46 @@ class ReviewerRuntimeTest(unittest.TestCase):
             ).strip()
 
             mode, diff_base, reason = WORKFLOW_MODULE.select_review_transport(
-                project, base, head, [{"reviewed_sha": old_head}]
+                project, base, head, [{"reviewed_sha": old_head}], False
             )
 
             self.assertEqual(mode, "FULL")
             self.assertEqual(diff_base, base)
             self.assertEqual(reason, "PRIOR_REVIEWED_SHA_NOT_ANCESTOR")
+
+    def test_same_sha_and_cumulative_reviews_retain_full_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            project = Path(scratch)
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=project, check=True)
+            tracked = project / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", tracked.name], cwd=project, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=project, check=True)
+            base = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=project, text=True
+            ).strip()
+            tracked.write_text("reviewed\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-qam", "reviewed"], cwd=project, check=True)
+            reviewed = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=project, text=True
+            ).strip()
+            prior = [{"reviewed_sha": reviewed}]
+
+            self.assertEqual(
+                WORKFLOW_MODULE.select_review_transport(project, base, reviewed, prior, False),
+                ("FULL", base, "SAME_SHA_AFTER_USER_DECISION"),
+            )
+            tracked.write_text("later\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-qam", "later"], cwd=project, check=True)
+            later = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=project, text=True
+            ).strip()
+            self.assertEqual(
+                WORKFLOW_MODULE.select_review_transport(project, base, later, prior, True),
+                ("FULL", base, "CUMULATIVE_FINAL_REVIEW"),
+            )
 
     def test_large_review_diff_falls_back_to_bounded_changed_path_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

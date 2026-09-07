@@ -3825,6 +3825,7 @@ def select_review_transport(
     authoritative_base: str,
     head: str,
     prior_reviews: list[dict[str, Any]],
+    cumulative_final_review: bool,
 ) -> tuple[str, str, str]:
     """Choose transported bytes without narrowing the reviewer's semantic authority.
 
@@ -3837,6 +3838,10 @@ def select_review_transport(
     if not prior_reviews:
         return "FULL", authoritative_base, "INITIAL_DISCOVERY"
     previous_head = prior_reviews[-1].get("reviewed_sha")
+    if previous_head == head:
+        return "FULL", authoritative_base, "SAME_SHA_AFTER_USER_DECISION"
+    if cumulative_final_review:
+        return "FULL", authoritative_base, "CUMULATIVE_FINAL_REVIEW"
     if isinstance(previous_head, str) and run(
         ("git", "-C", str(implementation), "merge-base", "--is-ancestor", previous_head, head),
         check=False,
@@ -3931,7 +3936,7 @@ def command_review(args: argparse.Namespace) -> None:
             "instead of paying for another review"
         )
     review_mode, diff_base, review_mode_reason = select_review_transport(
-        implementation, base, head, prior
+        implementation, base, head, prior, cumulative_final_review
     )
     contract_requests = register_missing_contract_verification(
         state, args.batch, round_number, base, head
@@ -4012,6 +4017,7 @@ def command_review(args: argparse.Namespace) -> None:
         state, args.batch, round_number, base, head,
         diff_base, review_mode, review_mode_reason, invocation_id,
     )
+    supplied_diff_bytes = context_diff.stat().st_size
     schema_path = context_dir / "review_schema.json"
     atomic_json(schema_path, REVIEW_SCHEMA)
     prompt = build_prompt(
@@ -4040,6 +4046,11 @@ def command_review(args: argparse.Namespace) -> None:
                 "base_sha": base,
                 "reviewed_sha": head,
                 "reviewer": state["reviewer"],
+                "review_mode": review_mode,
+                "review_mode_reason": review_mode_reason,
+                "authoritative_coverage_base_sha": base,
+                "supplied_diff_base_sha": diff_base,
+                "supplied_diff_bytes": supplied_diff_bytes,
                 "command": command[:-1] + ["<PROMPT>"],
                 "prompt_path": str(prompt_path),
             }
@@ -4074,7 +4085,7 @@ def command_review(args: argparse.Namespace) -> None:
                 "base_sha": base, "reviewed_sha": head, "returncode": result.returncode,
                 "review_mode": review_mode, "review_mode_reason": review_mode_reason,
                 "authoritative_coverage_base_sha": base, "supplied_diff_base_sha": diff_base,
-                "supplied_diff_bytes": context_diff.stat().st_size,
+                "supplied_diff_bytes": supplied_diff_bytes,
                 "duration_seconds": duration, "started_at": utc_now(),
             },
         )
@@ -4186,7 +4197,7 @@ def command_review(args: argparse.Namespace) -> None:
             "invocation_id": invocation_id, "reviewer": state["reviewer"],
             "review_mode": review_mode, "review_mode_reason": review_mode_reason,
             "supplied_diff_base_sha": diff_base,
-            "supplied_diff_bytes": context_diff.stat().st_size,
+            "supplied_diff_bytes": supplied_diff_bytes,
             "duration_seconds": duration,
         }
     )
@@ -4272,7 +4283,7 @@ def command_review(args: argparse.Namespace) -> None:
             "review_mode_reason": review_mode_reason,
             "authoritative_coverage_base_sha": base,
             "supplied_diff_base_sha": diff_base,
-            "supplied_diff_bytes": context_diff.stat().st_size,
+            "supplied_diff_bytes": supplied_diff_bytes,
             "duration_seconds": duration,
             "final_review_round": round_number >= MAX_REVIEW_ROUNDS,
             "legacy_recovery_round": legacy_recovery_round,
@@ -4496,12 +4507,12 @@ def review_performance(state: dict[str, Any]) -> dict[str, Any]:
         "full_reviews": sum(item.get("review_mode") == "FULL" for item in reviews),
         "delta_reviews": sum(item.get("review_mode") == "DELTA" for item in reviews),
         "legacy_unclassified_reviews": len(reviews) - classified,
-        "wall_seconds": round(sum(
+        "valid_review_wall_seconds": round(sum(
             float(item.get("duration_seconds", 0.0))
             for item in reviews
             if isinstance(item.get("duration_seconds"), (int, float))
         ), 3),
-        "supplied_diff_bytes": sum(
+        "valid_review_supplied_diff_bytes": sum(
             int(item.get("supplied_diff_bytes", 0))
             for item in reviews
             if isinstance(item.get("supplied_diff_bytes"), int)
