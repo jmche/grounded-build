@@ -2,7 +2,8 @@
 
 ## Supported environment
 
-The current public beta supports Linux, Git, bubblewrap, and CPython 3.11–3.13. Claude, Codex, and dsh
+The current public beta supports Linux, Git, the `bubblewrap` and `socat` sandbox packages, and
+CPython 3.11–3.13. Claude, Codex, and dsh
 are supported for both planning and implementation review. Provider CLI authentication, harness
 configuration, and model availability remain the operator's responsibility.
 
@@ -15,7 +16,7 @@ Use GitHub Issues for reproducible defects and GitHub Discussions for usage ques
 enabled. Before filing a defect, include only non-sensitive diagnostics:
 
 - Grounded Build version
-- Python, Git, bubblewrap, and provider CLI versions
+- Python, Git, `bubblewrap`, `socat`, and provider CLI versions
 - Operating-system distribution and version
 - Workflow mode, status, and emitted error classification
 - A minimal reproduction using a public or synthetic repository when possible

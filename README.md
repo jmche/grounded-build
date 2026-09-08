@@ -45,8 +45,35 @@ Your repository at one frozen SHA
 
 ## Install
 
-Grounded Build is currently installed from source. It requires Linux, Git, bubblewrap, Python 3.11+
-and at least one authenticated supported agent CLI.
+Grounded Build is currently installed from source.
+
+### Prerequisites
+
+| Requirement | Why | Missing behaviour |
+|---|---|---|
+| Linux | Namespaces are the isolation primitive | Unsupported platform |
+| Git | Worktrees and atomic ref updates | Cannot initialize a run |
+| CPython 3.11–3.13 | Controller and workflow engine | Cannot start |
+| `bubblewrap` (`bwrap`) | The fixed-SHA verification sandbox, and the namespace every agent is launched into | Verification and agent launch refuse to run |
+| `socat` | Required by the provider CLI's own sandbox, which Grounded Build enables **fail-closed** for every planning and review invocation | The reviewer CLI refuses to start: `sandbox is enabled but dependencies are missing: socat not installed` |
+| At least one authenticated agent CLI | Planning slots and the independent reviewer | No adapter to invoke |
+
+`socat` is easy to miss because Grounded Build never invokes it directly — it is a transitive
+requirement of the provider CLI's sandbox, and it surfaces only as a CLI startup error at the first
+review. Install both sandbox packages together:
+
+```bash
+sudo apt install bubblewrap socat      # Debian/Ubuntu
+```
+
+Verify before the first run:
+
+```bash
+bwrap --version && command -v socat
+```
+
+There is no fallback for either. A missing sandbox dependency refuses to start rather than quietly
+downgrading to a weaker boundary, which is the same rule the rest of the workflow follows.
 
 ```bash
 git clone https://github.com/jmche/grounded-build.git
@@ -186,6 +213,8 @@ that installed the skill. Read [SECURITY.md](SECURITY.md) before using it with s
 | Linux | Yes | Bubblewrap and Linux namespaces are required. |
 | Python | 3.11–3.13 | Runtime uses only the standard library. |
 | Git | Yes | Worktrees and atomic ref updates are core primitives. |
+| `bubblewrap` | Required | Verification sandbox and agent launch namespaces. |
+| `socat` | Required | Needed by the provider CLI's fail-closed sandbox; not invoked by Grounded Build itself. |
 | Claude CLI | Plan + Implement reviewer | Tested through a restricted fresh process. |
 | Codex CLI | Plan + Implement reviewer | Adapter identity is separate from model identity. |
 | dsh | Plan + Implement reviewer | Uses the local harness selection unless overridden. |

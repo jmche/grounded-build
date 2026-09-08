@@ -87,6 +87,8 @@ without paid calls.
 
 ### External
 Python 3.11+ stdlib (`argparse`, `fcntl`, `hmac`, `hashlib`, `json`, `resource`, `subprocess`,
-`tomllib`, `secrets`); `git`; `bwrap`; the `claude` / `codex` / `dsh` CLIs.
+`tomllib`, `secrets`); `git`; `bwrap`; `socat` (not resolved here — the provider CLI's own sandbox
+requires it, and `isolated_reviewer_command` runs that sandbox fail-closed); the `claude` / `codex` /
+`dsh` CLIs.
 
 <!-- MANUAL: -->

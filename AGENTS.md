@@ -91,7 +91,9 @@ implementation run; later reviews consume only the digest-bound run snapshots.
 
 ### External
 - Python 3.11+ standard library only (`tomllib` requires 3.11) — no third-party runtime packages.
-- Git (worktrees are the isolation primitive), `bubblewrap` (sandbox namespaces), Linux.
+- Git (worktrees are the isolation primitive), `bubblewrap` (sandbox namespaces), `socat` (required
+  by the provider CLI's fail-closed sandbox; never invoked by this codebase, which is why it is easy
+  to omit from an install), Linux.
 - At least one provider CLI: `claude`, `codex`, or `dsh`. Exercised with Claude Code 2.1.238 and
   Codex CLI 0.149.0.
 
