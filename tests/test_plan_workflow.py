@@ -147,6 +147,10 @@ def fake_assignment(prompt_text):
 
 router_error = re.search(r"FAKE_CODE_MODE_ROUTER_ERROR=(\S+)", request_text)
 router_warning = re.search(r"FAKE_CODE_MODE_WARNING=(\S+)", request_text)
+quota_error = re.search(r"FAKE_RATE_LIMIT=(\S+)", request_text)
+if quota_error and provider == "codex" and quota_error.group(1) == fake_assignment(prompt):
+    print("429 rate limit: five-hour token quota exhausted", file=sys.stderr)
+    raise SystemExit(42)
 if provider == "codex" and router_error and router_error.group(1) == fake_assignment(prompt):
     print("2026-09-09T00:00:00Z ERROR codex_core::tools::router: "
           "error=failed to spawn code-mode host /opt/codex-code-mode-host: "
@@ -412,6 +416,116 @@ class PlanWorkflowTest(unittest.TestCase):
             "--reviewer", "F")
         state = self.get_state(initialized)
         self.assertEqual(state["final_reviews"]["F"]["provider"], "dsh")
+
+    def test_auto_selected_b_rate_limit_persistently_falls_back_to_host(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_RATE_LIMIT=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh",
+        )
+        failed = self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        self.assertIn("RATE_LIMIT", failed["error"])
+        state = self.get_state(initialized)
+        self.assertEqual(state["slot_provider_overrides"], {"B": "dsh"})
+        self.assertIsNone(state["pending_decision"])
+        self.assertEqual(state["automatic_fallbacks"][0]["from"], "codex")
+        self.assertFalse(state["provider_diversity"])
+        status = self.call(
+            "status", "--project", str(self.project), "--run-id", initialized["run_id"],
+        )
+        self.assertEqual(status["slot_provider_overrides"], {"B": "dsh"})
+        self.assertEqual(status["automatic_fallbacks"][0]["to"], "dsh")
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B",
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["investigations"]["B"]["provider"], "dsh")
+        self.assertEqual(state["usage"]["investigate-B"], 1)
+
+    def test_explicit_b_reviewer_rate_limit_requires_user_decision(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_RATE_LIMIT=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh", "--peer-reviewer", "codex",
+        )
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["status"], "NEEDS_USER_DECISION")
+        self.assertEqual(state["pending_decision"]["kind"], "RATE_LIMIT")
+        self.assertEqual(state["slot_provider_overrides"], {})
+
+    def test_user_reassigned_assignment_is_not_automatically_replaced(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_explicit_fallback_test", SCRIPT)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        state = {
+            "backend_requested": "auto", "peer_reviewer_requested": "auto",
+            "host_adapter": "dsh", "assignment_providers": {"draft-B": "claude"},
+        }
+        failure = module.ProviderInfrastructureError(
+            "claude", "RATE_LIMIT", "429 rate limit", retryable=True,
+        )
+        self.assertIsNone(module.automatic_planning_host_fallback(
+            state, "draft-B", "B", "claude", failure,
+        ))
+        self.assertNotIn("slot_provider_overrides", state)
+
+    def test_auto_b_rate_limit_stops_when_host_fallback_is_unavailable(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_RATE_LIMIT=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh",
+        )
+        host = self.bin / "dsh"
+        host.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+        host.chmod(0o755)
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["status"], "NEEDS_USER_DECISION")
+        self.assertEqual(state["pending_decision"]["kind"], "RATE_LIMIT")
+        self.assertEqual(state["slot_provider_overrides"], {})
+
+    def test_auto_selected_b_can_fall_back_to_other_host_bridge(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_RATE_LIMIT=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+        )
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["slot_provider_overrides"], {"B": "other"})
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B",
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["investigations"]["B"]["provider"], "other")
 
     def test_other_host_uses_generic_bridge_and_keeps_final_review_on_host(self) -> None:
         initialized = self.call(
@@ -1321,6 +1435,8 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(exported["status"], "READY")
         self.assertFalse(exported["provider_diversity"])
         self.assertFalse(exported["model_diversity"])
+        self.assertEqual(exported["assignment_providers"], {"draft-B": "claude"})
+        self.assertEqual(exported["automatic_fallbacks"], [])
 
         report = (Path(initialized["run_directory"]) / "final_report.md").read_text(encoding="utf-8")
         self.assertIn("Provider diversity: `false`", report)

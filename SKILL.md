@@ -36,6 +36,9 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
 - Order work by scope gate, user priority, severity, urgency, blockers/dependencies, causal leverage,
   evidence strength, then effort. Do not promote or demote a finding without new evidence.
 - Authentication, overload, rate limit, timeout, adapter startup, or tool-host failure is infrastructure, not a quality FAIL and not a consumed quality attempt.
+- When an auto-selected external B slot or implementation reviewer reports a rate limit, persistently
+  move that role to the available frozen host and retry the same work. Never override an explicit
+  user selection; if the host is unavailable, preserve the existing typed recovery path.
 - Stop at every typed user decision and at implementation approval. Never infer authority from plan approval.
 
 ## Plan workflow
@@ -217,6 +220,10 @@ still wins. Claude defaults to Opus, Codex to `gpt-5.6-sol`, and dsh to the mode
 `~/.dsh/settings.yaml`; `--claude-model`, `--codex-model`, `--codex-model-provider`,
 `--codex-profile`, `--dsh-model`, and `--dsh-model-provider` may override that selection at `init`
 and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.
+If an auto-selected external reviewer reports a rate limit, the run records
+`REVIEWER_AUTO_FALLBACK`, switches permanently to the frozen host runtime, and requires the same
+contract or batch review to be retried. Other infrastructure failures and explicit reviewer choices
+continue to use `REVIEWER_ERROR` and preview-first `change-reviewer` recovery.
 
 Before implementation preflight, resolve one stable CPython 3.11+ executable and use its absolute path
 for every `workflow.py` command in that run. Report and preserve the frozen `controller_runtime`; never

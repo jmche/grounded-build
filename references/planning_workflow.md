@@ -180,6 +180,14 @@ If the controller is interrupted while an invocation record says `RUNNING`, reac
 - Invocation budget exhausted: one extra invocation, reassign the assignment, resume after genuinely changed input, or abandon.
 - Provider infrastructure failure: resolve the external condition and continue, reassign, or abandon. It does not consume a quality attempt.
 
+For an automatically selected external B provider, a machine-classified rate limit is recovered
+without a user decision: the engine records the failed infrastructure invocation, persistently routes
+all remaining B assignments to the frozen host, marks both diversity claims false, and asks the host
+to retry the same assignment. The failed call consumes no quality attempt. Explicit `--backend` or
+`--peer-reviewer` choices are never replaced automatically, and an unavailable host leaves the normal
+typed provider-infrastructure decision in place. Authentication, timeout, overload, startup, malformed
+output, and quality failures do not trigger this fallback.
+
 Reassignment preserves audit history and process isolation but breaks the original two-slot
 diversity claim. After any reassignment, both `provider_diversity` and `model_diversity` are
 reported as false; the decision record names the adapter change and the isolation that remains.

@@ -15,6 +15,10 @@ All notable changes use semantic versioning.
 - Fixed Codex companion-host mounting and classified successful exits containing router startup
   errors as infrastructure failures rather than valid reviews; planning and implementation now share
   the same verified runtime-selection and isolation path.
+- Added an observable runtime quota fallback: an auto-selected external planning B slot or
+  implementation reviewer now moves persistently to the frozen host and retries without spending a
+  quality attempt. Explicit selections remain authoritative, and unavailable hosts preserve the
+  existing manual recovery path.
 
 ## [0.6.4] - 2026-09-07
 

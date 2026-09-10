@@ -577,6 +577,65 @@ def select_implementation_reviewer(
     )
 
 
+def automatic_implementation_host_fallback(
+    state: dict[str, Any], infrastructure: Any, invocation_id: str, phase: str,
+) -> dict[str, Any] | None:
+    """Replace an auto-selected rate-limited reviewer with the frozen host reviewer."""
+    host = state.get("host_adapter")
+    current = state.get("reviewer")
+    if not (
+        state.get("reviewer_requested") == "auto"
+        and getattr(infrastructure, "kind", None) == "RATE_LIMIT"
+        and isinstance(host, str)
+        and host in SUPPORTED_REVIEWERS
+        and current != host
+    ):
+        return None
+    module = planning_isolation_module()
+    capability = module.adapter_capabilities(host)
+    if not capability.get("ok"):
+        return None
+    runtime = state.get("host_reviewer_runtime") or {}
+    if runtime.get("adapter") != host:
+        return None
+    if host == "other":
+        executable = module.provider_executable("other")
+        if not (
+            executable
+            and runtime.get("executable") == str(executable)
+            and runtime.get("executable_sha256") == module.sha256_file(executable)
+        ):
+            return None
+    changed_at = utc_now()
+    change = {
+        "id": f"decision-{len(state.get('decisions', [])) + 1:03d}",
+        "type": "REVIEWER_AUTO_FALLBACK",
+        "from_reviewer": current,
+        "to_reviewer": host,
+        "reason": "auto-selected external reviewer hit a rate limit",
+        "infrastructure_kind": "RATE_LIMIT",
+        "trigger_invocation": invocation_id,
+        "phase": phase,
+        "created_at": changed_at,
+        "quality_rounds_reset": False,
+        "invocation_budgets_reset": False,
+        "finding_ledger_reset": False,
+    }
+    state["reviewer"] = host
+    state["reviewer_runtime"] = runtime
+    state.setdefault("automatic_reviewer_fallbacks", []).append(change)
+    state.setdefault("reviewer_history", []).append({
+        "reviewer": host,
+        "selected_at": changed_at,
+        "source": "AUTO_RATE_LIMIT_FALLBACK",
+        "decision_id": change["id"],
+        "reason": change["reason"],
+    })
+    state.setdefault("decisions", []).append(change)
+    append_event(state, "REVIEWER_AUTO_FALLBACK", change)
+    return change
+
+
 def git(path: Path, *args: str, check: bool = True) -> str:
     return run(("git", "-C", str(path), *args), check=check).stdout.strip()
 
@@ -1796,6 +1855,10 @@ def command_init(args: argparse.Namespace) -> None:
     # Complete every free, deterministic input check before an automatic selection can make a
     # paid provider call. The probe then binds the exact runtime that this initialization freezes.
     reviewer, runtime, reviewer_selection_checks = select_implementation_reviewer(args, project)
+    host_reviewer_runtime = (
+        reviewer_runtime(args, args.host_adapter)
+        if args.reviewer == "auto" and args.host_adapter else None
+    )
     if reviewer == "other":
         reviewer_available = bool(runtime.get("executable"))
     else:
@@ -1865,7 +1928,9 @@ def command_init(args: argparse.Namespace) -> None:
         "instruction_snapshots": instruction_snapshots,
         "reviewer": reviewer,
         "reviewer_runtime": runtime,
+        "reviewer_requested": args.reviewer,
         "host_adapter": args.host_adapter,
+        "host_reviewer_runtime": host_reviewer_runtime,
         "reviewer_selection_checks": reviewer_selection_checks,
         "controller_runtime": controller_runtime(),
         "project_runtime_at_start": before["project_runtime"],
@@ -1972,6 +2037,7 @@ def command_init(args: argparse.Namespace) -> None:
             "reviewer": reviewer,
             "reviewer_selection_checks": reviewer_selection_checks,
             "reviewer_runtime": runtime,
+            "host_reviewer_runtime": host_reviewer_runtime,
             "controller_runtime": state["controller_runtime"],
             "project_runtime_at_start": state["project_runtime_at_start"],
         }
@@ -2357,17 +2423,23 @@ def isolated_reviewer_command(
 
 def successful_reviewer_infrastructure_failure(
     reviewer: str, result: subprocess.CompletedProcess[str], raw_path: Path,
-) -> str | None:
+) -> Any | None:
     """Reuse the planning adapter's evidence-based zero-exit failure classification.
 
     Some Codex releases can exit successfully and still emit a schema-valid answer after the
     repository read tool failed to start. The shared classifier requires the router's ERROR
     record, so an advisory startup warning alone remains non-fatal.
     """
-    failure = planning_isolation_module().classify_successful_exit_infrastructure_failure(
+    module = planning_isolation_module()
+    if reviewer == "claude":
+        try:
+            module.extract_payload(reviewer, result, raw_path)
+        except module.ProviderInfrastructureError as exc:
+            return exc
+    failure = module.classify_successful_exit_infrastructure_failure(
         reviewer, result, raw_path,
     )
-    return str(failure) if failure is not None else None
+    return failure
 
 
 def contract_digest(criteria: list[dict[str, Any]]) -> str:
@@ -2596,24 +2668,54 @@ def command_contract_review(args: argparse.Namespace) -> None:
     if state["reviewer"] == "claude":
         raw_path.write_text(result.stdout, encoding="utf-8")
     if result.returncode != 0:
-        invocation.update({"status": "INFRA_ERROR", "returncode": result.returncode, "completed_at": utc_now()})
-        append_event(state, "INVOCATION_INFRA_ERROR", {"invocation_id": invocation_id, "returncode": result.returncode})
+        infrastructure = planning_isolation_module().classify_failed_invocation(
+            state["reviewer"], result, raw_path,
+        )
+        invocation.update({
+            "status": "INFRA_ERROR", "returncode": result.returncode,
+            "error": str(infrastructure), "completed_at": utc_now(),
+        })
+        append_event(state, "INVOCATION_INFRA_ERROR", {
+            "invocation_id": invocation_id, "returncode": result.returncode,
+            "kind": infrastructure.kind,
+        })
+        fallback = automatic_implementation_host_fallback(
+            state, infrastructure, invocation_id, "CONTRACT_REVIEW",
+        )
         save_state(state)
+        if fallback:
+            emit({
+                "status": "REVIEWER_AUTO_FALLBACK", "reason": str(infrastructure),
+                "returncode": result.returncode, "run_id": state["run_id"],
+                "fallback": fallback, "retry_required": True,
+                "stderr_path": str(stderr_path),
+            }, 4)
         emit({"status": "REVIEWER_ERROR", "reason": "CLI_EXIT_NONZERO", "returncode": result.returncode, "run_id": state["run_id"], "stderr_path": str(stderr_path)}, 4)
     hidden_infrastructure_failure = successful_reviewer_infrastructure_failure(
         state["reviewer"], result, raw_path,
     )
     if hidden_infrastructure_failure:
         invocation.update({
-            "status": "INFRA_ERROR", "error": hidden_infrastructure_failure,
+            "status": "INFRA_ERROR", "error": str(hidden_infrastructure_failure),
             "completed_at": utc_now(),
         })
         append_event(state, "INVOCATION_INFRA_ERROR", {
-            "invocation_id": invocation_id, "error": hidden_infrastructure_failure,
+            "invocation_id": invocation_id, "error": str(hidden_infrastructure_failure),
         })
+        fallback = automatic_implementation_host_fallback(
+            state, hidden_infrastructure_failure, invocation_id, "CONTRACT_REVIEW",
+        )
         save_state(state)
+        if fallback:
+            emit({
+                "status": "REVIEWER_AUTO_FALLBACK",
+                "reason": str(hidden_infrastructure_failure),
+                "run_id": state["run_id"], "fallback": fallback,
+                "retry_required": True, "stderr_path": str(stderr_path),
+                "raw_output_path": str(raw_path),
+            }, 4)
         emit({
-            "status": "REVIEWER_ERROR", "reason": hidden_infrastructure_failure,
+            "status": "REVIEWER_ERROR", "reason": str(hidden_infrastructure_failure),
             "run_id": state["run_id"], "stderr_path": str(stderr_path),
             "raw_output_path": str(raw_path),
         }, 4)
@@ -4171,11 +4273,32 @@ def command_review(args: argparse.Namespace) -> None:
             },
         )
         if result.returncode != 0:
-            invocation.update({"status": "INFRA_ERROR", "returncode": result.returncode, "completed_at": utc_now()})
+            infrastructure = planning_isolation_module().classify_failed_invocation(
+                state["reviewer"], result, raw_path,
+            )
+            invocation.update({
+                "status": "INFRA_ERROR", "returncode": result.returncode,
+                "error": str(infrastructure), "completed_at": utc_now(),
+            })
             append_event(state, "INVOCATION_INFRA_ERROR", {
                 "invocation_id": invocation_id, "returncode": result.returncode,
+                "kind": infrastructure.kind,
             })
+            fallback = automatic_implementation_host_fallback(
+                state, infrastructure, invocation_id, f"BATCH_REVIEW:{args.batch}",
+            )
             save_state(state)
+            if fallback:
+                emit(
+                    {
+                        "status": "REVIEWER_AUTO_FALLBACK", "reason": str(infrastructure),
+                        "returncode": result.returncode, "run_id": state["run_id"],
+                        "batch": args.batch, "round": round_number,
+                        "fallback": fallback, "retry_required": True,
+                        "stderr_path": str(stderr_path), "raw_output_path": str(raw_path),
+                    },
+                    4,
+                )
             emit(
                 {
                     "status": "REVIEWER_ERROR", "reason": "CLI_EXIT_NONZERO",
@@ -4190,15 +4313,28 @@ def command_review(args: argparse.Namespace) -> None:
         )
         if hidden_infrastructure_failure:
             invocation.update({
-                "status": "INFRA_ERROR", "error": hidden_infrastructure_failure,
+                "status": "INFRA_ERROR", "error": str(hidden_infrastructure_failure),
                 "completed_at": utc_now(),
             })
             append_event(state, "INVOCATION_INFRA_ERROR", {
-                "invocation_id": invocation_id, "error": hidden_infrastructure_failure,
+                "invocation_id": invocation_id, "error": str(hidden_infrastructure_failure),
             })
+            fallback = automatic_implementation_host_fallback(
+                state, hidden_infrastructure_failure, invocation_id,
+                f"BATCH_REVIEW:{args.batch}",
+            )
             save_state(state)
+            if fallback:
+                emit({
+                    "status": "REVIEWER_AUTO_FALLBACK",
+                    "reason": str(hidden_infrastructure_failure),
+                    "run_id": state["run_id"], "batch": args.batch,
+                    "round": round_number, "fallback": fallback,
+                    "retry_required": True, "stderr_path": str(stderr_path),
+                    "raw_output_path": str(raw_path),
+                }, 4)
             emit({
-                "status": "REVIEWER_ERROR", "reason": hidden_infrastructure_failure,
+                "status": "REVIEWER_ERROR", "reason": str(hidden_infrastructure_failure),
                 "run_id": state["run_id"], "batch": args.batch, "round": round_number,
                 "stderr_path": str(stderr_path), "raw_output_path": str(raw_path),
             }, 4)
@@ -4691,6 +4827,9 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "implementation_sha": implementation_head,
         "reviewer": state["reviewer"], "reviewer_worktree": state["reviewer_worktree"],
         "reviewer_runtime": state.get("reviewer_runtime") or {},
+        "reviewer_requested": state.get("reviewer_requested"),
+        "host_reviewer_runtime": state.get("host_reviewer_runtime") or {},
+        "automatic_reviewer_fallbacks": state.get("automatic_reviewer_fallbacks", []),
         "host_adapter": state.get("host_adapter"),
         "reviewer_selection_checks": state.get("reviewer_selection_checks", {}),
         "controller_runtime": recorded_controller,
@@ -4953,6 +5092,7 @@ def write_final_report(state: dict[str, Any], integrated: bool) -> Path:
         f"- Host adapter: `{state.get('host_adapter') or 'unbound-legacy'}`\n"
         f"- Reviewer selection checks: `{json.dumps(state.get('reviewer_selection_checks', {}), ensure_ascii=False, sort_keys=True)}`\n"
         f"- Reviewer history: `{json.dumps(state.get('reviewer_history', []), ensure_ascii=False, sort_keys=True)}`\n"
+        f"- Automatic reviewer fallbacks: `{json.dumps(state.get('automatic_reviewer_fallbacks', []), ensure_ascii=False, sort_keys=True)}`\n"
         f"- Implementer: `{state.get('implementer', 'legacy-unknown')}`\n"
         f"- Controller runtime: `{json.dumps(state.get('controller_runtime'), ensure_ascii=False, sort_keys=True)}`\n"
         f"- Project runtime at start: `{json.dumps(state.get('project_runtime_at_start'), ensure_ascii=False, sort_keys=True)}`\n"
@@ -5510,6 +5650,9 @@ def command_change_reviewer(args: argparse.Namespace) -> None:
         emit(preview)
     state["reviewer"] = args.reviewer
     state["reviewer_runtime"] = runtime
+    # A preview-first user change supersedes init-time automatic selection authority. Without this
+    # binding, a later quota error could silently undo the user's explicit reviewer choice.
+    state["reviewer_requested"] = args.reviewer
     history = state.setdefault("reviewer_history", [{
         "reviewer": previous, "selected_at": state.get("created_at"),
         "source": "LEGACY_STATE",

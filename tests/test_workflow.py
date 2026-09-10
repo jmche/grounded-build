@@ -123,6 +123,13 @@ class WorkflowIntegrationTests(unittest.TestCase):
                     )
                 if os.environ.get("FAKE_{name.upper()}_SLEEP"):
                     time.sleep(float(os.environ["FAKE_{name.upper()}_SLEEP"]))
+                if "{name}" == "claude" and os.environ.get("FAKE_CLAUDE_QUOTA_WRAPPER") == "1":
+                    print(json.dumps({{"is_error": True, "api_error_status": 429,
+                                      "result": "five-hour token quota exhausted"}}))
+                    raise SystemExit(0)
+                if os.environ.get("FAKE_{name.upper()}_QUOTA") == "1":
+                    print("429 rate limit: five-hour token quota exhausted", file=sys.stderr)
+                    raise SystemExit(42)
                 if os.environ.get("FAKE_{name.upper()}_EXIT") == "1":
                     raise SystemExit(42)
                 def field(label):
@@ -392,6 +399,149 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(initialized["reviewer"], "codex")
         self.assertTrue(initialized["reviewer_selection_checks"]["codex"]["ok"])
+
+    def test_auto_reviewer_rate_limit_falls_back_to_host_for_contract_review(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "other", "--implementer", "other", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.environment["FAKE_CODEX_QUOTA"] = "1"
+        fallback = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_QUOTA")
+        self.assertEqual(fallback["status"], "REVIEWER_AUTO_FALLBACK")
+        self.assertEqual(fallback["fallback"]["to_reviewer"], "other")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "other")
+        self.assertEqual(status["reviewer_requested"], "auto")
+        self.assertEqual(status["automatic_reviewer_fallbacks"][0]["to_reviewer"], "other")
+        self.assertEqual(status["host_reviewer_runtime"]["adapter"], "other")
+        self.assertEqual(status["recorded_status"], "AWAITING_CONTRACT_REVIEW")
+        contract = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(contract["status"], "CONTRACT_READY")
+
+    def test_explicit_reviewer_rate_limit_does_not_change_authority(self) -> None:
+        initialized = self.initialize_raw("codex", implementer="dsh")
+        self.environment["FAKE_CODEX_QUOTA"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_QUOTA")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "codex")
+        self.assertEqual(status["recorded_status"], "AWAITING_CONTRACT_REVIEW")
+
+    def test_user_changed_reviewer_rate_limit_does_not_change_authority(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.workflow(
+            "change-reviewer", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--reviewer", "claude",
+            "--reason", "User-selected reviewer", "--actor", "test-user", "--apply",
+        )
+        self.environment["FAKE_CLAUDE_QUOTA"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CLAUDE_QUOTA")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "claude")
+        self.assertEqual(status["reviewer_requested"], "claude")
+        self.assertEqual(status["automatic_reviewer_fallbacks"], [])
+
+    def test_successful_claude_quota_wrapper_falls_back_to_codex_host(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "codex", "--implementer", "codex", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "claude")
+        self.environment["FAKE_CLAUDE_QUOTA_WRAPPER"] = "1"
+        fallback = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CLAUDE_QUOTA_WRAPPER")
+        self.assertEqual(fallback["status"], "REVIEWER_AUTO_FALLBACK")
+        self.assertEqual(fallback["fallback"]["to_reviewer"], "codex")
+
+    def test_rate_limit_classifier_does_not_match_incidental_rate_text(self) -> None:
+        classifier = WORKFLOW_MODULE.planning_isolation_module().is_rate_limit_failure
+        self.assertTrue(classifier("429 too many requests"))
+        self.assertTrue(classifier("five-hour usage limit reached"))
+        self.assertFalse(classifier("separate transport failure"))
+
+    def test_auto_reviewer_rate_limit_stops_when_host_is_unavailable(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        host = self.bin_dir / "dsh"
+        host.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+        host.chmod(0o755)
+        self.environment["FAKE_CODEX_QUOTA"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_QUOTA")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "codex")
+
+    def test_auto_reviewer_rate_limit_falls_back_for_batch_review(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        implementation = Path(str(initialized["implementation_worktree"]))
+        reviewed_sha = self.commit_batch_change(implementation)
+        self.environment["FAKE_CODEX_QUOTA"] = "1"
+        fallback = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_QUOTA")
+        self.assertEqual(fallback["status"], "REVIEWER_AUTO_FALLBACK")
+        self.assertEqual(fallback["fallback"]["to_reviewer"], "dsh")
+        review = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        )
+        self.assertEqual(review["status"], "REVIEW_PASS")
+        self.assertEqual(review["reviewed_sha"], reviewed_sha)
 
     def test_other_only_installation_uses_other_as_implementation_reviewer(self) -> None:
         for reviewer in ("codex", "claude", "dsh"):

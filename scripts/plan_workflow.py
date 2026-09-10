@@ -721,6 +721,34 @@ def persist_invocation_state(
             latest.setdefault("delivery_faults", {})[assignment] = fault
         elif clear_fault:
             latest.get("delivery_faults", {}).pop(assignment, None)
+        incoming_fallbacks = state.get("automatic_fallbacks") or []
+        known_fallbacks = {
+            (item.get("trigger_assignment"), item.get("at"))
+            for item in latest.setdefault("automatic_fallbacks", [])
+        }
+        for fallback in incoming_fallbacks:
+            identity = (fallback.get("trigger_assignment"), fallback.get("at"))
+            if identity not in known_fallbacks:
+                latest["automatic_fallbacks"].append(fallback)
+                known_fallbacks.add(identity)
+        if incoming_fallbacks:
+            latest.setdefault("slot_provider_overrides", {}).update(
+                state.get("slot_provider_overrides") or {}
+            )
+            known_notes = {
+                (item.get("assignment"), item.get("from"), item.get("to"), item.get("decided_at"))
+                for item in latest.setdefault("independence_notes", [])
+            }
+            for note in state.get("independence_notes") or []:
+                identity = (
+                    note.get("assignment"), note.get("from"), note.get("to"),
+                    note.get("decided_at"),
+                )
+                if identity not in known_notes:
+                    latest["independence_notes"].append(note)
+                    known_notes.add(identity)
+            latest["provider_diversity"] = False
+            latest["model_diversity"] = False
         incoming_decisions = dict(state.get("pending_decisions") or {})
         current = state.get("pending_decision")
         if current and current.get("assignment") == assignment:
@@ -1514,6 +1542,7 @@ def write_terminal_report(state: dict[str, Any], outcome: str) -> Path:
         f"- Resource usage: `{json.dumps(state.get('resource_usage', {}), sort_keys=True)}`\n"
         f"- Quality attempts: `{json.dumps(state.get('usage', {}), sort_keys=True)}`\n"
         f"- Infrastructure attempts: `{json.dumps(state.get('infrastructure_usage', {}), sort_keys=True)}`\n"
+        f"- Automatic provider fallbacks: `{json.dumps(state.get('automatic_fallbacks', []), sort_keys=True)}`\n"
         f"- Candidate: `{json.dumps(candidate, sort_keys=True)}`\n"
         f"- Reviews: `{json.dumps(reviews, sort_keys=True)}`\n"
         f"- Abandonment: `{json.dumps(abandoned, sort_keys=True)}`\n"
@@ -1574,19 +1603,74 @@ def budget_reset_due(used: int, charged: list[str], digest: str) -> bool:
 
 
 def assignment_provider(state: dict[str, Any], assignment: str, default: str) -> str:
-    """Which CLI serves this assignment, after any recorded reassignment.
+    """Which CLI serves this assignment after a recorded exact or slot-wide change.
 
     Topology is frozen at init, and that is right: a run that quietly swaps providers mid-flight
     is a run whose independence claim means nothing. But a frozen topology with no escape turns
     one unusable provider into a dead run -- the alternative being to abandon and re-draft
     everything, which costs the work that DID succeed.
 
-    So reassignment exists and is loud: an explicit user decision, recorded in the decisions
-    directory, listed in ``independence_notes``, and surfaced by ``export``. The skill's rule is
-    not "never share a provider" -- it is "never DESCRIBE two instances of one provider as
-    model-diverse". This keeps the description true while letting the run finish.
+    A user may reassign one exact invocation. Separately, an auto-selected B provider that reports
+    a rate limit moves the remaining B slot to the frozen host. Both changes are recorded and
+    downgrade diversity rather than describing two instances of one provider as model-diverse.
     """
-    return (state.get("assignment_providers") or {}).get(assignment, default)
+    exact = (state.get("assignment_providers") or {}).get(assignment)
+    if exact:
+        return exact
+    slot = assignment.rsplit("-", 1)[-1]
+    return (state.get("slot_provider_overrides") or {}).get(slot, default)
+
+
+def automatic_planning_host_fallback(
+    state: dict[str, Any], assignment: str, slot: str, provider: str,
+    infrastructure: ProviderInfrastructureError,
+) -> dict[str, Any] | None:
+    """Persist an auto-selected B slot's rate-limit fallback to its frozen host."""
+    host = state.get("host_adapter")
+    if not (
+        infrastructure.kind == "RATE_LIMIT"
+        and slot == "B"
+        and state.get("backend_requested") == "auto"
+        and state.get("peer_reviewer_requested") == "auto"
+        and assignment not in (state.get("assignment_providers") or {})
+        and isinstance(host, str)
+        and host in SUPPORTED_PROVIDERS
+        and provider != host
+    ):
+        return None
+    capability = adapter_capabilities(host)
+    if not capability.get("ok"):
+        return None
+    runtime = (state.get("agent_runtime") or {}).get(host) or {}
+    if host == "other":
+        executable = provider_executable("other")
+        if not (
+            executable
+            and runtime.get("executable") == str(executable)
+            and runtime.get("executable_sha256") == sha256_file(executable)
+        ):
+            return None
+    fallback = {
+        "type": "AUTOMATIC_RATE_LIMIT_FALLBACK",
+        "scope": "slot-B",
+        "trigger_assignment": assignment,
+        "from": provider,
+        "to": host,
+        "infrastructure_kind": infrastructure.kind,
+        "at": utc_now(),
+        "quality_attempt_consumed": False,
+        "persistent_for_remaining_slot_assignments": True,
+    }
+    state.setdefault("slot_provider_overrides", {})["B"] = host
+    state.setdefault("automatic_fallbacks", []).append(fallback)
+    state.setdefault("independence_notes", []).append({
+        "assignment": "slot-B", "from": provider, "to": host,
+        "reason": "auto-selected external slot hit a rate limit; remaining B work uses the host",
+        "decided_at": fallback["at"], "automatic": True,
+    })
+    state["provider_diversity"] = False
+    state["model_diversity"] = False
+    return fallback
 
 
 def planning_worktrees(state: dict[str, Any]) -> list[Path]:
@@ -2038,7 +2122,7 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
             joined = f"{status} {detail}".lower()
             if "401" in joined or "auth" in joined or "unauthorized" in joined:
                 kind, retryable = "AUTHENTICATION", False
-            elif "429" in joined or "rate" in joined or "quota" in joined:
+            elif is_rate_limit_failure(joined):
                 kind, retryable = "RATE_LIMIT", True
             elif "529" in joined or "overload" in joined:
                 kind, retryable = "PROVIDER_OVERLOAD", True
@@ -2063,7 +2147,7 @@ def classify_failed_invocation(
     lowered = detail.lower()
     if "401" in lowered or "unauthorized" in lowered or "authentication" in lowered:
         return ProviderInfrastructureError(provider, "AUTHENTICATION", detail, retryable=False)
-    if "429" in lowered or "rate limit" in lowered or "quota" in lowered:
+    if is_rate_limit_failure(lowered):
         return ProviderInfrastructureError(provider, "RATE_LIMIT", detail, retryable=True)
     if "529" in lowered or "overload" in lowered:
         return ProviderInfrastructureError(provider, "PROVIDER_OVERLOAD", detail, retryable=True)
@@ -2071,6 +2155,17 @@ def classify_failed_invocation(
         return ProviderInfrastructureError(provider, "TOOL_HOST_STARTUP", detail, retryable=False)
     return ProviderInfrastructureError(
         provider, "ADAPTER_EXIT", detail or f"exit code {result.returncode}", retryable=True)
+
+
+def is_rate_limit_failure(detail: str) -> bool:
+    """Recognize explicit provider quota signals without matching incidental text."""
+    lowered = detail.lower()
+    return bool(re.search(r"(?<!\d)429(?!\d)", lowered)) or any(
+        marker in lowered for marker in (
+            "rate limit", "rate_limit", "ratelimit", "quota",
+            "too many requests", "usage limit", "rate exceeded",
+        )
+    )
 
 
 def classify_successful_exit_infrastructure_failure(
@@ -2397,19 +2492,28 @@ def invoke(
         if digest_added and digest in state["charged_context_digests"][assignment]:
             state["charged_context_digests"][assignment].remove(digest)
         resume_status = state["status"]
-        state["status"] = "NEEDS_USER_DECISION"
-        state["pending_decision"] = {
-            "type": "PROVIDER_INFRASTRUCTURE_FAILURE", "assignment": assignment,
-            "provider": provider, "kind": exc.kind, "detail": exc.detail,
-            "retryable": exc.retryable, "attempt": count,
-            "maximum_infrastructure_attempts": MAX_INFRASTRUCTURE_ATTEMPTS,
-            "resume_status": resume_status, "created_at": utc_now(),
-            "choices": (["RESOLVE_AND_CONTINUE", "REASSIGN_ASSIGNMENT", "ABANDON"]
-                        if count < MAX_INFRASTRUCTURE_ATTEMPTS else
-                        ["REASSIGN_ASSIGNMENT", "ABANDON"]),
-        }
+        fallback = automatic_planning_host_fallback(
+            state, assignment, slot, provider, exc,
+        )
+        if fallback:
+            state["status"] = resume_status
+            state["pending_decision"] = None
+        else:
+            state["status"] = "NEEDS_USER_DECISION"
+            state["pending_decision"] = {
+                "type": "PROVIDER_INFRASTRUCTURE_FAILURE", "assignment": assignment,
+                "provider": provider, "kind": exc.kind, "detail": exc.detail,
+                "retryable": exc.retryable, "attempt": count,
+                "maximum_infrastructure_attempts": MAX_INFRASTRUCTURE_ATTEMPTS,
+                "resume_status": resume_status, "created_at": utc_now(),
+                "choices": (["RESOLVE_AND_CONTINUE", "REASSIGN_ASSIGNMENT", "ABANDON"]
+                            if count < MAX_INFRASTRUCTURE_ATTEMPTS else
+                            ["REASSIGN_ASSIGNMENT", "ABANDON"]),
+            }
         invocation_record["status"] = "INFRASTRUCTURE_FAILURE"
         invocation_record["diagnostic"] = str(exc)
+        if fallback:
+            invocation_record["automatic_fallback"] = fallback
         update_resource_usage(state, metrics)
         atomic_json(invocation_path, invocation_record)
         record_artifact(state, f"{artifact_prefix}-record", invocation_path)
@@ -2922,7 +3026,10 @@ def command_init(args: argparse.Namespace) -> None:
         "finding_aliases": {},
         "planning_depth": args.planning_depth,
         "research_policy": args.research_policy,
+        "backend_requested": args.backend,
         "host_adapter": args.host_adapter,
+        "peer_reviewer_requested": args.peer_reviewer,
+        "final_reviewer_requested": args.final_reviewer,
         "peer_reviewer": frozen_peer,
         "selection_checks": selection_checks,
         "planners": topology,
@@ -2949,6 +3056,8 @@ def command_init(args: argparse.Namespace) -> None:
         "pending_decisions": {},
         "usage": {},
         "infrastructure_usage": {},
+        "slot_provider_overrides": {},
+        "automatic_fallbacks": [],
         "resource_usage": {"wall_seconds": 0.0, "reported_cost_usd": 0.0,
                            "reported_turns": 0, "scratch_bytes_removed": 0},
         "active_invocations": {},
@@ -3509,7 +3618,7 @@ def command_adjudicate(args: argparse.Namespace) -> None:
             raise WorkflowError("reassignment decision is missing its assignment")
         current = pending.get("provider")
         alternatives = [name for name in SUPPORTED_PROVIDERS
-                        if name != current and shutil.which(name)]
+                        if name != current and available(name)]
         if not alternatives:
             raise WorkflowError(
                 f"no other provider is installed to take over {assignment} from {current}")
@@ -3517,7 +3626,7 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         if replacement == current:
             raise WorkflowError("reassigning an assignment to the provider that already holds it "
                                 "changes nothing")
-        if not shutil.which(replacement):
+        if not available(replacement):
             raise WorkflowError(f"provider is not installed: {replacement}")
         preview["reassignment"] = {"assignment": assignment, "from": current, "to": replacement}
         preview["independence_cost"] = (
@@ -3596,6 +3705,8 @@ def command_status(args: argparse.Namespace) -> None:
         "agent_runtime": state.get("agent_runtime") or {},
         "runtime_warnings": state.get("runtime_warnings") or [],
         "assignment_providers": state.get("assignment_providers") or {},
+        "slot_provider_overrides": state.get("slot_provider_overrides") or {},
+        "automatic_fallbacks": state.get("automatic_fallbacks") or [],
         "independence_notes": state.get("independence_notes") or [],
         "final_reviewer": state["final_reviewer"], "drafts": state["drafts"],
         "cross_reviews": state["cross_reviews"], "synthesis_submissions": state["synthesis_submissions"],
@@ -3638,6 +3749,10 @@ def command_export(args: argparse.Namespace) -> None:
         "model_diversity": state.get("model_diversity", False),
         "agent_runtime": state.get("agent_runtime") or {},
         "runtime_warnings": state.get("runtime_warnings") or [],
+        "assignment_providers": state.get("assignment_providers") or {},
+        "slot_provider_overrides": state.get("slot_provider_overrides") or {},
+        "automatic_fallbacks": state.get("automatic_fallbacks") or [],
+        "independence_notes": state.get("independence_notes") or [],
         "handoff": "Use scripts/workflow.py init only after explicit user approval.",
     })
 
@@ -3656,6 +3771,10 @@ def command_audit_export(args: argparse.Namespace) -> None:
         "host_adapter": state.get("host_adapter"),
         "peer_reviewer": state.get("peer_reviewer"),
         "selection_checks": state.get("selection_checks", {}),
+        "assignment_providers": state.get("assignment_providers") or {},
+        "slot_provider_overrides": state.get("slot_provider_overrides") or {},
+        "automatic_fallbacks": state.get("automatic_fallbacks") or [],
+        "independence_notes": state.get("independence_notes") or [],
         "candidate": state.get("candidate"), "final_reviews": state.get("final_reviews") or {},
         "abandoned": state.get("abandoned"), "resource_usage": state.get("resource_usage") or {},
     })

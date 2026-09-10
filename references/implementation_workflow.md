@@ -338,8 +338,15 @@ Interpret statuses as follows:
 
 Every real reviewer call is stored under a unique `round_N/invocation_N/` directory. A malformed result or process failure leaves a terminal invocation record but does not create a quality review. Invocation budgets stop repeated infrastructure failures from consuming unbounded external-agent budget.
 
-If the selected reviewer becomes unavailable—for example, Codex exhausts its token quota—switch to
-Claude, Codex, dsh, or a configured `other` bridge without restarting the run:
+If an auto-selected external reviewer reports a machine-classified rate limit, the engine records
+`REVIEWER_AUTO_FALLBACK`, persistently switches to the frozen host runtime, and returns
+`retry_required: true`. Repeat the same contract-review or batch-review command; the failed
+infrastructure call consumes no quality round and does not change the finding ledger or accepted
+evidence. This also applies when the host is a configured `other` bridge.
+
+An explicit reviewer is never replaced automatically. Other infrastructure failures, or a rate
+limit when the host is unavailable, remain `REVIEWER_ERROR`. In those cases switch to Claude, Codex,
+dsh, or a configured `other` bridge without restarting the run:
 
 ```bash
 <controller-python> <skill-root>/scripts/workflow.py change-reviewer \

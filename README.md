@@ -144,7 +144,10 @@ Two isolated planning slots inspect one frozen Git commit. They investigate inde
 independently, and cross-review evidence. Standard mode sends the host-synthesized plan to one fresh
 instance of the current host adapter for final review; deep or explicitly high-assurance runs may send
 it to both planning slots instead. Slot B and the implementation reviewer prefer a usable non-host
-adapter, while explicit user selections always win.
+adapter, while explicit user selections always win. If an auto-selected external B slot or
+implementation reviewer later reports a rate limit, that role persistently falls back to the host
+and retries the same work without consuming a quality attempt. Other failures and explicit choices
+stay on the audited manual recovery path.
 
 ```text
 frozen request + Git SHA
