@@ -50,6 +50,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.make_fake_reviewer("codex")
         self.make_fake_reviewer("claude")
         self.make_fake_reviewer("dsh")
+        code_mode_host = self.bin_dir / "codex-code-mode-host"
+        code_mode_host.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        code_mode_host.chmod(0o755)
         self.environment = os.environ.copy()
         self.environment["PATH"] = f"{self.bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["GROUNDED_BUILD_IMPLEMENT_HOME"] = str(self.state_home)
@@ -85,9 +88,30 @@ class WorkflowIntegrationTests(unittest.TestCase):
                     raise SystemExit(0)
                 if "--help" in sys.argv:
                     print("--profile headless --patch --dump-config --json-schema --output-format "
-                          "--permission-mode --no-session-persistence")
+                          "--permission-mode --no-session-persistence --output-schema "
+                          "--output-last-message --ephemeral --sandbox --config")
                     raise SystemExit(0)
                 prompt = sys.argv[-1]
+                if "This is a capability check." in prompt:
+                    probe_path = re.search(r"Read (/.+?/probe-input\\.txt)\\.", prompt).group(1)
+                    with open(probe_path, encoding="utf-8") as handle:
+                        observed = handle.read().rstrip("\\n")
+                    payload = {{"provider": "{name}", "ready": True, "observed": observed}}
+                    if "{name}" == "codex":
+                        with open(sys.argv[sys.argv.index("-o") + 1], "w", encoding="utf-8") as handle:
+                            json.dump(payload, handle)
+                    elif "{name}" == "dsh":
+                        print(json.dumps(payload))
+                    else:
+                        print(json.dumps({{"structured_output": payload}}))
+                    raise SystemExit(0)
+                if "{name}" == "codex" and os.environ.get("FAKE_CODEX_ROUTER_ERROR") == "1":
+                    print(
+                        "2026-09-09T00:00:00Z ERROR codex_core::tools::router: "
+                        "error=failed to spawn code-mode host /opt/codex-code-mode-host: "
+                        "No such file or directory (os error 2)",
+                        file=sys.stderr,
+                    )
                 if os.environ.get("FAKE_{name.upper()}_SLEEP"):
                     time.sleep(float(os.environ["FAKE_{name.upper()}_SLEEP"]))
                 if os.environ.get("FAKE_{name.upper()}_EXIT") == "1":
@@ -287,6 +311,68 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(status["reviewer"], "claude")
         self.assertEqual(status["reviewer_history"][0]["source"], "RUN_INITIALIZED")
 
+    def test_auto_reviewer_prefers_codex_for_non_codex_host(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "codex")
+        self.assertEqual(initialized["host_adapter"], "dsh")
+        self.assertTrue(initialized["reviewer_selection_checks"]["codex"]["ok"])
+
+    def test_invalid_environment_is_rejected_before_automatic_reviewer_probe(self) -> None:
+        launcher = self.project / ".venv" / "bin" / "python"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        os.mkfifo(self.project / ".venv" / "unsupported-fifo")
+        args = argparse.Namespace(
+            project=str(self.project), plan=str(self.plan),
+            batch_manifest=str(self.batch_manifest), target_branch="main", batches="1",
+            instruction_file=[], reviewer="auto", host_adapter="dsh", implementer="dsh",
+            fix_policy="ask",
+        )
+        with mock.patch.object(
+            WORKFLOW_MODULE, "select_implementation_reviewer",
+        ) as selection:
+            with self.assertRaisesRegex(
+                WORKFLOW_MODULE.WorkflowError, "unsupported special file",
+            ):
+                WORKFLOW_MODULE.command_init(args)
+        selection.assert_not_called()
+
+    def test_auto_reviewer_falls_back_to_host_when_codex_read_host_is_missing(self) -> None:
+        (self.bin_dir / "codex-code-mode-host").unlink()
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "dsh")
+        self.assertFalse(initialized["reviewer_selection_checks"]["codex"]["ok"])
+        self.assertTrue(initialized["reviewer_selection_checks"]["dsh"]["ok"])
+
+    def test_codex_host_auto_reviewer_prefers_claude_then_dsh(self) -> None:
+        common = (
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "codex", "--implementer", "codex", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        preferred = self.workflow(*common)
+        self.assertEqual(preferred["reviewer"], "claude")
+
+        claude = self.bin_dir / "claude"
+        claude.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+        claude.chmod(0o755)
+        fallback = self.workflow(*common)
+        self.assertEqual(fallback["reviewer"], "dsh")
+        self.assertFalse(fallback["reviewer_selection_checks"]["claude"]["ok"])
+        self.assertTrue(fallback["reviewer_selection_checks"]["dsh"]["ok"])
+
     def test_dsh_reviews_the_contract_and_fixed_sha_batch(self) -> None:
         initialized = self.initialize("dsh")
         status = self.workflow(
@@ -340,6 +426,40 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(state["review_invocations"][-1]["status"], "INFRA_ERROR")
         self.assertIn("timed out", state["review_invocations"][-1]["error"])
+
+    def test_zero_exit_codex_tool_host_failure_cannot_approve_contract(self) -> None:
+        initialized = self.initialize_raw("codex")
+        self.environment["FAKE_CODEX_ROUTER_ERROR"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_ROUTER_ERROR")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        self.assertIn("TOOL_HOST_STARTUP", str(failed["reason"]))
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text()
+        )
+        self.assertIsNone(state["acceptance_contract"])
+        self.assertEqual(state["contract_review_invocations"][-1]["status"], "INFRA_ERROR")
+
+    def test_zero_exit_codex_tool_host_failure_cannot_pass_batch_review(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        self.environment["FAKE_CODEX_ROUTER_ERROR"] = "1"
+        failed = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_ROUTER_ERROR")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        self.assertIn("TOOL_HOST_STARTUP", str(failed["reason"]))
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text()
+        )
+        self.assertEqual(state["reviews"], [])
+        self.assertEqual(state["review_invocations"][-1]["status"], "INFRA_ERROR")
 
     def test_reviewer_switch_is_audited_without_resetting_state_or_budget(self) -> None:
         initialized = self.initialize_raw("codex", implementer="claude")

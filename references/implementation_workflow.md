@@ -30,6 +30,9 @@ Collect or infer:
 - `plan`: an existing local plan file, resolved to an absolute path.
 - `batch_manifest`: a host-authored file that explicitly declares this run's included and excluded total scope and maps every batch ID to plan work. This is execution authority, not reviewer output.
 - `reviewer`: exactly `claude`, `codex`, or `dsh`; it may match the host/implementer.
+- `host_adapter`: the current host's CLI adapter when automatic reviewer selection is requested.
+- `reviewer_selection_checks`: initialization-bound static and mounted-file probe evidence for each
+  automatic candidate considered before the concrete reviewer is frozen.
 - `reviewer_runtime`: the non-secret model identity frozen at initialization. Claude defaults to Opus,
   Codex defaults to `gpt-5.6-sol`, and dsh reads the harness selection from `~/.dsh/settings.yaml`.
   Optional `--claude-model`, `--codex-model`, `--codex-model-provider`, `--codex-profile`,
@@ -180,12 +183,19 @@ Initialize a new run:
   --plan <absolute-plan-path> \
   --batch-manifest <absolute-batch-manifest-path> \
   --implementer <current-host-agent-name> \
-  --reviewer <claude-or-codex-or-dsh> \
+  --host-adapter <claude-or-codex-or-dsh> \
+  --reviewer <auto-or-claude-or-codex-or-dsh> \
   --fix-policy <ask-auto-or-never> \
   --batches <comma-separated-batch-ids> \
   --target-branch <branch> \
   [--instruction-file <absolute-contract-path>]...
 ```
+
+`--reviewer auto` prefers Codex for a non-Codex host and falls back to the host when Codex does not
+pass the initialization-bound check. For a Codex host it tries Claude, then dsh, then Codex. The check
+uses the exact model/provider/profile runtime that initialization will freeze; executable presence
+alone is insufficient. Explicit reviewer selection remains authoritative and preserves the legacy
+non-probing initialization behavior.
 
 The current host remains the implementer and is never model-overridden by this workflow. To override the
 isolated reviewer's advanced default, append the same selection verified during preflight:

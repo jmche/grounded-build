@@ -47,14 +47,23 @@ Use `scripts/plan_workflow.py`. Detailed state and failure semantics are in [ref
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py preflight \
   --project <absolute-project> --base-ref <ref> \
-  --backend <auto|claude|codex|dsh>
+  --backend <auto|claude|codex|dsh> --host-adapter <claude|codex|dsh> \
+  --peer-reviewer <auto|claude|codex|dsh>
 ```
 
-Use `--probe` when provider authentication/configuration is uncertain; it makes one small paid, sandboxed schema call per selected adapter.
+Use `--probe` for an early availability check. It makes one small paid, sandboxed call per selected
+adapter that authenticates, reads a controller-owned mounted file, and returns its contents in a
+schema object. Host-aware initialization repeats that check with the exact runtime it freezes, so a
+preflight result cannot go stale or be applied to different model/provider settings.
 
 Planning defaults to Claude Opus and Codex `gpt-5.6-sol`; the dsh adapter reads its model from the
-harness settings (`~/.dsh/settings.yaml`). `auto` fills the two slots from the preference order
-`claude -> dsh -> codex` (the default pair is claude + dsh). Explicit user selection always wins:
+harness settings (`~/.dsh/settings.yaml`). With `--host-adapter`, `auto` binds slot A to a fresh
+isolated instance of the host adapter and prefers Codex for the non-host slot. If the host is Codex,
+it prefers Claude and then dsh. Initialization checks those candidates in order with the exact runtime
+being frozen and automatically falls back to the host when no external candidate passes. An explicit
+`--peer-reviewer` or final reviewer must pass its initialization-bound check or initialization fails;
+`--final-reviewer auto` follows the frozen peer. Without a host binding, legacy
+`auto` uses `claude -> dsh -> codex`. Explicit user selection always wins:
 
 ```bash
 --codex-model <model> \
@@ -70,8 +79,9 @@ Use `cli-default` as a model value to defer to that CLI/harness. A Codex provide
 ### 2. Freeze request and initialize
 
 Write the objective, constraints, exclusions, priorities, success conditions, and known decisions to a local
-Markdown request file. Standard planning uses one fresh final reviewer by default; select the adapter
-that best fits the task's quality, latency, and availability requirements. Reserve
+Markdown request file. Standard planning uses one fresh final reviewer by default. `--final-reviewer auto`
+applies the same host-aware preference: Codex for a non-Codex host, Claude then dsh for a Codex host,
+and the host's fresh isolated CLI when no preferred external adapter is available. Reserve
 `final-reviewer=both` for deep planning, an explicitly requested dual review, or a demonstrated
 high-consequence reason. Process and context isolation establish reviewer independence; paying two
 final reviewers is not required merely to make a standard run independent.
@@ -91,7 +101,9 @@ and third-party summaries are never evidence.
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py init \
   --project <project> --request <request.md> --base-ref <ref> \
-  --backend <backend> --final-reviewer <both|claude|codex|dsh> \
+  --backend <backend> --host-adapter <claude|codex|dsh> \
+  --peer-reviewer <auto|claude|codex|dsh> \
+  --final-reviewer <auto|both|claude|codex|dsh> \
   --planning-depth <standard|deep> \
   --research-policy <local-only|authoritative-web> \
   [Codex selection options from preflight]
@@ -183,8 +195,11 @@ reviewer, or acceptance authority.
 The checked-out target must still be clean at final integration so user work cannot be overwritten.
 Finalize preview and status expose whether current target-checkout changes will block apply.
 
-The implementation host remains the current host model. Its isolated reviewer may be Claude, Codex, or
-dsh. Claude defaults to Opus, Codex to `gpt-5.6-sol`, and dsh to the model selected in
+The implementation host remains the current host model. With `--reviewer auto --host-adapter ...`, its
+isolated reviewer follows the same policy as planning: a non-Codex host prefers Codex and falls back
+to the host; a Codex host prefers Claude, then dsh, then Codex. Initialization verifies each candidate
+with the exact runtime before freezing it and records `reviewer_selection_checks`. An explicit reviewer
+still wins. Claude defaults to Opus, Codex to `gpt-5.6-sol`, and dsh to the model selected in
 `~/.dsh/settings.yaml`; `--claude-model`, `--codex-model`, `--codex-model-provider`,
 `--codex-profile`, `--dsh-model`, and `--dsh-model-provider` may override that selection at `init`
 and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.

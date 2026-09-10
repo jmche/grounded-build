@@ -4,23 +4,30 @@ Ordinary runs should follow the `next_action` returned by `plan_workflow.py`. Re
 
 ## Topology
 
-| Backend | A | B | Adapter diversity |
-|---|---|---|---|
-| `auto`, top two installed | claude | dsh | true |
-| `auto`, one of the top two missing | next available in preference order | same adapter | varies |
-| `auto`, one installed | two isolated instances of it | same adapter | false |
-| `claude`, `codex`, or `dsh` | two isolated instances | same adapter | false |
+| Backend | Host adapter | A | B | Adapter diversity |
+|---|---|---|---|---|
+| `auto` | dsh or claude | host | codex when available | varies |
+| `auto` | codex | codex | claude, then dsh, when available | varies |
+| `auto`, preferred external unavailable | any supported host | host | host | false |
+| `auto`, no host binding (legacy) | unset | first available | second available | varies |
+| `claude`, `codex`, or `dsh` | any | selected adapter | selected adapter | false |
 
-`auto` fills the two slots from the preference order `claude -> dsh -> codex`: it takes the first two
-available adapters, degrades to the third when one of the first two is missing, and uses two isolated
-instances of a lone adapter.
+Host-aware `auto` prefers Codex as the external reviewer for a Claude or dsh host. A Codex host
+prefers Claude, then dsh. Initialization performs static checks and a real mounted-file read with the
+exact runtime about to be frozen; it selects the first usable candidate and falls back to the host
+after every external candidate fails. An explicit peer must pass the same check or initialization
+fails. `final_reviewer=auto` follows that frozen peer selection. The checks and rejected candidates
+are frozen in `selection_checks`, making an installed but unusable higher-priority adapter observable
+without treating it as absent. Runs without
+`--host-adapter` retain
+the legacy `claude -> dsh -> codex` ordering for compatibility.
 
 Separate processes, fresh sessions, isolated context, a detached read-only worktree, and audited output provide process independence. Two instances of one adapter using the same model are not model-diverse. A Codex adapter configured for DeepSeek remains adapter `codex`, model family `deepseek`; the dsh adapter reports the model selected in the harness settings.
 
 Cross-review is mutual: A reviews B and B reviews A. Every same-round A/B pair is launched concurrently
 from one frozen barrier input; a finisher is merged atomically and cannot alter the peer's already frozen
-context. `final_reviewer=both` independently reviews the same synthesized candidate through both slots. A
-single selected adapter uses fresh logical reviewer F.
+context. `final_reviewer=both` independently reviews the same synthesized candidate through both slots.
+`final_reviewer=auto` follows the resolved peer and uses a fresh logical reviewer F.
 
 Planning defaults to Opus through Claude, `gpt-5.6-sol` through Codex, and the harness-saved model through
 dsh (`~/.dsh/settings.yaml`). Explicit model, provider, or profile selection wins; `cli-default` defers model

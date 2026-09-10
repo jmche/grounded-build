@@ -348,8 +348,11 @@ def no_answer_detail(result: subprocess.CompletedProcess[str]) -> str:
 PROBE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "properties": {"provider": {"type": "string"}, "ready": {"type": "boolean"}},
-    "required": ["provider", "ready"],
+    "properties": {
+        "provider": {"type": "string"}, "ready": {"type": "boolean"},
+        "observed": {"type": "string"},
+    },
+    "required": ["provider", "ready", "observed"],
 }
 
 
@@ -357,17 +360,16 @@ def probe_provider(
     provider: str, project: Path, timeout: int = 180,
     runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Can this CLI authenticate and return one small schema object right now?
+    """Can this CLI authenticate, read one mounted file, and return a schema object right now?
 
     Cheap, and deliberately narrow. It answers the question that cost the most to answer the
     expensive way: a codex whose credentials never reached the sandbox spent 22 minutes and five
     401s before saying so, and the operator read it as a failed planning draft. One trivial call
     says it in seconds, before a topology is frozen around a provider that cannot deliver.
 
-    What it does NOT establish is reliability on a real assignment. A provider that answers this
-    can still spend a whole turn reading a repository and never emit its verdict -- which is what
-    happened three times after the credential fix landed. Capability is necessary and not
-    sufficient, and this reports capability only.
+    The file read is deliberate. The old probe asked the model not to inspect anything, so Codex
+    could pass it even when every production read failed because its code-mode host was absent.
+    This remains a narrow capability check, not proof that a provider will complete a long review.
 
     It runs through the SAME bubblewrap composition as a real invocation, which is the only way it
     can see the failure it exists to catch: the credentials that went missing went missing because
@@ -386,10 +388,14 @@ def probe_provider(
             raise WorkflowError("could not create the empty capability-probe repository")
         context = root / "context"
         context.mkdir(mode=0o700)
+        probe_token = secrets.token_hex(16)
+        probe_input = context / "probe-input.txt"
+        probe_input.write_text(probe_token + "\n", encoding="utf-8")
         raw = root / "raw.json"
         prompt = (
-            f"Reply with the schema object only: provider={provider}, ready=true. "
-            "Do not inspect anything. This is a capability check."
+            f"Read {probe_input}. Reply with the schema object only: provider={provider}, "
+            "ready=true, observed=<the exact file contents without the trailing newline>. "
+            "This is a capability check."
         )
         command = agent_command(provider, workspace, context, PROBE_SCHEMA, raw, prompt, runtime)
         command = isolated_agent_command(
@@ -408,8 +414,16 @@ def probe_provider(
         except WorkflowError as exc:
             return {"provider": provider, "ok": False, "reason": "invalid schema object",
                     "detail": str(exc)}
-        return {"provider": provider, "ok": isinstance(payload, dict) and payload.get("ready") is True,
-                "reason": "delivered a schema object"}
+        ok = (
+            isinstance(payload, dict) and payload.get("ready") is True
+            and payload.get("provider") == provider and payload.get("observed") == probe_token
+        )
+        return {
+            "provider": provider, "ok": ok,
+            "reason": (
+                "read the mounted probe and delivered a schema object"
+                if ok else "schema object did not reproduce the mounted probe contents"),
+        }
 
 
 def utc_now() -> str:
@@ -1129,6 +1143,18 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
     missing = [flag for flag in required if flag not in text]
     capability = {"ok": result.returncode == 0 and not missing, "missing": missing,
                   "help_exit": result.returncode}
+    if provider == "codex":
+        # The enforced Codex policy exposes repository reads through code-mode. Standalone
+        # releases ship the matching host beside the resolved CLI; without it the CLI can still
+        # authenticate and emit JSON but cannot perform the review it is being selected for.
+        code_mode_host = Path(executable).resolve().with_name("codex-code-mode-host")
+        host_ready = code_mode_host.is_file() and os.access(code_mode_host, os.X_OK)
+        capability["code_mode_host"] = {
+            "ok": host_ready, "path": str(code_mode_host) if host_ready else None,
+        }
+        capability["ok"] = bool(capability["ok"] and host_ready)
+        if not host_ready:
+            capability["missing"].append("matching executable codex-code-mode-host")
     if provider == "dsh" and capability["ok"]:
         profile_help = run([executable, "--profile", "headless", "--help"], timeout=30)
         profile_ready = profile_help.returncode == 0
@@ -1191,8 +1217,36 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
 
 
 def resolve_topology(backend: str) -> dict[str, str]:
+    return resolve_host_topology(backend, None)
+
+
+def external_reviewer_preference(host_adapter: str) -> tuple[str, ...]:
+    """Ordered fresh-CLI reviewers outside the host's own adapter identity."""
+    if host_adapter == "codex":
+        return ("claude", "dsh")
+    return ("codex",)
+
+
+def resolve_host_topology(
+    backend: str, host_adapter: str | None, peer_reviewer: str = "auto",
+) -> dict[str, str]:
     present = {name for name in SUPPORTED_PROVIDERS if available(name)}
+    if peer_reviewer != "auto" and (backend != "auto" or not host_adapter):
+        raise WorkflowError("--peer-reviewer requires --backend auto and --host-adapter")
     if backend == "auto":
+        if host_adapter:
+            if host_adapter not in present:
+                raise WorkflowError(f"host adapter is unavailable: {host_adapter}")
+            if peer_reviewer != "auto":
+                if peer_reviewer not in present:
+                    raise WorkflowError(f"peer reviewer is unavailable: {peer_reviewer}")
+                external = peer_reviewer
+            else:
+                external = next(
+                    (name for name in external_reviewer_preference(host_adapter) if name in present),
+                    None,
+                )
+            return {"A": host_adapter, "B": external or host_adapter}
         # Take the first two available adapters in preference order; a missing adapter degrades to
         # the next one, and a lone adapter fills both slots as two isolated instances (same adapter,
         # not model-diverse). The third entry in AUTO_PREFERENCE is the fallback.
@@ -1205,6 +1259,120 @@ def resolve_topology(backend: str) -> dict[str, str]:
     if backend not in SUPPORTED_PROVIDERS or backend not in present:
         raise WorkflowError(f"requested provider is unavailable: {backend}")
     return {"A": backend, "B": backend}
+
+
+def resolve_final_reviewer(
+    selected: str, host_adapter: str | None, peer_provider: str | None = None,
+) -> str:
+    if selected != "auto":
+        if selected != "both" and not available(selected):
+            raise WorkflowError(f"final reviewer is unavailable: {selected}")
+        return selected
+    if not host_adapter:
+        raise WorkflowError("--final-reviewer auto requires --host-adapter")
+    if not available(host_adapter):
+        raise WorkflowError(f"host adapter is unavailable: {host_adapter}")
+    if peer_provider:
+        return peer_provider
+    return next(
+        (name for name in external_reviewer_preference(host_adapter) if available(name)),
+        host_adapter,
+    )
+
+
+def verify_provider_selection(
+    provider: str, project: Path, runtime: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify static requirements and one real read using the exact runtime about to be frozen."""
+    capability = adapter_capabilities(provider)
+    if not capability.get("ok"):
+        return {
+            "provider": provider, "ok": False, "reason": "static requirements failed",
+            "capability": capability,
+        }
+    return {
+        **probe_provider(provider, project, runtime=runtime),
+        "capability": capability,
+    }
+
+
+def resolve_verified_host_selection(
+    args: argparse.Namespace, project: Path, runtime: dict[str, dict[str, Any]],
+    *, perform_probe: bool = True,
+) -> tuple[dict[str, str], str | None, str, dict[str, dict[str, Any]]]:
+    """Resolve host-aware routing from checks performed at the initialization boundary."""
+    host = args.host_adapter
+    topology = resolve_host_topology(args.backend, host, args.peer_reviewer)
+    frozen_peer = topology["B"] if host and args.backend == "auto" else None
+    final_reviewer = resolve_final_reviewer(args.final_reviewer, host, frozen_peer)
+    if not host:
+        return topology, frozen_peer, final_reviewer, {}
+
+    checks: dict[str, dict[str, Any]] = {}
+
+    def check(provider: str) -> dict[str, Any]:
+        if provider not in checks:
+            if perform_probe:
+                checks[provider] = verify_provider_selection(provider, project, runtime[provider])
+            else:
+                capability = adapter_capabilities(provider)
+                checks[provider] = {
+                    "provider": provider, "ok": bool(capability.get("ok")),
+                    "reason": "static requirements passed" if capability.get("ok")
+                    else "static requirements failed",
+                    "capability": capability,
+                }
+        return checks[provider]
+
+    host_check = check(host)
+    if not host_check["ok"]:
+        raise WorkflowError(
+            "host adapter failed the initialization-bound capability probe: "
+            + json.dumps(host_check, sort_keys=True)
+        )
+
+    if args.backend == "auto":
+        if args.peer_reviewer != "auto":
+            peer_check = check(args.peer_reviewer)
+            if not peer_check["ok"]:
+                raise WorkflowError(
+                    "explicit peer reviewer failed the initialization-bound capability probe: "
+                    + json.dumps(peer_check, sort_keys=True)
+                )
+            frozen_peer = args.peer_reviewer
+        else:
+            frozen_peer = host
+            for candidate in external_reviewer_preference(host):
+                if check(candidate)["ok"]:
+                    frozen_peer = candidate
+                    break
+        topology = {"A": host, "B": frozen_peer}
+
+    if args.final_reviewer == "auto":
+        if args.backend == "auto":
+            final_reviewer = frozen_peer or host
+        else:
+            final_reviewer = host
+            for candidate in external_reviewer_preference(host):
+                if check(candidate)["ok"]:
+                    final_reviewer = candidate
+                    break
+    elif args.final_reviewer != "both":
+        final_check = check(args.final_reviewer)
+        if not final_check["ok"]:
+            raise WorkflowError(
+                "explicit final reviewer failed the initialization-bound capability probe: "
+                + json.dumps(final_check, sort_keys=True)
+            )
+
+    for provider in set(topology.values()):
+        provider_check = check(provider)
+        if not provider_check["ok"]:
+            raise WorkflowError(
+                "selected planner failed the initialization-bound capability probe: "
+                + json.dumps(provider_check, sort_keys=True)
+            )
+    return topology, frozen_peer, final_reviewer, checks
 
 
 def required_final_reviewers(state: dict[str, Any]) -> dict[str, str]:
@@ -1277,6 +1445,9 @@ def write_terminal_report(state: dict[str, Any], outcome: str) -> Path:
         f"- Run: `{state['run_id']}`\n"
         f"- Baseline: `{state['baseline_sha']}`\n"
         f"- Engine contract: `{json.dumps(state.get('engine_contract', {}), sort_keys=True)}`\n"
+        f"- Host adapter: `{state.get('host_adapter') or 'unbound-legacy'}`\n"
+        f"- Peer reviewer: `{state.get('peer_reviewer') or 'unbound-legacy'}`\n"
+        f"- Selection checks: `{json.dumps(state.get('selection_checks', {}), sort_keys=True)}`\n"
         f"- Planners: `{json.dumps(state['planners'], sort_keys=True)}`\n"
         f"- Provider diversity: `{str(state['provider_diversity']).lower()}`\n"
         f"- Model diversity: `{str(state.get('model_diversity', False)).lower()}`\n"
@@ -1697,6 +1868,15 @@ def isolated_agent_command(
         wrapper.extend(["--dir", "/opt", "--ro-bind", str(executable), "/opt/grounded-build-agent"])
     for source, destination in runtime_mounts:
         wrapper.extend(["--ro-bind", str(source), str(destination)])
+    # Standalone Codex keeps the matching code-mode host beside the versioned CLI executable but
+    # spawns it at /opt/codex-code-mode-host. Resolve beside the executable so an old frozen CLI
+    # never receives a host from a different `current` release, then mount that one binary read-only.
+    if provider == "codex":
+        code_mode_host = executable.with_name("codex-code-mode-host")
+        if code_mode_host.is_file():
+            wrapper.extend([
+                "--ro-bind", str(code_mode_host.resolve()), "/opt/codex-code-mode-host",
+            ])
     for system_path in ("/usr", "/bin", "/lib", "/lib64"):
         if Path(system_path).exists():
             wrapper.extend(["--ro-bind", system_path, system_path])
@@ -1803,6 +1983,35 @@ def classify_failed_invocation(
         return ProviderInfrastructureError(provider, "TOOL_HOST_STARTUP", detail, retryable=False)
     return ProviderInfrastructureError(
         provider, "ADAPTER_EXIT", detail or f"exit code {result.returncode}", retryable=True)
+
+
+def classify_successful_exit_infrastructure_failure(
+    provider: str, result: subprocess.CompletedProcess[str], raw: Path,
+) -> ProviderInfrastructureError | None:
+    """Recognize machine-reported tool failure hidden behind an adapter exit code of zero.
+
+    Codex may emit a schema-valid final answer after every attempted file read failed. Its startup
+    warning alone is not proof of impact: only the router's ERROR record establishes that the
+    unavailable host was actually called during this invocation.
+    """
+    if provider != "codex":
+        return None
+    for line in (result.stderr or "").splitlines():
+        router_record = re.match(
+            r"^(?:\d{4}-\d{2}-\d{2}T\S+\s+)?ERROR codex_core::tools::router:\s*(.*)$",
+            line.strip(), flags=re.IGNORECASE,
+        )
+        if not router_record:
+            continue
+        lowered = router_record.group(1).lower()
+        if (
+            "code-mode-host" in lowered
+            and ("failed to spawn" in lowered or "not found" in lowered or "no such file" in lowered)
+        ):
+            detail = line.strip()[-1200:]
+            return ProviderInfrastructureError(
+                provider, "TOOL_HOST_STARTUP", detail, retryable=False)
+    return None
 
 
 def tree_bytes(path: Path) -> int:
@@ -2071,6 +2280,8 @@ def invoke(
     infrastructure_error: ProviderInfrastructureError | None = None
     if result.returncode != 0:
         infrastructure_error = classify_failed_invocation(provider, result, raw)
+    else:
+        infrastructure_error = classify_successful_exit_infrastructure_failure(provider, result, raw)
     try:
         if infrastructure_error:
             raise infrastructure_error
@@ -2502,8 +2713,23 @@ def synthesis_diagnostics(
 
 def command_preflight(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
-    topology = resolve_topology(args.backend)
     runtime = agent_runtime(args)
+    selection_checks: dict[str, dict[str, Any]] = {}
+    if args.host_adapter and args.peer_reviewer == "auto":
+        selection_args = argparse.Namespace(**vars(args), final_reviewer="auto")
+        topology, frozen_peer, preferred_final, selection_checks = (
+            resolve_verified_host_selection(
+                selection_args, project, runtime, perform_probe=args.probe,
+            )
+        )
+    else:
+        topology = resolve_host_topology(args.backend, args.host_adapter, args.peer_reviewer)
+        frozen_peer = topology["B"] if args.host_adapter and args.backend == "auto" else None
+        preferred_final = (
+            resolve_final_reviewer("auto", args.host_adapter, frozen_peer)
+            if args.host_adapter else None
+        )
+    selected_adapters = set(topology.values()) | ({preferred_final} if preferred_final else set())
     baseline = git(project, "rev-parse", "--verify", f"{args.base_ref}^{{commit}}")
     payload = {
         "status": "PREFLIGHT_OK",
@@ -2512,16 +2738,20 @@ def command_preflight(args: argparse.Namespace) -> None:
         "baseline_sha": baseline,
         "clean": not bool(git(project, "status", "--porcelain")),
         "planners": topology,
+        "host_adapter": args.host_adapter,
+        "peer_reviewer": frozen_peer,
+        "preferred_final_reviewer": preferred_final,
+        "selection_checks": selection_checks,
         "provider_diversity": len(set(topology.values())) > 1,
         "model_diversity": model_diversity(topology, runtime),
-        "agent_runtime": {name: runtime[name] for name in sorted(set(topology.values()))},
-        "runtime_warnings": runtime_warnings({name: runtime[name] for name in set(topology.values())}),
+        "agent_runtime": {name: runtime[name] for name in sorted(selected_adapters)},
+        "runtime_warnings": runtime_warnings({name: runtime[name] for name in selected_adapters}),
         "capabilities": {
             "bubblewrap": shutil.which("bwrap") is not None,
             "git": executable_version("git"),
             "python": sys.version.split()[0],
             "adapters": {
-                name: adapter_capabilities(name) for name in sorted(set(topology.values()))
+                name: adapter_capabilities(name) for name in sorted(selected_adapters)
             },
         },
     }
@@ -2532,12 +2762,12 @@ def command_preflight(args: argparse.Namespace) -> None:
         payload["status"] = "PREFLIGHT_STATIC_REQUIREMENT_FAILED"
         emit(payload, code=2)
     if args.probe:
-        probes = {
+        probes = selection_checks or {
             name: probe_provider(name, project, runtime=runtime[name])
-            for name in sorted(set(topology.values()))
+            for name in sorted(selected_adapters)
         }
         payload["probes"] = probes
-        if not all(item["ok"] for item in probes.values()):
+        if not selection_checks and not all(item["ok"] for item in probes.values()):
             payload["status"] = "PREFLIGHT_PROVIDER_UNUSABLE"
             emit(payload, code=2)
     emit(payload)
@@ -2548,10 +2778,10 @@ def command_init(args: argparse.Namespace) -> None:
     request = Path(args.request).expanduser().resolve()
     if not request.is_file():
         raise WorkflowError(f"request file does not exist: {request}")
-    topology = resolve_topology(args.backend)
     runtime = agent_runtime(args)
-    if args.final_reviewer != "both" and not available(args.final_reviewer):
-        raise WorkflowError(f"final reviewer is unavailable: {args.final_reviewer}")
+    topology, frozen_peer, final_reviewer, selection_checks = resolve_verified_host_selection(
+        args, project, runtime,
+    )
     baseline = git(project, "rev-parse", "--verify", f"{args.base_ref}^{{commit}}")
     original_changes = git(project, "status", "--porcelain").splitlines()
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
@@ -2604,12 +2834,15 @@ def command_init(args: argparse.Namespace) -> None:
         "finding_aliases": {},
         "planning_depth": args.planning_depth,
         "research_policy": args.research_policy,
+        "host_adapter": args.host_adapter,
+        "peer_reviewer": frozen_peer,
+        "selection_checks": selection_checks,
         "planners": topology,
         "provider_diversity": len(set(topology.values())) > 1,
         "model_diversity": model_diversity(topology, runtime),
         "agent_runtime": runtime,
         "runtime_warnings": runtime_warnings(runtime),
-        "final_reviewer": args.final_reviewer,
+        "final_reviewer": final_reviewer,
         "worktree": str(worktree),
         "status": "INITIALIZED",
         "investigations": {},
@@ -2645,7 +2878,10 @@ def command_init(args: argparse.Namespace) -> None:
         "base_ref": state["base_ref"], "baseline_sha": state["baseline_sha"],
         "original_worktree_clean_at_start": state["original_worktree_clean_at_start"],
         "original_worktree_changes_at_start": state["original_worktree_changes_at_start"],
-        "planners": topology, "final_reviewer": args.final_reviewer,
+        "host_adapter": args.host_adapter,
+        "peer_reviewer": frozen_peer,
+        "selection_checks": selection_checks,
+        "planners": topology, "final_reviewer": final_reviewer,
         "provider_diversity": state["provider_diversity"],
         "model_diversity": state["model_diversity"], "agent_runtime": runtime,
         "runtime_warnings": state["runtime_warnings"],
@@ -3264,6 +3500,9 @@ def command_status(args: argparse.Namespace) -> None:
     state = load_state(project, args.run_id)
     emit({
         "status": state["status"], "run_id": state["run_id"], "baseline_sha": state["baseline_sha"],
+        "host_adapter": state.get("host_adapter"),
+        "peer_reviewer": state.get("peer_reviewer"),
+        "selection_checks": state.get("selection_checks", {}),
         "planners": state["planners"], "provider_diversity": state["provider_diversity"],
         "model_diversity": state.get("model_diversity", False),
         "agent_runtime": state.get("agent_runtime") or {},
@@ -3300,6 +3539,9 @@ def command_export(args: argparse.Namespace) -> None:
     validate_ready_invariants(state)
     emit({
         "status": "READY", "run_id": state["run_id"], "baseline_sha": state["baseline_sha"],
+        "host_adapter": state.get("host_adapter"),
+        "peer_reviewer": state.get("peer_reviewer"),
+        "selection_checks": state.get("selection_checks", {}),
         "plan": state["final"]["plan"], "batch_manifest": state["final"]["batch_manifest"],
         "plan_sha256": state["final"]["plan_sha256"],
         "batch_manifest_sha256": state["final"]["batch_manifest_sha256"],
@@ -3323,6 +3565,9 @@ def command_audit_export(args: argparse.Namespace) -> None:
         save_state(state)
     emit({
         "status": state["status"], "run_id": state["run_id"], "report": str(report),
+        "host_adapter": state.get("host_adapter"),
+        "peer_reviewer": state.get("peer_reviewer"),
+        "selection_checks": state.get("selection_checks", {}),
         "candidate": state.get("candidate"), "final_reviews": state.get("final_reviews") or {},
         "abandoned": state.get("abandoned"), "resource_usage": state.get("resource_usage") or {},
     })
@@ -3448,9 +3693,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight.add_argument("--backend", choices=["auto", *SUPPORTED_PROVIDERS], default="auto")
     preflight.add_argument(
+        "--host-adapter", choices=SUPPORTED_PROVIDERS,
+        help="freeze the current host's CLI adapter so auto can prefer an independent reviewer")
+    preflight.add_argument(
+        "--peer-reviewer", choices=["auto", *SUPPORTED_PROVIDERS], default="auto",
+        help="override the host-aware non-host slot after a higher-priority probe fails")
+    preflight.add_argument(
         "--probe", action="store_true",
-        help="spend one trivial sandboxed call per provider to check it can authenticate and "
-             "return a schema object; exits 2 if any cannot")
+        help="spend one small sandboxed call per provider to check it can authenticate, read a "
+             "mounted file, and return a schema object; exits 2 if any cannot")
     add_model_selection(preflight)
     preflight.set_defaults(func=command_preflight)
 
@@ -3463,7 +3714,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--backend", choices=["auto", *SUPPORTED_PROVIDERS], default="auto")
     init.add_argument(
-        "--final-reviewer", choices=["both", *SUPPORTED_PROVIDERS], required=True,
+        "--host-adapter", choices=SUPPORTED_PROVIDERS,
+        help="freeze the current host's CLI adapter for host-aware reviewer selection")
+    init.add_argument(
+        "--peer-reviewer", choices=["auto", *SUPPORTED_PROVIDERS], default="auto",
+        help="freeze an explicit non-host slot after probing the preferred reviewer order")
+    init.add_argument(
+        "--final-reviewer", choices=["auto", "both", *SUPPORTED_PROVIDERS], default="auto",
         help="use one fresh reviewer for standard planning; reserve 'both' for deep or explicitly requested high assurance",
     )
     init.add_argument(
