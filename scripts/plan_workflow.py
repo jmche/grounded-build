@@ -967,17 +967,9 @@ def resolve_other_bridge() -> tuple[Path | None, str | None]:
     return resolved, None
 
 
-def other_bridge_executable(*, strict: bool = True) -> Path | None:
-    """Return the bridge path, rejecting bad configuration only when `other` is authoritative."""
-    resolved, error = resolve_other_bridge()
-    if strict and error:
-        raise WorkflowError(error)
-    return resolved
-
-
 def provider_executable(provider: str) -> Path | None:
     if provider == "other":
-        return other_bridge_executable(strict=False)
+        return resolve_other_bridge()[0]
     executable = shutil.which(provider)
     return Path(executable).resolve() if executable else None
 
@@ -1140,7 +1132,7 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
         selected_claude_model = None
     if dsh_model == "cli-default":
         dsh_model = None
-    other_executable = other_bridge_executable(strict=False)
+    other_executable = provider_executable("other")
     runtime = {
         "codex": codex_runtime_identity(selected_codex_model, model_provider, profile),
         "claude": {
