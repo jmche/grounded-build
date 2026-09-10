@@ -50,10 +50,15 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.make_fake_reviewer("codex")
         self.make_fake_reviewer("claude")
         self.make_fake_reviewer("dsh")
+        self.make_fake_reviewer("other")
+        code_mode_host = self.bin_dir / "codex-code-mode-host"
+        code_mode_host.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        code_mode_host.chmod(0o755)
         self.environment = os.environ.copy()
         self.environment["PATH"] = f"{self.bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["GROUNDED_BUILD_IMPLEMENT_HOME"] = str(self.state_home)
         self.environment["GROUNDED_BUILD_TESTING"] = "1"
+        self.environment["GROUNDED_BUILD_OTHER_COMMAND"] = str(self.bin_dir / "other")
         dsh_home = self.root / "dsh-home"
         dsh_home.mkdir()
         (dsh_home / "settings.yaml").write_text(
@@ -83,13 +88,52 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 if "--version" in sys.argv:
                     print("fake-{name} 1.0")
                     raise SystemExit(0)
+                if len(sys.argv) > 1 and sys.argv[1] == "capabilities":
+                    print(json.dumps({{"protocol": "grounded-build-other-v1", "read_only": True,
+                                      "structured_output": True, "fresh_process": True}}))
+                    raise SystemExit(0)
                 if "--help" in sys.argv:
                     print("--profile headless --patch --dump-config --json-schema --output-format "
-                          "--permission-mode --no-session-persistence")
+                          "--permission-mode --no-session-persistence --output-schema "
+                          "--output-last-message --ephemeral --sandbox --config")
                     raise SystemExit(0)
-                prompt = sys.argv[-1]
+                bridge = len(sys.argv) > 1 and sys.argv[1] == "run"
+                prompt = (open(sys.argv[sys.argv.index("--prompt") + 1], encoding="utf-8").read()
+                          if bridge else sys.argv[-1])
+                if "This is a capability check." in prompt:
+                    probe_path = re.search(r"Read (/.+?/probe-input\\.txt)\\.", prompt).group(1)
+                    with open(probe_path, encoding="utf-8") as handle:
+                        observed = handle.read().rstrip("\\n")
+                    payload = {{"provider": "{name}", "ready": True, "observed": observed}}
+                    if bridge or "{name}" == "codex":
+                        flag = "--output" if bridge else "-o"
+                        with open(sys.argv[sys.argv.index(flag) + 1], "w", encoding="utf-8") as handle:
+                            json.dump(payload, handle)
+                    elif "{name}" == "dsh":
+                        print(json.dumps(payload))
+                    else:
+                        print(json.dumps({{"structured_output": payload}}))
+                    raise SystemExit(0)
+                if "{name}" == "codex" and os.environ.get("FAKE_CODEX_ROUTER_ERROR") == "1":
+                    print(
+                        "2026-09-09T00:00:00Z ERROR codex_core::tools::router: "
+                        "error=failed to spawn code-mode host /opt/codex-code-mode-host: "
+                        "No such file or directory (os error 2)",
+                        file=sys.stderr,
+                    )
                 if os.environ.get("FAKE_{name.upper()}_SLEEP"):
                     time.sleep(float(os.environ["FAKE_{name.upper()}_SLEEP"]))
+                if "{name}" == "claude" and os.environ.get("FAKE_CLAUDE_QUOTA_WRAPPER") == "1":
+                    print(json.dumps({{"is_error": True, "api_error_status": 429,
+                                      "result": "five-hour token quota exhausted"}}))
+                    raise SystemExit(0)
+                if os.environ.get("FAKE_{name.upper()}_QUOTA") == "1":
+                    print("429 rate limit: five-hour token quota exhausted", file=sys.stderr)
+                    raise SystemExit(42)
+                if os.environ.get("FAKE_{name.upper()}_NON_RATE") == "1":
+                    print("configuration error: unknown field quota_policy; "
+                          "request id 429 failed validation", file=sys.stderr)
+                    raise SystemExit(42)
                 if os.environ.get("FAKE_{name.upper()}_EXIT") == "1":
                     raise SystemExit(42)
                 def field(label):
@@ -163,8 +207,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
                             "rationale": "fixture repository assertion passed",
                         }} for item in selected_criteria],
                     }}
-                if "{name}" == "codex":
-                    output = sys.argv[sys.argv.index("-o") + 1]
+                if bridge or "{name}" == "codex":
+                    flag = "--output" if bridge else "-o"
+                    output = sys.argv[sys.argv.index(flag) + 1]
                     with open(output, "w", encoding="utf-8") as handle:
                         json.dump(payload, handle)
                 elif "{name}" == "dsh":
@@ -287,6 +332,276 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(status["reviewer"], "claude")
         self.assertEqual(status["reviewer_history"][0]["source"], "RUN_INITIALIZED")
 
+    def test_auto_reviewer_prefers_codex_for_non_codex_host(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "codex")
+        self.assertEqual(initialized["host_adapter"], "dsh")
+        self.assertTrue(initialized["reviewer_selection_checks"]["codex"]["ok"])
+
+    def test_invalid_environment_is_rejected_before_automatic_reviewer_probe(self) -> None:
+        launcher = self.project / ".venv" / "bin" / "python"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        os.mkfifo(self.project / ".venv" / "unsupported-fifo")
+        args = argparse.Namespace(
+            project=str(self.project), plan=str(self.plan),
+            batch_manifest=str(self.batch_manifest), target_branch="main", batches="1",
+            instruction_file=[], reviewer="auto", host_adapter="dsh", implementer="dsh",
+            fix_policy="ask",
+        )
+        with mock.patch.object(
+            WORKFLOW_MODULE, "select_implementation_reviewer",
+        ) as selection:
+            with self.assertRaisesRegex(
+                WORKFLOW_MODULE.WorkflowError, "unsupported special file",
+            ):
+                WORKFLOW_MODULE.command_init(args)
+        selection.assert_not_called()
+
+    def test_auto_reviewer_falls_back_to_host_when_codex_read_host_is_missing(self) -> None:
+        (self.bin_dir / "codex-code-mode-host").unlink()
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "dsh")
+        self.assertFalse(initialized["reviewer_selection_checks"]["codex"]["ok"])
+        self.assertTrue(initialized["reviewer_selection_checks"]["dsh"]["ok"])
+
+    def test_codex_host_auto_reviewer_prefers_claude_then_dsh(self) -> None:
+        common = (
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "codex", "--implementer", "codex", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        preferred = self.workflow(*common)
+        self.assertEqual(preferred["reviewer"], "claude")
+
+        claude = self.bin_dir / "claude"
+        claude.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+        claude.chmod(0o755)
+        fallback = self.workflow(*common)
+        self.assertEqual(fallback["reviewer"], "dsh")
+        self.assertFalse(fallback["reviewer_selection_checks"]["claude"]["ok"])
+        self.assertTrue(fallback["reviewer_selection_checks"]["dsh"]["ok"])
+
+    def test_other_host_auto_reviewer_prefers_codex(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "other", "--implementer", "other", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "codex")
+        self.assertTrue(initialized["reviewer_selection_checks"]["codex"]["ok"])
+
+    def test_auto_reviewer_rate_limit_falls_back_to_host_for_contract_review(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "other", "--implementer", "other", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.environment["FAKE_CODEX_QUOTA"] = "1"
+        fallback = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_QUOTA")
+        self.assertEqual(fallback["status"], "REVIEWER_AUTO_FALLBACK")
+        self.assertEqual(fallback["fallback"]["to_reviewer"], "other")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "other")
+        self.assertEqual(status["reviewer_requested"], "auto")
+        self.assertEqual(status["automatic_reviewer_fallbacks"][0]["to_reviewer"], "other")
+        self.assertEqual(status["host_reviewer_runtime"]["adapter"], "other")
+        self.assertEqual(status["recorded_status"], "AWAITING_CONTRACT_REVIEW")
+        contract = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(contract["status"], "CONTRACT_READY")
+
+    def test_explicit_reviewer_rate_limit_does_not_change_authority(self) -> None:
+        initialized = self.initialize_raw("codex", implementer="dsh")
+        self.environment["FAKE_CODEX_QUOTA"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_QUOTA")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "codex")
+        self.assertEqual(status["recorded_status"], "AWAITING_CONTRACT_REVIEW")
+
+    def test_user_changed_reviewer_rate_limit_does_not_change_authority(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.workflow(
+            "change-reviewer", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--reviewer", "claude",
+            "--reason", "User-selected reviewer", "--actor", "test-user", "--apply",
+        )
+        self.environment["FAKE_CLAUDE_QUOTA"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CLAUDE_QUOTA")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "claude")
+        self.assertEqual(status["reviewer_requested"], "claude")
+        self.assertEqual(status["automatic_reviewer_fallbacks"], [])
+
+    def test_successful_claude_quota_wrapper_falls_back_to_codex_host(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "codex", "--implementer", "codex", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "claude")
+        self.environment["FAKE_CLAUDE_QUOTA_WRAPPER"] = "1"
+        fallback = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CLAUDE_QUOTA_WRAPPER")
+        self.assertEqual(fallback["status"], "REVIEWER_AUTO_FALLBACK")
+        self.assertEqual(fallback["fallback"]["to_reviewer"], "codex")
+
+    def test_rate_limit_classifier_does_not_match_incidental_rate_text(self) -> None:
+        classifier = WORKFLOW_MODULE.planning_isolation_module().is_rate_limit_failure
+        self.assertTrue(classifier("429 too many requests"))
+        self.assertTrue(classifier("five-hour usage limit reached"))
+        self.assertFalse(classifier("separate transport failure"))
+        self.assertFalse(classifier("configuration error: unknown field quota_policy"))
+        self.assertFalse(classifier("invalid value request_quota in schema"))
+        self.assertFalse(classifier("request id 429 failed validation"))
+
+    def test_auto_reviewer_non_rate_failure_does_not_fall_back(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.environment["FAKE_CODEX_NON_RATE"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_NON_RATE")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "codex")
+        self.assertEqual(status["automatic_reviewer_fallbacks"], [])
+
+    def test_auto_reviewer_rate_limit_stops_when_host_is_unavailable(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        host = self.bin_dir / "dsh"
+        host.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+        host.chmod(0o755)
+        self.environment["FAKE_CODEX_QUOTA"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_QUOTA")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "codex")
+
+    def test_auto_reviewer_rate_limit_falls_back_for_batch_review(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+        )
+        implementation = Path(str(initialized["implementation_worktree"]))
+        reviewed_sha = self.commit_batch_change(implementation)
+        self.environment["FAKE_CODEX_QUOTA"] = "1"
+        fallback = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_QUOTA")
+        self.assertEqual(fallback["status"], "REVIEWER_AUTO_FALLBACK")
+        self.assertEqual(fallback["fallback"]["to_reviewer"], "dsh")
+        review = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        )
+        self.assertEqual(review["status"], "REVIEW_PASS")
+        self.assertEqual(review["reviewed_sha"], reviewed_sha)
+
+    def test_other_only_installation_uses_other_as_implementation_reviewer(self) -> None:
+        for reviewer in ("codex", "claude", "dsh"):
+            path = self.bin_dir / reviewer
+            path.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+            path.chmod(0o755)
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "other", "--implementer", "other", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "other")
+        self.assertTrue(initialized["reviewer_selection_checks"]["other"]["ok"])
+
+    def test_explicit_other_reviewer_handles_contract_and_fixed_sha_review(self) -> None:
+        initialized = self.initialize("other", implementer="other")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer_runtime"]["adapter"], "other")
+        self.assertEqual(status["reviewer_runtime"]["protocol"], "grounded-build-other-v1")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        reviewed_sha = self.commit_batch_change(implementation)
+        review = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        )
+        self.assertEqual(review["status"], "REVIEW_PASS")
+        self.assertEqual(review["reviewed_sha"], reviewed_sha)
+        report = json.loads(Path(str(review["report_path"])).read_text(encoding="utf-8"))
+        self.assertEqual(report["reviewer"], "other")
+
     def test_dsh_reviews_the_contract_and_fixed_sha_batch(self) -> None:
         initialized = self.initialize("dsh")
         status = self.workflow(
@@ -340,6 +655,40 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(state["review_invocations"][-1]["status"], "INFRA_ERROR")
         self.assertIn("timed out", state["review_invocations"][-1]["error"])
+
+    def test_zero_exit_codex_tool_host_failure_cannot_approve_contract(self) -> None:
+        initialized = self.initialize_raw("codex")
+        self.environment["FAKE_CODEX_ROUTER_ERROR"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_ROUTER_ERROR")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        self.assertIn("TOOL_HOST_STARTUP", str(failed["reason"]))
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text()
+        )
+        self.assertIsNone(state["acceptance_contract"])
+        self.assertEqual(state["contract_review_invocations"][-1]["status"], "INFRA_ERROR")
+
+    def test_zero_exit_codex_tool_host_failure_cannot_pass_batch_review(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        self.environment["FAKE_CODEX_ROUTER_ERROR"] = "1"
+        failed = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_ROUTER_ERROR")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        self.assertIn("TOOL_HOST_STARTUP", str(failed["reason"]))
+        state = json.loads(
+            (Path(str(initialized["run_directory"])) / "workflow.json").read_text()
+        )
+        self.assertEqual(state["reviews"], [])
+        self.assertEqual(state["review_invocations"][-1]["status"], "INFRA_ERROR")
 
     def test_reviewer_switch_is_audited_without_resetting_state_or_budget(self) -> None:
         initialized = self.initialize_raw("codex", implementer="claude")
@@ -3490,7 +3839,7 @@ class DocumentationContractTests(unittest.TestCase):
             self.assertIn("exact-HEAD", document)
         self.assertIn("Never use filenames, line counts, or keyword rules", implementation)
 
-    def test_public_contract_documents_dsh_as_an_implementation_reviewer(self) -> None:
+    def test_public_contract_documents_all_implementation_reviewers(self) -> None:
         documents = {
             "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
             "readme": (SKILL_ROOT / "README.md").read_text(encoding="utf-8"),
@@ -3499,10 +3848,14 @@ class DocumentationContractTests(unittest.TestCase):
                 SKILL_ROOT / "references" / "implementation_workflow.md"
             ).read_text(encoding="utf-8"),
         }
-        self.assertEqual(WORKFLOW_MODULE.SUPPORTED_REVIEWERS, ("claude", "codex", "dsh"))
+        self.assertEqual(
+            WORKFLOW_MODULE.SUPPORTED_REVIEWERS,
+            ("claude", "codex", "dsh", "other"),
+        )
         for name, document in documents.items():
             with self.subTest(document=name):
                 self.assertIn("dsh", document)
+                self.assertIn("other", document)
                 self.assertNotIn("dsh is supported for planning only", document.lower())
                 self.assertNotIn("not an Implement reviewer", document)
                 self.assertNotIn("planning backend only", document.lower())

@@ -13,9 +13,13 @@ Security reports must follow [SECURITY.md](SECURITY.md), not the public issue tr
 
 Requirements:
 
-- Linux with bubblewrap
+- Linux with `bubblewrap` and `socat` (`sudo apt install bubblewrap socat`) — `socat` is required by
+  the provider CLI's fail-closed sandbox even though Grounded Build never invokes it directly
 - Git
 - CPython 3.11, 3.12, or 3.13
+- `python3-venv` (`sudo apt install python3-venv`) — the runtime never creates a virtual environment,
+  but the environment-fingerprint tests build one as a fixture, and Debian/Ubuntu ship `venv`
+  separately from the interpreter
 
 The runtime is standard-library only. Tests install fake provider executables and never call paid models.
 
@@ -63,7 +67,7 @@ credentials, and private repository content must never be committed.
 
 Grounded Build uses semantic versioning while it remains a public beta:
 
-- Patch (`0.6.x` on the current line): compatible correctness, security, documentation, prompt,
+- Patch (`0.7.x` on the current line): compatible correctness, security, documentation, prompt,
   review-policy, and other bounded refinements.
 - Minor (`0.x.0`, including values such as `0.100.0`): substantial compatible workflow capability or
   public-surface additions that deserve a distinct product milestone.

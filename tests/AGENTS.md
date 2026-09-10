@@ -6,7 +6,7 @@
 ## Purpose
 Regression coverage for both workflow engines, run as real end-to-end CLI exercises rather than unit
 mocks: each suite builds a throwaway Git project in a `TemporaryDirectory`, installs **fake** local
-`claude` / `codex` / `dsh` executables on `PATH`, points the state root at a temporary directory, and
+`claude` / `codex` / `dsh` executables and an `other` bridge, points the state root at a temporary directory, and
 drives the actual `scripts/*.py` commands. No paid model calls are made.
 
 ## Key Files

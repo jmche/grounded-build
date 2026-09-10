@@ -24,17 +24,28 @@ from pathlib import Path
 if "--version" in sys.argv:
     print("fake-agent 1.0")
     raise SystemExit(0)
+if len(sys.argv) > 1 and sys.argv[1] == "capabilities":
+    print(json.dumps({"protocol": "grounded-build-other-v1", "read_only": True,
+                      "structured_output": True, "fresh_process": True}))
+    raise SystemExit(0)
 if "--help" in sys.argv:
     print("--output-schema --output-last-message --ephemeral --sandbox --config "
           "--profile headless --patch --dump-config --json-schema --output-format --permission-mode "
           "--no-session-persistence")
     raise SystemExit(0)
-prompt = sys.argv[-1]
-provider = re.search(r"provider=(claude|codex|dsh)", prompt).group(1)
+bridge = len(sys.argv) > 1 and sys.argv[1] == "run"
+prompt = (Path(sys.argv[sys.argv.index("--prompt") + 1]).read_text(encoding="utf-8")
+          if bridge else sys.argv[-1])
+provider = re.search(r"provider=(claude|codex|dsh|other)", prompt).group(1)
 if "This is a capability check." in prompt:
     ready = not any(Path(name).exists() for name in ("dirty-tracked.txt", "dirty-staged.txt", "dirty-untracked.txt"))
-    probe = {"provider": provider, "ready": ready}
-    if "-o" in sys.argv:
+    probe_path = Path(re.search(r"Read (/.+?/probe-input\.txt)\.", prompt).group(1))
+    probe = {"provider": provider, "ready": ready,
+             "observed": probe_path.read_text(encoding="utf-8").rstrip("\n")}
+    if bridge:
+        with open(sys.argv[sys.argv.index("--output") + 1], "w", encoding="utf-8") as handle:
+            json.dump(probe, handle)
+    elif "-o" in sys.argv:
         with open(sys.argv[sys.argv.index("-o") + 1], "w", encoding="utf-8") as handle:
             json.dump(probe, handle)
     elif "OUTPUT CONTRACT" in prompt:
@@ -134,11 +145,31 @@ def fake_assignment(prompt_text):
     return ""
 
 
+router_error = re.search(r"FAKE_CODE_MODE_ROUTER_ERROR=(\S+)", request_text)
+router_warning = re.search(r"FAKE_CODE_MODE_WARNING=(\S+)", request_text)
+quota_error = re.search(r"FAKE_RATE_LIMIT=(\S+)", request_text)
+if quota_error and provider == "codex" and quota_error.group(1) == fake_assignment(prompt):
+    print("429 rate limit: five-hour token quota exhausted", file=sys.stderr)
+    raise SystemExit(42)
+non_rate_error = re.search(r"FAKE_NON_RATE_FAILURE=(\S+)", request_text)
+if non_rate_error and provider == "codex" and non_rate_error.group(1) == fake_assignment(prompt):
+    print("configuration error: unknown field quota_policy; request id 429 failed validation",
+          file=sys.stderr)
+    raise SystemExit(42)
+if provider == "codex" and router_error and router_error.group(1) == fake_assignment(prompt):
+    print("2026-09-09T00:00:00Z ERROR codex_core::tools::router: "
+          "error=failed to spawn code-mode host /opt/codex-code-mode-host: "
+          "No such file or directory (os error 2)", file=sys.stderr)
+elif provider == "codex" and router_warning and router_warning.group(1) == fake_assignment(prompt):
+    print("warning: Code Mode is unavailable because failed to spawn code-mode host "
+          "/opt/codex-code-mode-host: host executable was not found.", file=sys.stderr)
+
+
 if "FAKE_529" in request_text and "independent evidence investigator A" in prompt:
     print(json.dumps({"is_error": True, "api_error_status": 529,
                       "result": "upstream provider overloaded"}))
-elif "-o" in sys.argv:
-    output = sys.argv[sys.argv.index("-o") + 1]
+elif bridge or "-o" in sys.argv:
+    output = sys.argv[sys.argv.index("--output" if bridge else "-o") + 1]
     # Deliver nothing on the first attempt when the request asks for it: the shape codex hit
     # three times running, where the turn ends with no final message at all.
     always = re.search(r"FAKE_EMPTY_ALWAYS=(\S+)", request_text)
@@ -179,9 +210,16 @@ class PlanWorkflowTest(unittest.TestCase):
             path = self.bin / name
             path.write_text(FAKE_AGENT, encoding="utf-8")
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        other = self.bin / "other-bridge"
+        other.write_text(FAKE_AGENT, encoding="utf-8")
+        other.chmod(other.stat().st_mode | stat.S_IXUSR)
+        code_mode_host = self.bin / "codex-code-mode-host"
+        code_mode_host.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        code_mode_host.chmod(code_mode_host.stat().st_mode | stat.S_IXUSR)
         self.env = os.environ.copy()
         self.env["PATH"] = f"{self.bin}:{self.env['PATH']}"
         self.env["GROUNDED_BUILD_PLAN_HOME"] = str(self.temp / "state")
+        self.env["GROUNDED_BUILD_OTHER_COMMAND"] = str(other)
 
     def tearDown(self) -> None:
         subprocess.run(["git", "worktree", "prune"], cwd=self.project, check=False)
@@ -273,6 +311,57 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(result["status"], "PREFLIGHT_OK")
         self.assertTrue(result["probes"]["claude"]["ok"])
 
+    def test_preflight_rejects_schema_delivery_without_the_mounted_file_contents(self) -> None:
+        codex = self.bin / "codex"
+        codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "if '--version' in sys.argv:\n print('fake-agent 1.0'); raise SystemExit(0)\n"
+            "if '--help' in sys.argv:\n"
+            " print('--output-schema --output-last-message --ephemeral --sandbox --config'); raise SystemExit(0)\n"
+            "payload = {'provider': 'codex', 'ready': True, 'observed': 'not-read'}\n"
+            "with open(sys.argv[sys.argv.index('-o') + 1], 'w') as handle: json.dump(payload, handle)\n",
+            encoding="utf-8")
+        codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
+
+        result = self.call(
+            "preflight", "--project", str(self.project), "--backend", "codex", "--probe",
+            expect=2)
+        self.assertEqual(result["status"], "PREFLIGHT_PROVIDER_UNUSABLE")
+        self.assertFalse(result["probes"]["codex"]["ok"])
+        self.assertIn("did not reproduce", result["probes"]["codex"]["reason"])
+
+    def test_codex_host_can_skip_installed_probe_failed_claude_for_dsh(self) -> None:
+        claude = self.bin / "claude"
+        claude.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "if '--version' in sys.argv:\n print('fake-agent 1.0'); raise SystemExit(0)\n"
+            "if '--help' in sys.argv:\n"
+            " print('--json-schema --output-format --permission-mode --no-session-persistence'); raise SystemExit(0)\n"
+            "payload = {'provider': 'claude', 'ready': True, 'observed': 'not-read'}\n"
+            "print(json.dumps({'structured_output': payload}))\n",
+            encoding="utf-8")
+        claude.chmod(claude.stat().st_mode | stat.S_IXUSR)
+
+        failed = self.call(
+            "preflight", "--project", str(self.project), "--backend", "auto",
+            "--host-adapter", "codex", "--peer-reviewer", "claude", "--probe", expect=2)
+        self.assertEqual(failed["status"], "PREFLIGHT_PROVIDER_UNUSABLE")
+        self.assertFalse(failed["probes"]["claude"]["ok"])
+
+        fallback = self.call(
+            "preflight", "--project", str(self.project), "--backend", "auto",
+            "--host-adapter", "codex", "--peer-reviewer", "dsh", "--probe")
+        self.assertEqual(fallback["planners"], {"A": "codex", "B": "dsh"})
+        self.assertEqual(fallback["preferred_final_reviewer"], "codex")
+
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "codex", "--peer-reviewer", "dsh")
+        self.assertEqual(initialized["planners"], {"A": "codex", "B": "dsh"})
+        self.assertEqual(initialized["final_reviewer"], "codex")
+
     def test_single_provider_uses_two_isolated_instances_and_reaches_ready(self) -> None:
         initialized = self.initialize("claude", "both")
         self.assertEqual(initialized["planners"], {"A": "claude", "B": "claude"})
@@ -309,6 +398,320 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertTrue(Path(exported["plan"]).is_file())
         self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.project, text=True).strip(), self.baseline)
         self.assertEqual(subprocess.check_output(["git", "status", "--porcelain"], cwd=self.project, text=True), "")
+
+    def test_host_aware_auto_freezes_cross_review_and_final_reviewer_policy(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh")
+        self.assertEqual(initialized["host_adapter"], "dsh")
+        self.assertEqual(initialized["planners"], {"A": "dsh", "B": "codex"})
+        self.assertEqual(initialized["final_reviewer"], "dsh")
+
+        for slot in ("A", "B"):
+            self.call(
+                "investigate", "--project", str(self.project),
+                "--run-id", initialized["run_id"], "--slot", slot)
+        self.run_through_cross_review(initialized)
+        state = self.get_state(initialized)
+        self.assertEqual(state["draft_rounds"]["2"]["A"]["provider"], "dsh")
+        self.assertEqual(state["draft_rounds"]["2"]["B"]["provider"], "codex")
+        self.submit_candidate(initialized)
+        self.call(
+            "final-review", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--reviewer", "F")
+        state = self.get_state(initialized)
+        self.assertEqual(state["final_reviews"]["F"]["provider"], "dsh")
+
+    def test_auto_selected_b_rate_limit_persistently_falls_back_to_host(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_RATE_LIMIT=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh",
+        )
+        failed = self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        self.assertIn("RATE_LIMIT", failed["error"])
+        state = self.get_state(initialized)
+        self.assertEqual(state["slot_provider_overrides"], {"B": "dsh"})
+        self.assertIsNone(state["pending_decision"])
+        self.assertEqual(state["automatic_fallbacks"][0]["from"], "codex")
+        self.assertFalse(state["provider_diversity"])
+        status = self.call(
+            "status", "--project", str(self.project), "--run-id", initialized["run_id"],
+        )
+        self.assertEqual(status["slot_provider_overrides"], {"B": "dsh"})
+        self.assertEqual(status["automatic_fallbacks"][0]["to"], "dsh")
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B",
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["investigations"]["B"]["provider"], "dsh")
+        self.assertEqual(state["usage"]["investigate-B"], 1)
+
+    def test_explicit_b_reviewer_rate_limit_requires_user_decision(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_RATE_LIMIT=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh", "--peer-reviewer", "codex",
+        )
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["status"], "NEEDS_USER_DECISION")
+        self.assertEqual(state["pending_decision"]["kind"], "RATE_LIMIT")
+        self.assertEqual(state["slot_provider_overrides"], {})
+
+    def test_user_reassigned_assignment_is_not_automatically_replaced(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_explicit_fallback_test", SCRIPT)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        state = {
+            "backend_requested": "auto", "peer_reviewer_requested": "auto",
+            "host_adapter": "dsh", "assignment_providers": {"draft-B": "claude"},
+        }
+        failure = module.ProviderInfrastructureError(
+            "claude", "RATE_LIMIT", "429 rate limit", retryable=True,
+        )
+        self.assertIsNone(module.automatic_planning_host_fallback(
+            state, "draft-B", "B", "claude", failure,
+        ))
+        self.assertNotIn("slot_provider_overrides", state)
+
+    def test_auto_b_rate_limit_stops_when_host_fallback_is_unavailable(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_RATE_LIMIT=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh",
+        )
+        host = self.bin / "dsh"
+        host.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+        host.chmod(0o755)
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["status"], "NEEDS_USER_DECISION")
+        self.assertEqual(state["pending_decision"]["kind"], "RATE_LIMIT")
+        self.assertEqual(state["slot_provider_overrides"], {})
+
+    def test_auto_b_non_rate_failure_does_not_fall_back(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_NON_RATE_FAILURE=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh",
+        )
+        failed = self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        self.assertIn("ADAPTER_EXIT", failed["error"])
+        state = self.get_state(initialized)
+        self.assertEqual(state["status"], "NEEDS_USER_DECISION")
+        self.assertEqual(state["pending_decision"]["kind"], "ADAPTER_EXIT")
+        self.assertEqual(state["automatic_fallbacks"], [])
+        self.assertEqual(state["slot_provider_overrides"], {})
+
+    def test_auto_selected_b_can_fall_back_to_other_host_bridge(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_RATE_LIMIT=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+        )
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["slot_provider_overrides"], {"B": "other"})
+        self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B",
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["investigations"]["B"]["provider"], "other")
+
+    def test_other_host_uses_generic_bridge_and_keeps_final_review_on_host(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+        )
+        self.assertEqual(initialized["planners"], {"A": "other", "B": "codex"})
+        self.assertEqual(initialized["peer_reviewer"], "codex")
+        self.assertEqual(initialized["final_reviewer"], "other")
+        self.assertEqual(
+            initialized["agent_runtime"]["other"]["protocol"],
+            "grounded-build-other-v1",
+        )
+
+        for slot in ("A", "B"):
+            self.call(
+                "investigate", "--project", str(self.project),
+                "--run-id", initialized["run_id"], "--slot", slot,
+            )
+        self.run_through_cross_review(initialized)
+        self.submit_candidate(initialized)
+        self.call(
+            "final-review", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--reviewer", "F",
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["draft_rounds"]["2"]["A"]["provider"], "other")
+        self.assertEqual(state["draft_rounds"]["2"]["B"]["provider"], "codex")
+        self.assertEqual(state["final_reviews"]["F"]["provider"], "other")
+
+    def test_other_only_installation_uses_other_for_every_planning_slot(self) -> None:
+        for provider in ("claude", "codex", "dsh"):
+            path = self.bin / provider
+            path.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+            path.chmod(0o755)
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+        )
+        self.assertEqual(initialized["planners"], {"A": "other", "B": "other"})
+        self.assertEqual(initialized["peer_reviewer"], "other")
+        self.assertEqual(initialized["final_reviewer"], "other")
+        self.assertTrue(initialized["selection_checks"]["other"]["ok"])
+
+    def test_explicit_final_reviewer_overrides_other_host_default(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+            "--final-reviewer", "dsh",
+        )
+        self.assertEqual(initialized["planners"], {"A": "other", "B": "codex"})
+        self.assertEqual(initialized["final_reviewer"], "dsh")
+        self.assertTrue(initialized["selection_checks"]["dsh"]["ok"])
+
+    def test_unused_invalid_other_bridge_does_not_block_explicit_builtin_backend(self) -> None:
+        preflight = self.call(
+            "preflight", "--project", str(self.project), "--backend", "claude",
+            extra_env={"GROUNDED_BUILD_OTHER_COMMAND": "relative/bad"},
+        )
+        self.assertEqual(preflight["status"], "PREFLIGHT_OK")
+        self.assertEqual(preflight["planners"], {"A": "claude", "B": "claude"})
+
+    def test_explicit_backend_and_final_do_not_require_an_unused_host_bridge(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--host-adapter", "other",
+            "--final-reviewer", "claude",
+            extra_env={"GROUNDED_BUILD_OTHER_COMMAND": ""},
+        )
+        self.assertEqual(initialized["planners"], {"A": "claude", "B": "claude"})
+        self.assertEqual(initialized["final_reviewer"], "claude")
+        self.assertNotIn("other", initialized["selection_checks"])
+
+    def test_other_bridge_digest_is_frozen_before_agent_invocation(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+            "--peer-reviewer", "other",
+        )
+        bridge = Path(self.env["GROUNDED_BUILD_OTHER_COMMAND"])
+        bridge.write_text(bridge.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+        result = self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "A", expect=2,
+        )
+        self.assertIn("bridge executable changed", result["error"])
+
+    def test_other_bridge_must_declare_the_protocol_contract(self) -> None:
+        bridge = Path(self.env["GROUNDED_BUILD_OTHER_COMMAND"])
+        bridge.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "if '--version' in sys.argv: print('bad-bridge 1.0')\n"
+            "elif sys.argv[1] == 'capabilities': print(json.dumps({'protocol': 'unknown'}))\n",
+            encoding="utf-8",
+        )
+        bridge.chmod(0o755)
+        result = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other", expect=2,
+        )
+        self.assertIn("host adapter failed", result["error"])
+        self.assertIn("grounded-build-other-v1", result["error"])
+
+    def test_host_aware_init_does_not_freeze_installed_codex_without_its_read_host(self) -> None:
+        (self.bin / "codex-code-mode-host").unlink()
+        preflight = self.call(
+            "preflight", "--project", str(self.project), "--backend", "auto",
+            "--host-adapter", "dsh", "--probe",
+        )
+        self.assertEqual(preflight["status"], "PREFLIGHT_OK")
+        self.assertEqual(preflight["planners"], {"A": "dsh", "B": "dsh"})
+        self.assertFalse(preflight["selection_checks"]["codex"]["ok"])
+        self.assertTrue(preflight["selection_checks"]["dsh"]["ok"])
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh",
+        )
+        self.assertEqual(initialized["planners"], {"A": "dsh", "B": "dsh"})
+        self.assertEqual(initialized["peer_reviewer"], "dsh")
+        self.assertEqual(initialized["final_reviewer"], "dsh")
+        self.assertTrue(initialized["selection_checks"]["dsh"]["ok"])
+        self.assertFalse(initialized["selection_checks"]["codex"]["ok"])
+        self.assertTrue(any(
+            "codex-code-mode-host" in item
+            for item in initialized["selection_checks"]["codex"]["capability"]["missing"]
+        ),
+        )
+
+    def test_explicit_backend_does_not_override_host_aware_final_auto(self) -> None:
+        preflight = self.call(
+            "preflight", "--project", str(self.project), "--backend", "claude",
+            "--host-adapter", "dsh", "--probe")
+        self.assertEqual(preflight["preferred_final_reviewer"], "dsh")
+        self.assertEqual(set(preflight["capabilities"]["adapters"]), {"claude", "dsh"})
+        self.assertEqual(set(preflight["probes"]), {"claude", "dsh"})
+
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--host-adapter", "dsh")
+        self.assertEqual(initialized["planners"], {"A": "claude", "B": "claude"})
+        self.assertIsNone(initialized["peer_reviewer"])
+        self.assertEqual(initialized["final_reviewer"], "dsh")
+
+    def test_explicit_backend_preflight_does_not_probe_an_unused_external_reviewer(self) -> None:
+        (self.bin / "codex-code-mode-host").unlink()
+        preflight = self.call(
+            "preflight", "--project", str(self.project), "--backend", "claude",
+            "--host-adapter", "dsh", "--probe",
+        )
+        self.assertEqual(preflight["status"], "PREFLIGHT_OK")
+        self.assertEqual(preflight["planners"], {"A": "claude", "B": "claude"})
+        self.assertEqual(preflight["preferred_final_reviewer"], "dsh")
+        self.assertTrue(preflight["selection_checks"]["dsh"]["ok"])
+        self.assertNotIn("codex", preflight["selection_checks"])
+
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--host-adapter", "dsh",
+        )
+        self.assertEqual(initialized["final_reviewer"], "dsh")
 
     def test_same_round_investigations_really_overlap_and_merge(self) -> None:
         self.request.write_text(
@@ -459,6 +862,64 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertNotIn("investigate-A", state["usage"])
         self.assertEqual(state["infrastructure_usage"]["investigate-A"], 1)
         self.assertEqual(state["pending_decision"]["type"], "PROVIDER_INFRASTRUCTURE_FAILURE")
+
+    def test_zero_exit_codex_tool_host_failure_is_infrastructure(self) -> None:
+        self.request.write_text(
+            self.request.read_text() + "\nFAKE_CODE_MODE_ROUTER_ERROR=final-1-F\n",
+            encoding="utf-8")
+        initialized = self.initialize("codex", "codex")
+        self.run_through_cross_review(initialized)
+        self.submit_candidate(initialized)
+
+        failure = self.call(
+            "final-review", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--reviewer", "F", expect=2)
+        self.assertIn("TOOL_HOST_STARTUP", failure["error"])
+        state = self.get_state(initialized)
+        self.assertNotIn("final-1-F", state["usage"])
+        self.assertEqual(state["infrastructure_usage"]["final-1-F"], 1)
+        self.assertEqual(state["pending_decision"]["type"], "PROVIDER_INFRASTRUCTURE_FAILURE")
+        self.assertEqual(state["pending_decision"]["kind"], "TOOL_HOST_STARTUP")
+        self.assertEqual(state["final_reviews"], {})
+        record_path = next(
+            (Path(initialized["run_directory"]) / "invocations" / "final-1-F")
+            .glob("attempt_1_*/invocation.json"))
+        self.assertEqual(
+            json.loads(record_path.read_text(encoding="utf-8"))["status"],
+            "INFRASTRUCTURE_FAILURE")
+
+    def test_codex_unavailable_warning_without_router_error_is_not_failure(self) -> None:
+        self.request.write_text(
+            self.request.read_text() + "\nFAKE_CODE_MODE_WARNING=final-1-F\n",
+            encoding="utf-8")
+        initialized = self.initialize("codex", "codex")
+        self.run_through_cross_review(initialized)
+        self.submit_candidate(initialized)
+
+        delivered = self.call(
+            "final-review", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--reviewer", "F")
+        self.assertEqual(delivered["status"], "READY")
+        state = self.get_state(initialized)
+        self.assertEqual(state["final_reviews"]["F"]["verdict"], "PASS")
+        self.assertNotIn("final-1-F", state.get("infrastructure_usage", {}))
+
+    def test_quoted_router_error_inside_codex_json_is_not_infrastructure(self) -> None:
+        quoted = (
+            '{"summary":"ERROR codex_core::tools::router: error=failed to spawn '
+            'code-mode-host: No such file or directory"}'
+        )
+        result = subprocess.CompletedProcess(
+            ["codex"], 0, stdout="", stderr=f"review result: {quoted}\n",
+        )
+        spec = importlib.util.spec_from_file_location("plan_workflow_quoted_error", SCRIPT)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        failure = module.classify_successful_exit_infrastructure_failure(
+            "codex", result, self.temp / "raw.json",
+        )
+        self.assertIsNone(failure)
 
     def test_infrastructure_failure_after_budget_reset_is_idempotently_reimbursed(self) -> None:
         self.request.write_text("# Objective\nFAKE_529\n", encoding="utf-8")
@@ -999,6 +1460,8 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(exported["status"], "READY")
         self.assertFalse(exported["provider_diversity"])
         self.assertFalse(exported["model_diversity"])
+        self.assertEqual(exported["assignment_providers"], {"draft-B": "claude"})
+        self.assertEqual(exported["automatic_fallbacks"], [])
 
         report = (Path(initialized["run_directory"]) / "final_report.md").read_text(encoding="utf-8")
         self.assertIn("Provider diversity: `false`", report)
@@ -1632,6 +2095,33 @@ class CodexTrustStoreTest(unittest.TestCase):
         self.assertNotIn("--dangerously", line)
         self.assertIn("read-only", line)
 
+    def test_matching_code_mode_host_is_mounted_once_at_codex_absolute_path(self) -> None:
+        worktree = self.home / "project"
+        worktree.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
+        context = self.home / "context"
+        context.mkdir()
+        invocation = self.home / "invocation"
+        executable = self.home / "release" / "bin" / "codex"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("binary", encoding="utf-8")
+        code_mode_host = executable.with_name("codex-code-mode-host")
+        code_mode_host.write_text("host", encoding="utf-8")
+        command = ["codex", "-o", str(invocation / "raw.json"), "prompt"]
+
+        def which(name: str) -> str | None:
+            return "/usr/bin/bwrap" if name == "bwrap" else str(executable) if name == "codex" else None
+
+        with mock.patch.object(self.module.shutil, "which", side_effect=which):
+            wrapper = self.module.isolated_agent_command(
+                command, {"agent_runtime": {"codex": {}}}, invocation, worktree, context)
+
+        self.assertEqual(wrapper.count("/opt/codex-code-mode-host"), 1)
+        destination = wrapper.index("/opt/codex-code-mode-host")
+        self.assertEqual(wrapper[destination - 2:destination + 1], [
+            "--ro-bind", str(code_mode_host.resolve()), "/opt/codex-code-mode-host",
+        ])
+
     def test_the_reviewer_can_read_what_it_reviews(self) -> None:
         """The per-model catalog truncates tool output at 10,000 tokens; a plan exceeds that.
 
@@ -1800,6 +2290,71 @@ class DshAdapterTest(unittest.TestCase):
         self.assertEqual(resolve("auto"), {"A": "claude", "B": "codex"})
         present("codex")
         self.assertEqual(resolve("auto"), {"A": "codex", "B": "codex"})
+
+    def test_host_aware_topology_prefers_codex_for_non_codex_hosts(self) -> None:
+        self.module.available = lambda provider: provider in {"claude", "codex", "dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "dsh"),
+            {"A": "dsh", "B": "codex"})
+        self.assertEqual(self.module.resolve_final_reviewer("auto", "dsh"), "dsh")
+
+        self.module.available = lambda provider: provider in {"dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "dsh"),
+            {"A": "dsh", "B": "dsh"})
+        self.assertEqual(self.module.resolve_final_reviewer("auto", "dsh"), "dsh")
+
+    def test_codex_host_prefers_claude_then_dsh_as_external_reviewer(self) -> None:
+        self.module.available = lambda provider: provider in {"claude", "codex", "dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "codex"),
+            {"A": "codex", "B": "claude"})
+        self.assertEqual(self.module.resolve_final_reviewer("auto", "codex"), "codex")
+
+    def test_other_host_prefers_codex_then_claude_then_dsh_and_finalizes_on_host(self) -> None:
+        self.module.available = lambda provider: provider in {"other", "claude", "codex", "dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "other"),
+            {"A": "other", "B": "codex"},
+        )
+        self.assertEqual(self.module.resolve_final_reviewer("auto", "other"), "other")
+
+        self.module.available = lambda provider: provider in {"other", "claude", "dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "other"),
+            {"A": "other", "B": "claude"},
+        )
+        self.module.available = lambda provider: provider in {"other", "dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "other"),
+            {"A": "other", "B": "dsh"},
+        )
+        self.module.available = lambda provider: provider == "other"
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "other"),
+            {"A": "other", "B": "other"},
+        )
+
+        self.module.available = lambda provider: provider in {"codex", "dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "codex"),
+            {"A": "codex", "B": "dsh"})
+        self.assertEqual(self.module.resolve_final_reviewer("auto", "codex"), "codex")
+
+    def test_explicit_peer_requires_a_bound_host_and_overrides_installed_priority(self) -> None:
+        self.module.available = lambda provider: provider in {"claude", "codex", "dsh"}
+        with self.assertRaisesRegex(self.module.WorkflowError, "requires --backend auto"):
+            self.module.resolve_host_topology("auto", None, "dsh")
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "codex", "dsh"),
+            {"A": "codex", "B": "dsh"})
+        self.assertEqual(
+            self.module.resolve_final_reviewer("auto", "codex", "dsh"), "codex")
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "dsh", "dsh"),
+            {"A": "dsh", "B": "dsh"})
+        self.assertEqual(
+            self.module.resolve_final_reviewer("auto", "dsh", "dsh"), "dsh")
 
     def test_dsh_single_backend_uses_two_isolated_instances(self) -> None:
         self.module.available = lambda provider: provider == "dsh"

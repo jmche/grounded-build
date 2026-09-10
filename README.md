@@ -45,8 +45,35 @@ Your repository at one frozen SHA
 
 ## Install
 
-Grounded Build is currently installed from source. It requires Linux, Git, bubblewrap, Python 3.11+
-and at least one authenticated supported agent CLI.
+Grounded Build is currently installed from source.
+
+### Prerequisites
+
+| Requirement | Why | Missing behaviour |
+|---|---|---|
+| Linux | Namespaces are the isolation primitive | Unsupported platform |
+| Git | Worktrees and atomic ref updates | Cannot initialize a run |
+| CPython 3.11–3.13 | Controller and workflow engine | Cannot start |
+| `bubblewrap` (`bwrap`) | The fixed-SHA verification sandbox, and the namespace every agent is launched into | Verification and agent launch refuse to run |
+| `socat` | Required by the provider CLI's own sandbox, which Grounded Build enables **fail-closed** for every planning and review invocation | The reviewer CLI refuses to start: `sandbox is enabled but dependencies are missing: socat not installed` |
+| At least one authenticated agent CLI | Planning slots and the independent reviewer | No adapter to invoke |
+
+`socat` is easy to miss because Grounded Build never invokes it directly — it is a transitive
+requirement of the provider CLI's sandbox, and it surfaces only as a CLI startup error at the first
+review. Install both sandbox packages together:
+
+```bash
+sudo apt install bubblewrap socat      # Debian/Ubuntu
+```
+
+Verify before the first run:
+
+```bash
+bwrap --version && command -v socat
+```
+
+There is no fallback for either. A missing sandbox dependency refuses to start rather than quietly
+downgrading to a weaker boundary, which is the same rule the rest of the workflow follows.
 
 ```bash
 git clone https://github.com/jmche/grounded-build.git
@@ -115,7 +142,12 @@ Plan and Implement are independent workflows with separate state and review boun
 
 Two isolated planning slots inspect one frozen Git commit. They investigate independently, draft
 independently, and cross-review evidence. Standard mode sends the host-synthesized plan to one fresh
-final reviewer; deep or explicitly high-assurance runs may send it to both.
+instance of the current host adapter for final review; deep or explicitly high-assurance runs may send
+it to both planning slots instead. Slot B and the implementation reviewer prefer a usable non-host
+adapter, while explicit user selections always win. If an auto-selected external B slot or
+implementation reviewer later reports a rate limit, that role persistently falls back to the host
+and retries the same work without consuming a quality attempt. Other failures and explicit choices
+stay on the audited manual recovery path.
 
 ```text
 frozen request + Git SHA
@@ -186,13 +218,18 @@ that installed the skill. Read [SECURITY.md](SECURITY.md) before using it with s
 | Linux | Yes | Bubblewrap and Linux namespaces are required. |
 | Python | 3.11–3.13 | Runtime uses only the standard library. |
 | Git | Yes | Worktrees and atomic ref updates are core primitives. |
+| `bubblewrap` | Required | Verification sandbox and agent launch namespaces. |
+| `socat` | Required | Needed by the provider CLI's fail-closed sandbox; not invoked by Grounded Build itself. |
 | Claude CLI | Plan + Implement reviewer | Tested through a restricted fresh process. |
 | Codex CLI | Plan + Implement reviewer | Adapter identity is separate from model identity. |
 | dsh | Plan + Implement reviewer | Uses the local harness selection unless overridden. |
+| Generic `other` bridge | Plan + Implement reviewer | One `grounded-build-other-v1` protocol supports conforming hosts without agent-specific engine branches. |
 | macOS / Windows | No | No silent fallback to a weaker sandbox is provided. |
 
-At least one provider CLI must already be installed and authenticated. Grounded Build never installs
-provider CLIs, project dependencies, or interpreters on your behalf.
+At least one provider CLI must already be installed and authenticated. For Pi, OpenCode, or another
+host without a built-in adapter, set `GROUNDED_BUILD_OTHER_COMMAND` to an absolute executable that
+implements the bridge protocol documented in `references/planning_workflow.md`. Grounded Build never
+installs provider CLIs, bridge wrappers, project dependencies, or interpreters on your behalf.
 
 ## Resume without guessing
 
@@ -207,7 +244,7 @@ deployments.
 
 ## Public beta status
 
-Version `v0.6.4` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
+Version `v0.7.0` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
 release gate are production-oriented, but broader provider and repository coverage is still needed
 before a general-availability claim.
 

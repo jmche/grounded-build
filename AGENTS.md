@@ -3,8 +3,8 @@
 # grounded-build
 
 ## Purpose
-A local coding-agent skill (v0.6.4, public beta) with two independent modes. **Plan** runs two
-isolated Claude/Codex/dsh CLI instances against one frozen Git SHA, has them investigate independently,
+A local coding-agent skill (v0.7.0, public beta) with two independent modes. **Plan** runs two
+isolated Claude/Codex/dsh/generic-bridge CLI instances against one frozen Git SHA, has them investigate independently,
 cross-review each other's evidence, and converge on a host-synthesized implementation plan. **Implement**
 executes an approved plan batch by batch in isolated Git worktrees with fixed-SHA independent review,
 bounded repair, and explicit final integration. The two modes never share state. The design premise is
@@ -16,7 +16,7 @@ next rather than reconstructing a state machine from prose.
 |------|-------------|
 | `SKILL.md` | Host-facing skill contract and entry point: routing (Plan / Implement / end-to-end), non-negotiable boundaries, and the command sequence for both workflows. Frontmatter carries `name`, `description`, and `metadata.version`. |
 | `README.md` | Human-facing overview, install location, examples, runtime notes, and coexistence rules with `implement-plan-with-review`. |
-| `VERSION` | Single source of truth for the release version (`0.6.4`). The release gate rejects drift against SKILL.md, README.md, CHANGELOG.md, and `scripts/plan_workflow.py`. |
+| `VERSION` | Single source of truth for the release version (`0.7.0`). The release gate rejects drift against SKILL.md, README.md, CHANGELOG.md, and `scripts/plan_workflow.py`. |
 | `CHANGELOG.md` | Semantic-versioned history; entries record measured behavior (e.g. limits derived from a completed 223-verification run), not intentions. |
 | `SECURITY.md` | Trust model, enforced bubblewrap/filesystem boundaries, the deliberate limit of local HMAC, and private vulnerability reporting. Content is asserted by the release gate. |
 | `LICENSE` | MIT license. The release gate requires it to start with `MIT License`. |
@@ -91,7 +91,9 @@ implementation run; later reviews consume only the digest-bound run snapshots.
 
 ### External
 - Python 3.11+ standard library only (`tomllib` requires 3.11) — no third-party runtime packages.
-- Git (worktrees are the isolation primitive), `bubblewrap` (sandbox namespaces), Linux.
+- Git (worktrees are the isolation primitive), `bubblewrap` (sandbox namespaces), `socat` (required
+  by the provider CLI's fail-closed sandbox; never invoked by this codebase, which is why it is easy
+  to omit from an install), Linux.
 - At least one provider CLI: `claude`, `codex`, or `dsh`. Exercised with Claude Code 2.1.238 and
   Codex CLI 0.149.0.
 

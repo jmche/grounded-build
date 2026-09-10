@@ -57,7 +57,7 @@ MAX_ENVIRONMENT_SCAN_SECONDS = 30.0
 MAX_INSTRUCTION_FILES = 16
 MAX_INSTRUCTION_BYTES = 1024 * 1024
 MAX_REVIEW_DIFF_BYTES = 4 * 1024 * 1024
-SUPPORTED_REVIEWERS = ("claude", "codex", "dsh")
+SUPPORTED_REVIEWERS = ("claude", "codex", "dsh", "other")
 DEFAULT_CLAUDE_REVIEWER_MODEL = "opus"
 DEFAULT_CODEX_REVIEWER_MODEL = "gpt-5.6-sol"
 TERMINAL_STATUSES = {"FINALIZED", "SUPERSEDED", "ABANDONED"}
@@ -477,6 +477,8 @@ def dsh_settings_selection(settings: Path) -> dict[str, str]:
 
 def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
     """Freeze the selected reviewer model separately from its CLI adapter."""
+    if reviewer == "other":
+        return planning_isolation_module().agent_runtime(args)["other"]
     if reviewer == "claude":
         requested = getattr(args, "claude_model", None)
         model = DEFAULT_CLAUDE_REVIEWER_MODEL if requested is None else requested
@@ -542,6 +544,96 @@ def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
             "identity_source": "explicit_override" if any((getattr(args, "codex_model", None),
                                                               getattr(args, "codex_model_provider", None),
                                                               profile)) else "grounded_build_default"}
+
+
+def select_implementation_reviewer(
+    args: argparse.Namespace, project: Path,
+) -> tuple[str, dict[str, Any], dict[str, dict[str, Any]]]:
+    """Resolve and verify an automatic implementation reviewer at the freeze boundary."""
+    if args.reviewer != "auto":
+        return args.reviewer, reviewer_runtime(args, args.reviewer), {}
+    host = getattr(args, "host_adapter", None)
+    if host not in SUPPORTED_REVIEWERS:
+        raise WorkflowError("--reviewer auto requires --host-adapter")
+    module = planning_isolation_module()
+    candidates = [*module.external_reviewer_preference(host), host]
+    checks: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        runtime = reviewer_runtime(args, candidate)
+        capability = module.adapter_capabilities(candidate)
+        if capability.get("ok"):
+            result = module.probe_provider(candidate, project, runtime=runtime)
+        else:
+            result = {
+                "provider": candidate, "ok": False,
+                "reason": "static requirements failed",
+            }
+        checks[candidate] = {**result, "capability": capability}
+        if checks[candidate]["ok"]:
+            return candidate, runtime, checks
+    raise WorkflowError(
+        "no implementation reviewer passed the initialization-bound capability probe: "
+        + json.dumps(checks, sort_keys=True)
+    )
+
+
+def automatic_implementation_host_fallback(
+    state: dict[str, Any], infrastructure: Any, invocation_id: str, phase: str,
+) -> dict[str, Any] | None:
+    """Replace an auto-selected rate-limited reviewer with the frozen host reviewer."""
+    host = state.get("host_adapter")
+    current = state.get("reviewer")
+    if not (
+        state.get("reviewer_requested") == "auto"
+        and getattr(infrastructure, "kind", None) == "RATE_LIMIT"
+        and isinstance(host, str)
+        and host in SUPPORTED_REVIEWERS
+        and current != host
+    ):
+        return None
+    module = planning_isolation_module()
+    capability = module.adapter_capabilities(host)
+    if not capability.get("ok"):
+        return None
+    runtime = state.get("host_reviewer_runtime") or {}
+    if runtime.get("adapter") != host:
+        return None
+    if host == "other":
+        executable = module.provider_executable("other")
+        if not (
+            executable
+            and runtime.get("executable") == str(executable)
+            and runtime.get("executable_sha256") == module.sha256_file(executable)
+        ):
+            return None
+    changed_at = utc_now()
+    change = {
+        "id": f"decision-{len(state.get('decisions', [])) + 1:03d}",
+        "type": "REVIEWER_AUTO_FALLBACK",
+        "from_reviewer": current,
+        "to_reviewer": host,
+        "reason": "auto-selected external reviewer hit a rate limit",
+        "infrastructure_kind": "RATE_LIMIT",
+        "trigger_invocation": invocation_id,
+        "phase": phase,
+        "created_at": changed_at,
+        "quality_rounds_reset": False,
+        "invocation_budgets_reset": False,
+        "finding_ledger_reset": False,
+    }
+    state["reviewer"] = host
+    state["reviewer_runtime"] = runtime
+    state.setdefault("automatic_reviewer_fallbacks", []).append(change)
+    state.setdefault("reviewer_history", []).append({
+        "reviewer": host,
+        "selected_at": changed_at,
+        "source": "AUTO_RATE_LIMIT_FALLBACK",
+        "decision_id": change["id"],
+        "reason": change["reason"],
+    })
+    state.setdefault("decisions", []).append(change)
+    append_event(state, "REVIEWER_AUTO_FALLBACK", change)
+    return change
 
 
 def git(path: Path, *args: str, check: bool = True) -> str:
@@ -1749,15 +1841,6 @@ def command_init(args: argparse.Namespace) -> None:
     if not plan.is_file():
         raise WorkflowError(f"plan file does not exist: {plan}")
     batch_manifest = Path(args.batch_manifest).expanduser().resolve()
-    if not shutil.which(args.reviewer):
-        raise WorkflowError(f"reviewer CLI is not available on PATH: {args.reviewer}")
-    runtime = reviewer_runtime(args, args.reviewer)
-    if args.reviewer == "dsh":
-        capability = planning_isolation_module().adapter_capabilities("dsh")
-        if not capability.get("ok"):
-            raise WorkflowError(
-                "dsh cannot prove the required headless overlay contract: "
-                + json.dumps(capability, sort_keys=True))
     ensure_no_git_operation(project)
     target = args.target_branch or git(project, "branch", "--show-current")
     if not target:
@@ -1768,6 +1851,25 @@ def command_init(args: argparse.Namespace) -> None:
     batches = parse_batches(args.batches)
     validate_batch_manifest(batch_manifest, batches)
     instruction_sources = load_instruction_files(args.instruction_file)
+    environment_contract = project_environment_contract(project)
+    # Complete every free, deterministic input check before an automatic selection can make a
+    # paid provider call. The probe then binds the exact runtime that this initialization freezes.
+    reviewer, runtime, reviewer_selection_checks = select_implementation_reviewer(args, project)
+    host_reviewer_runtime = (
+        reviewer_runtime(args, args.host_adapter)
+        if args.reviewer == "auto" and args.host_adapter else None
+    )
+    if reviewer == "other":
+        reviewer_available = bool(runtime.get("executable"))
+    else:
+        reviewer_available = shutil.which(reviewer) is not None
+    if not reviewer_available:
+        raise WorkflowError(f"reviewer CLI is not available on PATH: {reviewer}")
+    capability = planning_isolation_module().adapter_capabilities(reviewer)
+    if not capability.get("ok"):
+        raise WorkflowError(
+            f"{reviewer} cannot prove the required reviewer capability contract: "
+            + json.dumps(capability, sort_keys=True))
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_id = f"{timestamp}-{slug(plan.stem, 32)}-{secrets.token_hex(3)}"
     run_root = run_directory(project, run_id)
@@ -1824,14 +1926,18 @@ def command_init(args: argparse.Namespace) -> None:
         "batch_manifest_digest": sha256_file(batch_manifest),
         "batch_manifest_snapshot_digest": sha256_file(manifest_snapshot),
         "instruction_snapshots": instruction_snapshots,
-        "reviewer": args.reviewer,
+        "reviewer": reviewer,
         "reviewer_runtime": runtime,
+        "reviewer_requested": args.reviewer,
+        "host_adapter": args.host_adapter,
+        "host_reviewer_runtime": host_reviewer_runtime,
+        "reviewer_selection_checks": reviewer_selection_checks,
         "controller_runtime": controller_runtime(),
         "project_runtime_at_start": before["project_runtime"],
-        "environment_contract": project_environment_contract(project),
+        "environment_contract": environment_contract,
         "review_contract": review_contract,
         "reviewer_history": [{
-            "reviewer": args.reviewer, "selected_at": utc_now(), "source": "RUN_INITIALIZED",
+            "reviewer": reviewer, "selected_at": utc_now(), "source": "RUN_INITIALIZED",
             "actor": args.implementer,
         }],
         "implementer": args.implementer,
@@ -1927,7 +2033,11 @@ def command_init(args: argparse.Namespace) -> None:
             "batch_manifest_digest": state["batch_manifest_digest"],
             "batches": batches,
             "next_batch": batches[0],
+            "host_adapter": args.host_adapter,
+            "reviewer": reviewer,
+            "reviewer_selection_checks": reviewer_selection_checks,
             "reviewer_runtime": runtime,
+            "host_reviewer_runtime": host_reviewer_runtime,
             "controller_runtime": state["controller_runtime"],
             "project_runtime_at_start": state["project_runtime_at_start"],
         }
@@ -2179,6 +2289,11 @@ def reviewer_command(
     schema: dict[str, Any] = REVIEW_SCHEMA,
     runtime: dict[str, Any] | None = None,
 ) -> list[str]:
+    if reviewer == "other":
+        return planning_isolation_module().agent_command(
+            "other", reviewer_path, context_dir, schema, raw_path, prompt,
+            runtime=runtime, allow_web=False,
+        )
     if reviewer == "dsh":
         # dsh-headless has no structured-output flag, so the schema travels IN the prompt and the
         # host parses the printed final message. Contract review needs no writable output channel.
@@ -2244,12 +2359,12 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
             if isinstance(payload, dict):
                 return payload
         raise WorkflowError("dsh output did not contain a structured review result")
-    if reviewer == "codex":
+    if reviewer in {"codex", "other"}:
         source = raw_path.read_text(encoding="utf-8") if raw_path.is_file() else stdout
         try:
             payload = json.loads(source)
         except json.JSONDecodeError as exc:
-            raise WorkflowError(f"Codex returned invalid structured output: {exc}") from exc
+            raise WorkflowError(f"{reviewer} returned invalid structured output: {exc}") from exc
         return payload
     try:
         wrapper = json.loads(stdout)
@@ -2304,6 +2419,27 @@ def isolated_reviewer_command(
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         raise WorkflowError(f"could not construct the fail-closed reviewer sandbox: {exc}") from exc
+
+
+def successful_reviewer_infrastructure_failure(
+    reviewer: str, result: subprocess.CompletedProcess[str], raw_path: Path,
+) -> Any | None:
+    """Reuse the planning adapter's evidence-based zero-exit failure classification.
+
+    Some Codex releases can exit successfully and still emit a schema-valid answer after the
+    repository read tool failed to start. The shared classifier requires the router's ERROR
+    record, so an advisory startup warning alone remains non-fatal.
+    """
+    module = planning_isolation_module()
+    if reviewer == "claude":
+        try:
+            module.extract_payload(reviewer, result, raw_path)
+        except module.ProviderInfrastructureError as exc:
+            return exc
+    failure = module.classify_successful_exit_infrastructure_failure(
+        reviewer, result, raw_path,
+    )
+    return failure
 
 
 def contract_digest(criteria: list[dict[str, Any]]) -> str:
@@ -2532,10 +2668,57 @@ def command_contract_review(args: argparse.Namespace) -> None:
     if state["reviewer"] == "claude":
         raw_path.write_text(result.stdout, encoding="utf-8")
     if result.returncode != 0:
-        invocation.update({"status": "INFRA_ERROR", "returncode": result.returncode, "completed_at": utc_now()})
-        append_event(state, "INVOCATION_INFRA_ERROR", {"invocation_id": invocation_id, "returncode": result.returncode})
+        infrastructure = planning_isolation_module().classify_failed_invocation(
+            state["reviewer"], result, raw_path,
+        )
+        invocation.update({
+            "status": "INFRA_ERROR", "returncode": result.returncode,
+            "error": str(infrastructure), "completed_at": utc_now(),
+        })
+        append_event(state, "INVOCATION_INFRA_ERROR", {
+            "invocation_id": invocation_id, "returncode": result.returncode,
+            "kind": infrastructure.kind,
+        })
+        fallback = automatic_implementation_host_fallback(
+            state, infrastructure, invocation_id, "CONTRACT_REVIEW",
+        )
         save_state(state)
+        if fallback:
+            emit({
+                "status": "REVIEWER_AUTO_FALLBACK", "reason": str(infrastructure),
+                "returncode": result.returncode, "run_id": state["run_id"],
+                "fallback": fallback, "retry_required": True,
+                "stderr_path": str(stderr_path),
+            }, 4)
         emit({"status": "REVIEWER_ERROR", "reason": "CLI_EXIT_NONZERO", "returncode": result.returncode, "run_id": state["run_id"], "stderr_path": str(stderr_path)}, 4)
+    hidden_infrastructure_failure = successful_reviewer_infrastructure_failure(
+        state["reviewer"], result, raw_path,
+    )
+    if hidden_infrastructure_failure:
+        invocation.update({
+            "status": "INFRA_ERROR", "error": str(hidden_infrastructure_failure),
+            "completed_at": utc_now(),
+        })
+        append_event(state, "INVOCATION_INFRA_ERROR", {
+            "invocation_id": invocation_id, "error": str(hidden_infrastructure_failure),
+        })
+        fallback = automatic_implementation_host_fallback(
+            state, hidden_infrastructure_failure, invocation_id, "CONTRACT_REVIEW",
+        )
+        save_state(state)
+        if fallback:
+            emit({
+                "status": "REVIEWER_AUTO_FALLBACK",
+                "reason": str(hidden_infrastructure_failure),
+                "run_id": state["run_id"], "fallback": fallback,
+                "retry_required": True, "stderr_path": str(stderr_path),
+                "raw_output_path": str(raw_path),
+            }, 4)
+        emit({
+            "status": "REVIEWER_ERROR", "reason": str(hidden_infrastructure_failure),
+            "run_id": state["run_id"], "stderr_path": str(stderr_path),
+            "raw_output_path": str(raw_path),
+        }, 4)
     try:
         payload = extract_review(state["reviewer"], result.stdout, raw_path)
         validate_contract_payload(payload, state)
@@ -4090,11 +4273,32 @@ def command_review(args: argparse.Namespace) -> None:
             },
         )
         if result.returncode != 0:
-            invocation.update({"status": "INFRA_ERROR", "returncode": result.returncode, "completed_at": utc_now()})
+            infrastructure = planning_isolation_module().classify_failed_invocation(
+                state["reviewer"], result, raw_path,
+            )
+            invocation.update({
+                "status": "INFRA_ERROR", "returncode": result.returncode,
+                "error": str(infrastructure), "completed_at": utc_now(),
+            })
             append_event(state, "INVOCATION_INFRA_ERROR", {
                 "invocation_id": invocation_id, "returncode": result.returncode,
+                "kind": infrastructure.kind,
             })
+            fallback = automatic_implementation_host_fallback(
+                state, infrastructure, invocation_id, f"BATCH_REVIEW:{args.batch}",
+            )
             save_state(state)
+            if fallback:
+                emit(
+                    {
+                        "status": "REVIEWER_AUTO_FALLBACK", "reason": str(infrastructure),
+                        "returncode": result.returncode, "run_id": state["run_id"],
+                        "batch": args.batch, "round": round_number,
+                        "fallback": fallback, "retry_required": True,
+                        "stderr_path": str(stderr_path), "raw_output_path": str(raw_path),
+                    },
+                    4,
+                )
             emit(
                 {
                     "status": "REVIEWER_ERROR", "reason": "CLI_EXIT_NONZERO",
@@ -4104,6 +4308,36 @@ def command_review(args: argparse.Namespace) -> None:
                 },
                 4,
             )
+        hidden_infrastructure_failure = successful_reviewer_infrastructure_failure(
+            state["reviewer"], result, raw_path,
+        )
+        if hidden_infrastructure_failure:
+            invocation.update({
+                "status": "INFRA_ERROR", "error": str(hidden_infrastructure_failure),
+                "completed_at": utc_now(),
+            })
+            append_event(state, "INVOCATION_INFRA_ERROR", {
+                "invocation_id": invocation_id, "error": str(hidden_infrastructure_failure),
+            })
+            fallback = automatic_implementation_host_fallback(
+                state, hidden_infrastructure_failure, invocation_id,
+                f"BATCH_REVIEW:{args.batch}",
+            )
+            save_state(state)
+            if fallback:
+                emit({
+                    "status": "REVIEWER_AUTO_FALLBACK",
+                    "reason": str(hidden_infrastructure_failure),
+                    "run_id": state["run_id"], "batch": args.batch,
+                    "round": round_number, "fallback": fallback,
+                    "retry_required": True, "stderr_path": str(stderr_path),
+                    "raw_output_path": str(raw_path),
+                }, 4)
+            emit({
+                "status": "REVIEWER_ERROR", "reason": str(hidden_infrastructure_failure),
+                "run_id": state["run_id"], "batch": args.batch, "round": round_number,
+                "stderr_path": str(stderr_path), "raw_output_path": str(raw_path),
+            }, 4)
     try:
         assert result is not None
         payload = extract_review(state["reviewer"], result.stdout, raw_path)
@@ -4593,6 +4827,11 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "implementation_sha": implementation_head,
         "reviewer": state["reviewer"], "reviewer_worktree": state["reviewer_worktree"],
         "reviewer_runtime": state.get("reviewer_runtime") or {},
+        "reviewer_requested": state.get("reviewer_requested"),
+        "host_reviewer_runtime": state.get("host_reviewer_runtime") or {},
+        "automatic_reviewer_fallbacks": state.get("automatic_reviewer_fallbacks", []),
+        "host_adapter": state.get("host_adapter"),
+        "reviewer_selection_checks": state.get("reviewer_selection_checks", {}),
         "controller_runtime": recorded_controller,
         "current_controller_runtime": current_controller,
         "controller_runtime_drift": controller_drift,
@@ -4850,7 +5089,10 @@ def write_final_report(state: dict[str, Any], integrated: bool) -> Path:
         f"- Project: `{state['project']}`\n- Project key: `{state['project_key']}`\n"
         f"- Run ID: `{state['run_id']}`\n- Plan: `{state['plan_snapshot']}`\n"
         f"- Plan SHA-256: `{state['plan_digest']}`\n- Reviewer: `{state['reviewer']}`\n"
+        f"- Host adapter: `{state.get('host_adapter') or 'unbound-legacy'}`\n"
+        f"- Reviewer selection checks: `{json.dumps(state.get('reviewer_selection_checks', {}), ensure_ascii=False, sort_keys=True)}`\n"
         f"- Reviewer history: `{json.dumps(state.get('reviewer_history', []), ensure_ascii=False, sort_keys=True)}`\n"
+        f"- Automatic reviewer fallbacks: `{json.dumps(state.get('automatic_reviewer_fallbacks', []), ensure_ascii=False, sort_keys=True)}`\n"
         f"- Implementer: `{state.get('implementer', 'legacy-unknown')}`\n"
         f"- Controller runtime: `{json.dumps(state.get('controller_runtime'), ensure_ascii=False, sort_keys=True)}`\n"
         f"- Project runtime at start: `{json.dumps(state.get('project_runtime_at_start'), ensure_ascii=False, sort_keys=True)}`\n"
@@ -5367,8 +5609,17 @@ def command_change_reviewer(args: argparse.Namespace) -> None:
     validate_active_state(project, state)
     if state.get("status") in {"FINALIZING", "READY_TO_FINALIZE", "FINAL_VERIFICATION_REQUIRED"}:
         raise WorkflowError(f"reviewer change is not meaningful from workflow status {state.get('status')}")
-    if not shutil.which(args.reviewer):
+    if args.reviewer == "other":
+        reviewer_available = planning_isolation_module().available("other")
+    else:
+        reviewer_available = shutil.which(args.reviewer) is not None
+    if not reviewer_available:
         raise WorkflowError(f"reviewer CLI is not available on PATH: {args.reviewer}")
+    capability = planning_isolation_module().adapter_capabilities(args.reviewer)
+    if not capability.get("ok"):
+        raise WorkflowError(
+            f"{args.reviewer} cannot prove the required reviewer capability contract: "
+            + json.dumps(capability, sort_keys=True))
     runtime = reviewer_runtime(args, args.reviewer)
     previous = state["reviewer"]
     previous_runtime = state.get("reviewer_runtime") or {}
@@ -5399,6 +5650,9 @@ def command_change_reviewer(args: argparse.Namespace) -> None:
         emit(preview)
     state["reviewer"] = args.reviewer
     state["reviewer_runtime"] = runtime
+    # A preview-first user change supersedes init-time automatic selection authority. Without this
+    # binding, a later quota error could silently undo the user's explicit reviewer choice.
+    state["reviewer_requested"] = args.reviewer
     history = state.setdefault("reviewer_history", [{
         "reviewer": previous, "selected_at": state.get("created_at"),
         "source": "LEGACY_STATE",
@@ -5608,7 +5862,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-manifest", required=True,
         help="host-authored run scope and mapping for every declared batch",
     )
-    init.add_argument("--reviewer", required=True, choices=SUPPORTED_REVIEWERS)
+    init.add_argument("--reviewer", required=True, choices=("auto", *SUPPORTED_REVIEWERS))
+    init.add_argument(
+        "--host-adapter", choices=SUPPORTED_REVIEWERS,
+        help="bind the current host adapter for automatic reviewer selection",
+    )
     init.add_argument("--implementer", default="current-host-agent")
     init.add_argument("--fix-policy", choices=("ask", "auto", "never"), default="ask")
     init.add_argument("--batches", required=True)

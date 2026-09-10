@@ -25,9 +25,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.6.4"
+VERSION = "0.7.0"
 SCHEMA_VERSION = 2
-SUPPORTED_PROVIDERS = ("claude", "codex", "dsh")
+SUPPORTED_PROVIDERS = ("claude", "codex", "dsh", "other")
+OTHER_BRIDGE_PROTOCOL = "grounded-build-other-v1"
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
 MAX_SYNTHESIS_SUBMISSIONS = 2
 MAX_INFRASTRUCTURE_ATTEMPTS = 3
@@ -348,8 +349,11 @@ def no_answer_detail(result: subprocess.CompletedProcess[str]) -> str:
 PROBE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "properties": {"provider": {"type": "string"}, "ready": {"type": "boolean"}},
-    "required": ["provider", "ready"],
+    "properties": {
+        "provider": {"type": "string"}, "ready": {"type": "boolean"},
+        "observed": {"type": "string"},
+    },
+    "required": ["provider", "ready", "observed"],
 }
 
 
@@ -357,17 +361,16 @@ def probe_provider(
     provider: str, project: Path, timeout: int = 180,
     runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Can this CLI authenticate and return one small schema object right now?
+    """Can this CLI authenticate, read one mounted file, and return a schema object right now?
 
     Cheap, and deliberately narrow. It answers the question that cost the most to answer the
     expensive way: a codex whose credentials never reached the sandbox spent 22 minutes and five
     401s before saying so, and the operator read it as a failed planning draft. One trivial call
     says it in seconds, before a topology is frozen around a provider that cannot deliver.
 
-    What it does NOT establish is reliability on a real assignment. A provider that answers this
-    can still spend a whole turn reading a repository and never emit its verdict -- which is what
-    happened three times after the credential fix landed. Capability is necessary and not
-    sufficient, and this reports capability only.
+    The file read is deliberate. The old probe asked the model not to inspect anything, so Codex
+    could pass it even when every production read failed because its code-mode host was absent.
+    This remains a narrow capability check, not proof that a provider will complete a long review.
 
     It runs through the SAME bubblewrap composition as a real invocation, which is the only way it
     can see the failure it exists to catch: the credentials that went missing went missing because
@@ -386,10 +389,14 @@ def probe_provider(
             raise WorkflowError("could not create the empty capability-probe repository")
         context = root / "context"
         context.mkdir(mode=0o700)
+        probe_token = secrets.token_hex(16)
+        probe_input = context / "probe-input.txt"
+        probe_input.write_text(probe_token + "\n", encoding="utf-8")
         raw = root / "raw.json"
         prompt = (
-            f"Reply with the schema object only: provider={provider}, ready=true. "
-            "Do not inspect anything. This is a capability check."
+            f"Read {probe_input}. Reply with the schema object only: provider={provider}, "
+            "ready=true, observed=<the exact file contents without the trailing newline>. "
+            "This is a capability check."
         )
         command = agent_command(provider, workspace, context, PROBE_SCHEMA, raw, prompt, runtime)
         command = isolated_agent_command(
@@ -408,8 +415,16 @@ def probe_provider(
         except WorkflowError as exc:
             return {"provider": provider, "ok": False, "reason": "invalid schema object",
                     "detail": str(exc)}
-        return {"provider": provider, "ok": isinstance(payload, dict) and payload.get("ready") is True,
-                "reason": "delivered a schema object"}
+        ok = (
+            isinstance(payload, dict) and payload.get("ready") is True
+            and payload.get("provider") == provider and payload.get("observed") == probe_token
+        )
+        return {
+            "provider": provider, "ok": ok,
+            "reason": (
+                "read the mounted probe and delivered a schema object"
+                if ok else "schema object did not reproduce the mounted probe contents"),
+        }
 
 
 def utc_now() -> str:
@@ -706,6 +721,34 @@ def persist_invocation_state(
             latest.setdefault("delivery_faults", {})[assignment] = fault
         elif clear_fault:
             latest.get("delivery_faults", {}).pop(assignment, None)
+        incoming_fallbacks = state.get("automatic_fallbacks") or []
+        known_fallbacks = {
+            (item.get("trigger_assignment"), item.get("at"))
+            for item in latest.setdefault("automatic_fallbacks", [])
+        }
+        for fallback in incoming_fallbacks:
+            identity = (fallback.get("trigger_assignment"), fallback.get("at"))
+            if identity not in known_fallbacks:
+                latest["automatic_fallbacks"].append(fallback)
+                known_fallbacks.add(identity)
+        if incoming_fallbacks:
+            latest.setdefault("slot_provider_overrides", {}).update(
+                state.get("slot_provider_overrides") or {}
+            )
+            known_notes = {
+                (item.get("assignment"), item.get("from"), item.get("to"), item.get("decided_at"))
+                for item in latest.setdefault("independence_notes", [])
+            }
+            for note in state.get("independence_notes") or []:
+                identity = (
+                    note.get("assignment"), note.get("from"), note.get("to"),
+                    note.get("decided_at"),
+                )
+                if identity not in known_notes:
+                    latest["independence_notes"].append(note)
+                    known_notes.add(identity)
+            latest["provider_diversity"] = False
+            latest["model_diversity"] = False
         incoming_decisions = dict(state.get("pending_decisions") or {})
         current = state.get("pending_decision")
         if current and current.get("assignment") == assignment:
@@ -935,8 +978,32 @@ def record_findings(state: dict[str, Any], findings: list[dict[str, Any]], sourc
             ledger[key]["observations"].append(observation)
 
 
+def resolve_other_bridge() -> tuple[Path | None, str | None]:
+    """Resolve the generic bridge while keeping an irrelevant bad setting non-authoritative."""
+    configured = os.environ.get("GROUNDED_BUILD_OTHER_COMMAND", "").strip()
+    if not configured:
+        return None, None
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        return None, "GROUNDED_BUILD_OTHER_COMMAND must be an absolute executable path"
+    resolved = candidate.resolve()
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        return (
+            None,
+            "GROUNDED_BUILD_OTHER_COMMAND does not name an executable file: " + str(resolved),
+        )
+    return resolved, None
+
+
+def provider_executable(provider: str) -> Path | None:
+    if provider == "other":
+        return resolve_other_bridge()[0]
+    executable = shutil.which(provider)
+    return Path(executable).resolve() if executable else None
+
+
 def available(provider: str) -> bool:
-    return shutil.which(provider) is not None
+    return provider_executable(provider) is not None
 
 
 @functools.lru_cache(maxsize=None)
@@ -944,7 +1011,8 @@ def executable_version(provider: str) -> str | None:
     """Return a short CLI version without making a model/API call."""
     if not available(provider):
         return None
-    executable = shutil.which(provider)
+    executable_path = provider_executable(provider)
+    executable = str(executable_path) if executable_path else None
     if not executable:
         return None
     # PATH is preserved so a script-based CLI (dsh is `#!/usr/bin/env node`) can resolve its
@@ -1092,6 +1160,7 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
         selected_claude_model = None
     if dsh_model == "cli-default":
         dsh_model = None
+    other_executable = provider_executable("other")
     runtime = {
         "codex": codex_runtime_identity(selected_codex_model, model_provider, profile),
         "claude": {
@@ -1102,6 +1171,14 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
                 "explicit_override" if claude_model is not None else "grounded_build_default"),
         },
         "dsh": dsh_runtime_identity(dsh_model, dsh_model_provider),
+        "other": {
+            "adapter": "other", "cli_version": executable_version("other"),
+            "model": None, "model_provider": None, "profile": None,
+            "model_family": "other", "identity_source": "generic_bridge",
+            "executable": str(other_executable) if other_executable else None,
+            "executable_sha256": sha256_file(other_executable) if other_executable else None,
+            "protocol": OTHER_BRIDGE_PROTOCOL,
+        },
     }
     if not explicit_codex:
         runtime["codex"]["identity_source"] = "grounded_build_default"
@@ -1110,9 +1187,40 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
 
 def adapter_capabilities(provider: str) -> dict[str, Any]:
     """Check the non-network CLI surface this workflow depends on."""
-    executable = shutil.which(provider)
-    if not executable:
+    if provider == "other":
+        _, configuration_error = resolve_other_bridge()
+        if configuration_error:
+            return {"ok": False, "missing": [configuration_error]}
+    executable_path = provider_executable(provider)
+    if not executable_path:
         return {"ok": False, "missing": ["executable"]}
+    executable = str(executable_path)
+    if provider == "other":
+        result = run(
+            [executable, "capabilities"], timeout=30,
+            env={**agent_environment(), "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        )
+        try:
+            declaration = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            declaration = None
+        required = {
+            "protocol": OTHER_BRIDGE_PROTOCOL,
+            "read_only": True,
+            "structured_output": True,
+            "fresh_process": True,
+        }
+        ok = result.returncode == 0 and isinstance(declaration, dict) and all(
+            declaration.get(key) == value for key, value in required.items()
+        )
+        return {
+            "ok": ok,
+            "missing": [] if ok else ["grounded-build-other-v1 capability declaration"],
+            "capability_exit": result.returncode,
+            "declaration": declaration,
+            "executable": executable,
+            "executable_sha256": sha256_file(executable_path),
+        }
     if provider == "codex":
         help_args = [executable, "exec", "--help"]
         required = ["--output-schema", "--output-last-message", "--ephemeral", "--sandbox", "--config"]
@@ -1129,6 +1237,18 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
     missing = [flag for flag in required if flag not in text]
     capability = {"ok": result.returncode == 0 and not missing, "missing": missing,
                   "help_exit": result.returncode}
+    if provider == "codex":
+        # The enforced Codex policy exposes repository reads through code-mode. Standalone
+        # releases ship the matching host beside the resolved CLI; without it the CLI can still
+        # authenticate and emit JSON but cannot perform the review it is being selected for.
+        code_mode_host = Path(executable).resolve().with_name("codex-code-mode-host")
+        host_ready = code_mode_host.is_file() and os.access(code_mode_host, os.X_OK)
+        capability["code_mode_host"] = {
+            "ok": host_ready, "path": str(code_mode_host) if host_ready else None,
+        }
+        capability["ok"] = bool(capability["ok"] and host_ready)
+        if not host_ready:
+            capability["missing"].append("matching executable codex-code-mode-host")
     if provider == "dsh" and capability["ok"]:
         profile_help = run([executable, "--profile", "headless", "--help"], timeout=30)
         profile_ready = profile_help.returncode == 0
@@ -1191,8 +1311,38 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
 
 
 def resolve_topology(backend: str) -> dict[str, str]:
+    return resolve_host_topology(backend, None)
+
+
+def external_reviewer_preference(host_adapter: str) -> tuple[str, ...]:
+    """Ordered fresh-CLI reviewers outside the host's own adapter identity."""
+    if host_adapter == "codex":
+        return ("claude", "dsh")
+    if host_adapter == "other":
+        return ("codex", "claude", "dsh")
+    return ("codex",)
+
+
+def resolve_host_topology(
+    backend: str, host_adapter: str | None, peer_reviewer: str = "auto",
+) -> dict[str, str]:
     present = {name for name in SUPPORTED_PROVIDERS if available(name)}
+    if peer_reviewer != "auto" and (backend != "auto" or not host_adapter):
+        raise WorkflowError("--peer-reviewer requires --backend auto and --host-adapter")
     if backend == "auto":
+        if host_adapter:
+            if host_adapter not in present:
+                raise WorkflowError(f"host adapter is unavailable: {host_adapter}")
+            if peer_reviewer != "auto":
+                if peer_reviewer not in present:
+                    raise WorkflowError(f"peer reviewer is unavailable: {peer_reviewer}")
+                external = peer_reviewer
+            else:
+                external = next(
+                    (name for name in external_reviewer_preference(host_adapter) if name in present),
+                    None,
+                )
+            return {"A": host_adapter, "B": external or host_adapter}
         # Take the first two available adapters in preference order; a missing adapter degrades to
         # the next one, and a lone adapter fills both slots as two isolated instances (same adapter,
         # not model-diverse). The third entry in AUTO_PREFERENCE is the fallback.
@@ -1205,6 +1355,110 @@ def resolve_topology(backend: str) -> dict[str, str]:
     if backend not in SUPPORTED_PROVIDERS or backend not in present:
         raise WorkflowError(f"requested provider is unavailable: {backend}")
     return {"A": backend, "B": backend}
+
+
+def resolve_final_reviewer(
+    selected: str, host_adapter: str | None, peer_provider: str | None = None,
+) -> str:
+    if selected != "auto":
+        if selected != "both" and not available(selected):
+            raise WorkflowError(f"final reviewer is unavailable: {selected}")
+        return selected
+    if not host_adapter:
+        raise WorkflowError("--final-reviewer auto requires --host-adapter")
+    if not available(host_adapter):
+        raise WorkflowError(f"host adapter is unavailable: {host_adapter}")
+    return host_adapter
+
+
+def verify_provider_selection(
+    provider: str, project: Path, runtime: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify static requirements and one real read using the exact runtime about to be frozen."""
+    capability = adapter_capabilities(provider)
+    if not capability.get("ok"):
+        return {
+            "provider": provider, "ok": False, "reason": "static requirements failed",
+            "capability": capability,
+        }
+    return {
+        **probe_provider(provider, project, runtime=runtime),
+        "capability": capability,
+    }
+
+
+def resolve_verified_host_selection(
+    args: argparse.Namespace, project: Path, runtime: dict[str, dict[str, Any]],
+    *, perform_probe: bool = True,
+) -> tuple[dict[str, str], str | None, str, dict[str, dict[str, Any]]]:
+    """Resolve host-aware routing from checks performed at the initialization boundary."""
+    host = args.host_adapter
+    topology = resolve_host_topology(args.backend, host, args.peer_reviewer)
+    frozen_peer = topology["B"] if host and args.backend == "auto" else None
+    final_reviewer = resolve_final_reviewer(args.final_reviewer, host, frozen_peer)
+    if not host:
+        return topology, frozen_peer, final_reviewer, {}
+
+    checks: dict[str, dict[str, Any]] = {}
+
+    def check(provider: str) -> dict[str, Any]:
+        if provider not in checks:
+            if perform_probe:
+                checks[provider] = verify_provider_selection(provider, project, runtime[provider])
+            else:
+                capability = adapter_capabilities(provider)
+                checks[provider] = {
+                    "provider": provider, "ok": bool(capability.get("ok")),
+                    "reason": "static requirements passed" if capability.get("ok")
+                    else "static requirements failed",
+                    "capability": capability,
+                }
+        return checks[provider]
+
+    host_is_selected = args.backend == "auto" or args.final_reviewer == "auto"
+    if host_is_selected:
+        host_check = check(host)
+        if not host_check["ok"]:
+            raise WorkflowError(
+                "host adapter failed the initialization-bound capability probe: "
+                + json.dumps(host_check, sort_keys=True)
+            )
+
+    if args.backend == "auto":
+        if args.peer_reviewer != "auto":
+            peer_check = check(args.peer_reviewer)
+            if not peer_check["ok"]:
+                raise WorkflowError(
+                    "explicit peer reviewer failed the initialization-bound capability probe: "
+                    + json.dumps(peer_check, sort_keys=True)
+                )
+            frozen_peer = args.peer_reviewer
+        else:
+            frozen_peer = host
+            for candidate in external_reviewer_preference(host):
+                if check(candidate)["ok"]:
+                    frozen_peer = candidate
+                    break
+        topology = {"A": host, "B": frozen_peer}
+
+    if args.final_reviewer == "auto":
+        final_reviewer = host
+    elif args.final_reviewer != "both":
+        final_check = check(args.final_reviewer)
+        if not final_check["ok"]:
+            raise WorkflowError(
+                "explicit final reviewer failed the initialization-bound capability probe: "
+                + json.dumps(final_check, sort_keys=True)
+            )
+
+    for provider in set(topology.values()):
+        provider_check = check(provider)
+        if not provider_check["ok"]:
+            raise WorkflowError(
+                "selected planner failed the initialization-bound capability probe: "
+                + json.dumps(provider_check, sort_keys=True)
+            )
+    return topology, frozen_peer, final_reviewer, checks
 
 
 def required_final_reviewers(state: dict[str, Any]) -> dict[str, str]:
@@ -1277,6 +1531,9 @@ def write_terminal_report(state: dict[str, Any], outcome: str) -> Path:
         f"- Run: `{state['run_id']}`\n"
         f"- Baseline: `{state['baseline_sha']}`\n"
         f"- Engine contract: `{json.dumps(state.get('engine_contract', {}), sort_keys=True)}`\n"
+        f"- Host adapter: `{state.get('host_adapter') or 'unbound-legacy'}`\n"
+        f"- Peer reviewer: `{state.get('peer_reviewer') or 'unbound-legacy'}`\n"
+        f"- Selection checks: `{json.dumps(state.get('selection_checks', {}), sort_keys=True)}`\n"
         f"- Planners: `{json.dumps(state['planners'], sort_keys=True)}`\n"
         f"- Provider diversity: `{str(state['provider_diversity']).lower()}`\n"
         f"- Model diversity: `{str(state.get('model_diversity', False)).lower()}`\n"
@@ -1285,6 +1542,7 @@ def write_terminal_report(state: dict[str, Any], outcome: str) -> Path:
         f"- Resource usage: `{json.dumps(state.get('resource_usage', {}), sort_keys=True)}`\n"
         f"- Quality attempts: `{json.dumps(state.get('usage', {}), sort_keys=True)}`\n"
         f"- Infrastructure attempts: `{json.dumps(state.get('infrastructure_usage', {}), sort_keys=True)}`\n"
+        f"- Automatic provider fallbacks: `{json.dumps(state.get('automatic_fallbacks', []), sort_keys=True)}`\n"
         f"- Candidate: `{json.dumps(candidate, sort_keys=True)}`\n"
         f"- Reviews: `{json.dumps(reviews, sort_keys=True)}`\n"
         f"- Abandonment: `{json.dumps(abandoned, sort_keys=True)}`\n"
@@ -1345,19 +1603,74 @@ def budget_reset_due(used: int, charged: list[str], digest: str) -> bool:
 
 
 def assignment_provider(state: dict[str, Any], assignment: str, default: str) -> str:
-    """Which CLI serves this assignment, after any recorded reassignment.
+    """Which CLI serves this assignment after a recorded exact or slot-wide change.
 
     Topology is frozen at init, and that is right: a run that quietly swaps providers mid-flight
     is a run whose independence claim means nothing. But a frozen topology with no escape turns
     one unusable provider into a dead run -- the alternative being to abandon and re-draft
     everything, which costs the work that DID succeed.
 
-    So reassignment exists and is loud: an explicit user decision, recorded in the decisions
-    directory, listed in ``independence_notes``, and surfaced by ``export``. The skill's rule is
-    not "never share a provider" -- it is "never DESCRIBE two instances of one provider as
-    model-diverse". This keeps the description true while letting the run finish.
+    A user may reassign one exact invocation. Separately, an auto-selected B provider that reports
+    a rate limit moves the remaining B slot to the frozen host. Both changes are recorded and
+    downgrade diversity rather than describing two instances of one provider as model-diverse.
     """
-    return (state.get("assignment_providers") or {}).get(assignment, default)
+    exact = (state.get("assignment_providers") or {}).get(assignment)
+    if exact:
+        return exact
+    slot = assignment.rsplit("-", 1)[-1]
+    return (state.get("slot_provider_overrides") or {}).get(slot, default)
+
+
+def automatic_planning_host_fallback(
+    state: dict[str, Any], assignment: str, slot: str, provider: str,
+    infrastructure: ProviderInfrastructureError,
+) -> dict[str, Any] | None:
+    """Persist an auto-selected B slot's rate-limit fallback to its frozen host."""
+    host = state.get("host_adapter")
+    if not (
+        infrastructure.kind == "RATE_LIMIT"
+        and slot == "B"
+        and state.get("backend_requested") == "auto"
+        and state.get("peer_reviewer_requested") == "auto"
+        and assignment not in (state.get("assignment_providers") or {})
+        and isinstance(host, str)
+        and host in SUPPORTED_PROVIDERS
+        and provider != host
+    ):
+        return None
+    capability = adapter_capabilities(host)
+    if not capability.get("ok"):
+        return None
+    runtime = (state.get("agent_runtime") or {}).get(host) or {}
+    if host == "other":
+        executable = provider_executable("other")
+        if not (
+            executable
+            and runtime.get("executable") == str(executable)
+            and runtime.get("executable_sha256") == sha256_file(executable)
+        ):
+            return None
+    fallback = {
+        "type": "AUTOMATIC_RATE_LIMIT_FALLBACK",
+        "scope": "slot-B",
+        "trigger_assignment": assignment,
+        "from": provider,
+        "to": host,
+        "infrastructure_kind": infrastructure.kind,
+        "at": utc_now(),
+        "quality_attempt_consumed": False,
+        "persistent_for_remaining_slot_assignments": True,
+    }
+    state.setdefault("slot_provider_overrides", {})["B"] = host
+    state.setdefault("automatic_fallbacks", []).append(fallback)
+    state.setdefault("independence_notes", []).append({
+        "assignment": "slot-B", "from": provider, "to": host,
+        "reason": "auto-selected external slot hit a rate limit; remaining B work uses the host",
+        "decided_at": fallback["at"], "automatic": True,
+    })
+    state["provider_diversity"] = False
+    state["model_diversity"] = False
+    return fallback
 
 
 def planning_worktrees(state: dict[str, Any]) -> list[Path]:
@@ -1402,6 +1715,22 @@ def agent_command(
     provider: str, worktree: Path, context: Path, schema: dict[str, Any], raw: Path, prompt: str,
     runtime: dict[str, Any] | None = None, allow_web: bool = False,
 ) -> list[str]:
+    if provider == "other":
+        runtime = runtime or {}
+        executable = runtime.get("executable")
+        if not isinstance(executable, str) or not executable:
+            raise WorkflowError("other adapter has no frozen bridge executable")
+        schema_path = context / "schema.json"
+        prompt_path = context / "prompt.md"
+        atomic_json(schema_path, schema)
+        prompt_path.write_text(prompt, encoding="utf-8")
+        prompt_path.chmod(0o600)
+        return [
+            executable, "run", "--protocol", OTHER_BRIDGE_PROTOCOL,
+            "--workspace", str(worktree), "--context", str(context),
+            "--schema", str(schema_path), "--output", str(raw),
+            "--prompt", str(prompt_path), "--web", "enabled" if allow_web else "disabled",
+        ]
     if provider == "dsh":
         # dsh-headless has no structured-output flag, so the schema travels IN the prompt and the
         # host parses and validates the printed final message (approach (a)). The adapter is told
@@ -1553,7 +1882,17 @@ def isolated_agent_command(
     private_tmp = invocation_root / "tmp"
     private_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
-    provider = Path(command[0]).name
+    other_runtime = ((state.get("agent_runtime") or {}).get("other") or {})
+    frozen_other = other_runtime.get("executable")
+    provider = (
+        "other"
+        if isinstance(frozen_other, str) and Path(frozen_other).resolve() == executable
+        else Path(command[0]).name
+    )
+    if provider == "other":
+        expected_digest = other_runtime.get("executable_sha256")
+        if not isinstance(expected_digest, str) or sha256_file(executable) != expected_digest:
+            raise WorkflowError("other bridge executable changed after runtime selection")
     controller_inputs: list[Path] = []
     writable_outputs: list[Path] = []
     credential_mounts: list[tuple[Path, Path]] = []
@@ -1581,8 +1920,8 @@ def isolated_agent_command(
             }
         }
         command[1:1] = ["--settings", json.dumps(sandbox_settings, separators=(",", ":"))]
-    elif provider == "codex":
-        raw_index = command.index("-o") + 1
+    elif provider in {"codex", "other"}:
+        raw_index = command.index("--output" if provider == "other" else "-o") + 1
         raw_output = Path(command[raw_index])
         descriptor = os.open(
             raw_output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -1697,6 +2036,15 @@ def isolated_agent_command(
         wrapper.extend(["--dir", "/opt", "--ro-bind", str(executable), "/opt/grounded-build-agent"])
     for source, destination in runtime_mounts:
         wrapper.extend(["--ro-bind", str(source), str(destination)])
+    # Standalone Codex keeps the matching code-mode host beside the versioned CLI executable but
+    # spawns it at /opt/codex-code-mode-host. Resolve beside the executable so an old frozen CLI
+    # never receives a host from a different `current` release, then mount that one binary read-only.
+    if provider == "codex":
+        code_mode_host = executable.with_name("codex-code-mode-host")
+        if code_mode_host.is_file():
+            wrapper.extend([
+                "--ro-bind", str(code_mode_host.resolve()), "/opt/codex-code-mode-host",
+            ])
     for system_path in ("/usr", "/bin", "/lib", "/lib64"):
         if Path(system_path).exists():
             wrapper.extend(["--ro-bind", system_path, system_path])
@@ -1751,7 +2099,11 @@ def extract_dsh_object(provider: str, source: str) -> dict[str, Any]:
 
 
 def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw: Path) -> dict[str, Any]:
-    source = raw.read_text(encoding="utf-8") if provider == "codex" and raw.is_file() else result.stdout
+    source = (
+        raw.read_text(encoding="utf-8")
+        if provider in {"codex", "other"} and raw.is_file()
+        else result.stdout
+    )
     if not source.strip():
         raise NoFinalAnswer(f"{provider} ended its turn without a final message"
                             f"{no_answer_detail(result)}")
@@ -1761,7 +2113,7 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
         wrapper = json.loads(source)
     except json.JSONDecodeError as exc:
         raise NoFinalAnswer(describe_unparseable(provider, source, exc)) from exc
-    if provider == "codex":
+    if provider in {"codex", "other"}:
         payload = wrapper
     else:
         if wrapper.get("is_error"):
@@ -1770,7 +2122,7 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
             joined = f"{status} {detail}".lower()
             if "401" in joined or "auth" in joined or "unauthorized" in joined:
                 kind, retryable = "AUTHENTICATION", False
-            elif "429" in joined or "rate" in joined or "quota" in joined:
+            elif status == "429" or is_rate_limit_failure(detail):
                 kind, retryable = "RATE_LIMIT", True
             elif "529" in joined or "overload" in joined:
                 kind, retryable = "PROVIDER_OVERLOAD", True
@@ -1795,7 +2147,7 @@ def classify_failed_invocation(
     lowered = detail.lower()
     if "401" in lowered or "unauthorized" in lowered or "authentication" in lowered:
         return ProviderInfrastructureError(provider, "AUTHENTICATION", detail, retryable=False)
-    if "429" in lowered or "rate limit" in lowered or "quota" in lowered:
+    if is_rate_limit_failure(lowered):
         return ProviderInfrastructureError(provider, "RATE_LIMIT", detail, retryable=True)
     if "529" in lowered or "overload" in lowered:
         return ProviderInfrastructureError(provider, "PROVIDER_OVERLOAD", detail, retryable=True)
@@ -1803,6 +2155,57 @@ def classify_failed_invocation(
         return ProviderInfrastructureError(provider, "TOOL_HOST_STARTUP", detail, retryable=False)
     return ProviderInfrastructureError(
         provider, "ADAPTER_EXIT", detail or f"exit code {result.returncode}", retryable=True)
+
+
+def is_rate_limit_failure(detail: str) -> bool:
+    """Recognize bounded provider rate-limit evidence, not incidental identifiers."""
+    lowered = detail.lower()
+    if any(marker in lowered for marker in (
+        "rate limit", "rate_limit", "ratelimit", "too many requests",
+        "rate exceeded", "insufficient_quota",
+    )):
+        return True
+    if any(re.search(pattern, lowered) for pattern in (
+        r"\bhttp(?:\s+status)?\s*[:=]?\s*429\b",
+        r"\bstatus(?:\s+code)?\s*[:=]?\s*429\b",
+        r"\b(?:error|response)\s+(?:code\s*)?[:=]?\s*429\b",
+        r"\b429\s+(?:rate|quota|too\s+many\s+requests)\b",
+    )):
+        return True
+    exhaustion = r"(?:exhausted|exceeded|depleted|reached|used\s+up|hit)"
+    return bool(
+        re.search(rf"\b(?:quota|usage\s+limit)\b.{{0,48}}\b{exhaustion}\b", lowered)
+        or re.search(rf"\b{exhaustion}\b.{{0,48}}\b(?:quota|usage\s+limit)\b", lowered)
+    )
+
+
+def classify_successful_exit_infrastructure_failure(
+    provider: str, result: subprocess.CompletedProcess[str], raw: Path,
+) -> ProviderInfrastructureError | None:
+    """Recognize machine-reported tool failure hidden behind an adapter exit code of zero.
+
+    Codex may emit a schema-valid final answer after every attempted file read failed. Its startup
+    warning alone is not proof of impact: only the router's ERROR record establishes that the
+    unavailable host was actually called during this invocation.
+    """
+    if provider != "codex":
+        return None
+    for line in (result.stderr or "").splitlines():
+        router_record = re.match(
+            r"^(?:\d{4}-\d{2}-\d{2}T\S+\s+)?ERROR codex_core::tools::router:\s*(.*)$",
+            line.strip(), flags=re.IGNORECASE,
+        )
+        if not router_record:
+            continue
+        lowered = router_record.group(1).lower()
+        if (
+            "code-mode-host" in lowered
+            and ("failed to spawn" in lowered or "not found" in lowered or "no such file" in lowered)
+        ):
+            detail = line.strip()[-1200:]
+            return ProviderInfrastructureError(
+                provider, "TOOL_HOST_STARTUP", detail, retryable=False)
+    return None
 
 
 def tree_bytes(path: Path) -> int:
@@ -2071,6 +2474,8 @@ def invoke(
     infrastructure_error: ProviderInfrastructureError | None = None
     if result.returncode != 0:
         infrastructure_error = classify_failed_invocation(provider, result, raw)
+    else:
+        infrastructure_error = classify_successful_exit_infrastructure_failure(provider, result, raw)
     try:
         if infrastructure_error:
             raise infrastructure_error
@@ -2098,19 +2503,28 @@ def invoke(
         if digest_added and digest in state["charged_context_digests"][assignment]:
             state["charged_context_digests"][assignment].remove(digest)
         resume_status = state["status"]
-        state["status"] = "NEEDS_USER_DECISION"
-        state["pending_decision"] = {
-            "type": "PROVIDER_INFRASTRUCTURE_FAILURE", "assignment": assignment,
-            "provider": provider, "kind": exc.kind, "detail": exc.detail,
-            "retryable": exc.retryable, "attempt": count,
-            "maximum_infrastructure_attempts": MAX_INFRASTRUCTURE_ATTEMPTS,
-            "resume_status": resume_status, "created_at": utc_now(),
-            "choices": (["RESOLVE_AND_CONTINUE", "REASSIGN_ASSIGNMENT", "ABANDON"]
-                        if count < MAX_INFRASTRUCTURE_ATTEMPTS else
-                        ["REASSIGN_ASSIGNMENT", "ABANDON"]),
-        }
+        fallback = automatic_planning_host_fallback(
+            state, assignment, slot, provider, exc,
+        )
+        if fallback:
+            state["status"] = resume_status
+            state["pending_decision"] = None
+        else:
+            state["status"] = "NEEDS_USER_DECISION"
+            state["pending_decision"] = {
+                "type": "PROVIDER_INFRASTRUCTURE_FAILURE", "assignment": assignment,
+                "provider": provider, "kind": exc.kind, "detail": exc.detail,
+                "retryable": exc.retryable, "attempt": count,
+                "maximum_infrastructure_attempts": MAX_INFRASTRUCTURE_ATTEMPTS,
+                "resume_status": resume_status, "created_at": utc_now(),
+                "choices": (["RESOLVE_AND_CONTINUE", "REASSIGN_ASSIGNMENT", "ABANDON"]
+                            if count < MAX_INFRASTRUCTURE_ATTEMPTS else
+                            ["REASSIGN_ASSIGNMENT", "ABANDON"]),
+            }
         invocation_record["status"] = "INFRASTRUCTURE_FAILURE"
         invocation_record["diagnostic"] = str(exc)
+        if fallback:
+            invocation_record["automatic_fallback"] = fallback
         update_resource_usage(state, metrics)
         atomic_json(invocation_path, invocation_record)
         record_artifact(state, f"{artifact_prefix}-record", invocation_path)
@@ -2502,8 +2916,23 @@ def synthesis_diagnostics(
 
 def command_preflight(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
-    topology = resolve_topology(args.backend)
     runtime = agent_runtime(args)
+    selection_checks: dict[str, dict[str, Any]] = {}
+    if args.host_adapter and args.peer_reviewer == "auto":
+        selection_args = argparse.Namespace(**vars(args), final_reviewer="auto")
+        topology, frozen_peer, preferred_final, selection_checks = (
+            resolve_verified_host_selection(
+                selection_args, project, runtime, perform_probe=args.probe,
+            )
+        )
+    else:
+        topology = resolve_host_topology(args.backend, args.host_adapter, args.peer_reviewer)
+        frozen_peer = topology["B"] if args.host_adapter and args.backend == "auto" else None
+        preferred_final = (
+            resolve_final_reviewer("auto", args.host_adapter, frozen_peer)
+            if args.host_adapter else None
+        )
+    selected_adapters = set(topology.values()) | ({preferred_final} if preferred_final else set())
     baseline = git(project, "rev-parse", "--verify", f"{args.base_ref}^{{commit}}")
     payload = {
         "status": "PREFLIGHT_OK",
@@ -2512,16 +2941,20 @@ def command_preflight(args: argparse.Namespace) -> None:
         "baseline_sha": baseline,
         "clean": not bool(git(project, "status", "--porcelain")),
         "planners": topology,
+        "host_adapter": args.host_adapter,
+        "peer_reviewer": frozen_peer,
+        "preferred_final_reviewer": preferred_final,
+        "selection_checks": selection_checks,
         "provider_diversity": len(set(topology.values())) > 1,
         "model_diversity": model_diversity(topology, runtime),
-        "agent_runtime": {name: runtime[name] for name in sorted(set(topology.values()))},
-        "runtime_warnings": runtime_warnings({name: runtime[name] for name in set(topology.values())}),
+        "agent_runtime": {name: runtime[name] for name in sorted(selected_adapters)},
+        "runtime_warnings": runtime_warnings({name: runtime[name] for name in selected_adapters}),
         "capabilities": {
             "bubblewrap": shutil.which("bwrap") is not None,
             "git": executable_version("git"),
             "python": sys.version.split()[0],
             "adapters": {
-                name: adapter_capabilities(name) for name in sorted(set(topology.values()))
+                name: adapter_capabilities(name) for name in sorted(selected_adapters)
             },
         },
     }
@@ -2532,12 +2965,12 @@ def command_preflight(args: argparse.Namespace) -> None:
         payload["status"] = "PREFLIGHT_STATIC_REQUIREMENT_FAILED"
         emit(payload, code=2)
     if args.probe:
-        probes = {
+        probes = selection_checks or {
             name: probe_provider(name, project, runtime=runtime[name])
-            for name in sorted(set(topology.values()))
+            for name in sorted(selected_adapters)
         }
         payload["probes"] = probes
-        if not all(item["ok"] for item in probes.values()):
+        if not selection_checks and not all(item["ok"] for item in probes.values()):
             payload["status"] = "PREFLIGHT_PROVIDER_UNUSABLE"
             emit(payload, code=2)
     emit(payload)
@@ -2548,10 +2981,10 @@ def command_init(args: argparse.Namespace) -> None:
     request = Path(args.request).expanduser().resolve()
     if not request.is_file():
         raise WorkflowError(f"request file does not exist: {request}")
-    topology = resolve_topology(args.backend)
     runtime = agent_runtime(args)
-    if args.final_reviewer != "both" and not available(args.final_reviewer):
-        raise WorkflowError(f"final reviewer is unavailable: {args.final_reviewer}")
+    topology, frozen_peer, final_reviewer, selection_checks = resolve_verified_host_selection(
+        args, project, runtime,
+    )
     baseline = git(project, "rev-parse", "--verify", f"{args.base_ref}^{{commit}}")
     original_changes = git(project, "status", "--porcelain").splitlines()
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
@@ -2604,12 +3037,18 @@ def command_init(args: argparse.Namespace) -> None:
         "finding_aliases": {},
         "planning_depth": args.planning_depth,
         "research_policy": args.research_policy,
+        "backend_requested": args.backend,
+        "host_adapter": args.host_adapter,
+        "peer_reviewer_requested": args.peer_reviewer,
+        "final_reviewer_requested": args.final_reviewer,
+        "peer_reviewer": frozen_peer,
+        "selection_checks": selection_checks,
         "planners": topology,
         "provider_diversity": len(set(topology.values())) > 1,
         "model_diversity": model_diversity(topology, runtime),
         "agent_runtime": runtime,
         "runtime_warnings": runtime_warnings(runtime),
-        "final_reviewer": args.final_reviewer,
+        "final_reviewer": final_reviewer,
         "worktree": str(worktree),
         "status": "INITIALIZED",
         "investigations": {},
@@ -2628,6 +3067,8 @@ def command_init(args: argparse.Namespace) -> None:
         "pending_decisions": {},
         "usage": {},
         "infrastructure_usage": {},
+        "slot_provider_overrides": {},
+        "automatic_fallbacks": [],
         "resource_usage": {"wall_seconds": 0.0, "reported_cost_usd": 0.0,
                            "reported_turns": 0, "scratch_bytes_removed": 0},
         "active_invocations": {},
@@ -2645,7 +3086,10 @@ def command_init(args: argparse.Namespace) -> None:
         "base_ref": state["base_ref"], "baseline_sha": state["baseline_sha"],
         "original_worktree_clean_at_start": state["original_worktree_clean_at_start"],
         "original_worktree_changes_at_start": state["original_worktree_changes_at_start"],
-        "planners": topology, "final_reviewer": args.final_reviewer,
+        "host_adapter": args.host_adapter,
+        "peer_reviewer": frozen_peer,
+        "selection_checks": selection_checks,
+        "planners": topology, "final_reviewer": final_reviewer,
         "provider_diversity": state["provider_diversity"],
         "model_diversity": state["model_diversity"], "agent_runtime": runtime,
         "runtime_warnings": state["runtime_warnings"],
@@ -3185,7 +3629,7 @@ def command_adjudicate(args: argparse.Namespace) -> None:
             raise WorkflowError("reassignment decision is missing its assignment")
         current = pending.get("provider")
         alternatives = [name for name in SUPPORTED_PROVIDERS
-                        if name != current and shutil.which(name)]
+                        if name != current and available(name)]
         if not alternatives:
             raise WorkflowError(
                 f"no other provider is installed to take over {assignment} from {current}")
@@ -3193,7 +3637,7 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         if replacement == current:
             raise WorkflowError("reassigning an assignment to the provider that already holds it "
                                 "changes nothing")
-        if not shutil.which(replacement):
+        if not available(replacement):
             raise WorkflowError(f"provider is not installed: {replacement}")
         preview["reassignment"] = {"assignment": assignment, "from": current, "to": replacement}
         preview["independence_cost"] = (
@@ -3264,11 +3708,16 @@ def command_status(args: argparse.Namespace) -> None:
     state = load_state(project, args.run_id)
     emit({
         "status": state["status"], "run_id": state["run_id"], "baseline_sha": state["baseline_sha"],
+        "host_adapter": state.get("host_adapter"),
+        "peer_reviewer": state.get("peer_reviewer"),
+        "selection_checks": state.get("selection_checks", {}),
         "planners": state["planners"], "provider_diversity": state["provider_diversity"],
         "model_diversity": state.get("model_diversity", False),
         "agent_runtime": state.get("agent_runtime") or {},
         "runtime_warnings": state.get("runtime_warnings") or [],
         "assignment_providers": state.get("assignment_providers") or {},
+        "slot_provider_overrides": state.get("slot_provider_overrides") or {},
+        "automatic_fallbacks": state.get("automatic_fallbacks") or [],
         "independence_notes": state.get("independence_notes") or [],
         "final_reviewer": state["final_reviewer"], "drafts": state["drafts"],
         "cross_reviews": state["cross_reviews"], "synthesis_submissions": state["synthesis_submissions"],
@@ -3300,6 +3749,9 @@ def command_export(args: argparse.Namespace) -> None:
     validate_ready_invariants(state)
     emit({
         "status": "READY", "run_id": state["run_id"], "baseline_sha": state["baseline_sha"],
+        "host_adapter": state.get("host_adapter"),
+        "peer_reviewer": state.get("peer_reviewer"),
+        "selection_checks": state.get("selection_checks", {}),
         "plan": state["final"]["plan"], "batch_manifest": state["final"]["batch_manifest"],
         "plan_sha256": state["final"]["plan_sha256"],
         "batch_manifest_sha256": state["final"]["batch_manifest_sha256"],
@@ -3308,6 +3760,10 @@ def command_export(args: argparse.Namespace) -> None:
         "model_diversity": state.get("model_diversity", False),
         "agent_runtime": state.get("agent_runtime") or {},
         "runtime_warnings": state.get("runtime_warnings") or [],
+        "assignment_providers": state.get("assignment_providers") or {},
+        "slot_provider_overrides": state.get("slot_provider_overrides") or {},
+        "automatic_fallbacks": state.get("automatic_fallbacks") or [],
+        "independence_notes": state.get("independence_notes") or [],
         "handoff": "Use scripts/workflow.py init only after explicit user approval.",
     })
 
@@ -3323,6 +3779,13 @@ def command_audit_export(args: argparse.Namespace) -> None:
         save_state(state)
     emit({
         "status": state["status"], "run_id": state["run_id"], "report": str(report),
+        "host_adapter": state.get("host_adapter"),
+        "peer_reviewer": state.get("peer_reviewer"),
+        "selection_checks": state.get("selection_checks", {}),
+        "assignment_providers": state.get("assignment_providers") or {},
+        "slot_provider_overrides": state.get("slot_provider_overrides") or {},
+        "automatic_fallbacks": state.get("automatic_fallbacks") or [],
+        "independence_notes": state.get("independence_notes") or [],
         "candidate": state.get("candidate"), "final_reviews": state.get("final_reviews") or {},
         "abandoned": state.get("abandoned"), "resource_usage": state.get("resource_usage") or {},
     })
@@ -3448,9 +3911,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight.add_argument("--backend", choices=["auto", *SUPPORTED_PROVIDERS], default="auto")
     preflight.add_argument(
+        "--host-adapter", choices=SUPPORTED_PROVIDERS,
+        help="freeze the current host's CLI adapter so auto can prefer an independent reviewer")
+    preflight.add_argument(
+        "--peer-reviewer", choices=["auto", *SUPPORTED_PROVIDERS], default="auto",
+        help="override the host-aware non-host slot after a higher-priority probe fails")
+    preflight.add_argument(
         "--probe", action="store_true",
-        help="spend one trivial sandboxed call per provider to check it can authenticate and "
-             "return a schema object; exits 2 if any cannot")
+        help="spend one small sandboxed call per provider to check it can authenticate, read a "
+             "mounted file, and return a schema object; exits 2 if any cannot")
     add_model_selection(preflight)
     preflight.set_defaults(func=command_preflight)
 
@@ -3463,7 +3932,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--backend", choices=["auto", *SUPPORTED_PROVIDERS], default="auto")
     init.add_argument(
-        "--final-reviewer", choices=["both", *SUPPORTED_PROVIDERS], required=True,
+        "--host-adapter", choices=SUPPORTED_PROVIDERS,
+        help="freeze the current host's CLI adapter for host-aware reviewer selection")
+    init.add_argument(
+        "--peer-reviewer", choices=["auto", *SUPPORTED_PROVIDERS], default="auto",
+        help="freeze an explicit non-host slot after probing the preferred reviewer order")
+    init.add_argument(
+        "--final-reviewer", choices=["auto", "both", *SUPPORTED_PROVIDERS], default="auto",
         help="use one fresh reviewer for standard planning; reserve 'both' for deep or explicitly requested high assurance",
     )
     init.add_argument(
