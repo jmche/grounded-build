@@ -6,8 +6,8 @@ Grounded Build is a local workflow for a trusted operating-system account. The r
 
 | Version | Security support |
 |---|---|
-| 0.6.x | Supported public beta |
-| 0.5.x and earlier | Upgrade required unless an advisory says otherwise |
+| 0.7.x | Supported public beta |
+| 0.6.x and earlier | Upgrade required unless an advisory says otherwise |
 
 ## Enforced boundaries
 

@@ -950,25 +950,34 @@ def record_findings(state: dict[str, Any], findings: list[dict[str, Any]], sourc
             ledger[key]["observations"].append(observation)
 
 
-def other_bridge_executable() -> Path | None:
-    """Resolve the one generic host bridge without guessing a coding-agent CLI."""
+def resolve_other_bridge() -> tuple[Path | None, str | None]:
+    """Resolve the generic bridge while keeping an irrelevant bad setting non-authoritative."""
     configured = os.environ.get("GROUNDED_BUILD_OTHER_COMMAND", "").strip()
     if not configured:
-        return None
+        return None, None
     candidate = Path(configured).expanduser()
     if not candidate.is_absolute():
-        raise WorkflowError("GROUNDED_BUILD_OTHER_COMMAND must be an absolute executable path")
+        return None, "GROUNDED_BUILD_OTHER_COMMAND must be an absolute executable path"
     resolved = candidate.resolve()
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        raise WorkflowError(
-            "GROUNDED_BUILD_OTHER_COMMAND does not name an executable file: " + str(resolved)
+        return (
+            None,
+            "GROUNDED_BUILD_OTHER_COMMAND does not name an executable file: " + str(resolved),
         )
+    return resolved, None
+
+
+def other_bridge_executable(*, strict: bool = True) -> Path | None:
+    """Return the bridge path, rejecting bad configuration only when `other` is authoritative."""
+    resolved, error = resolve_other_bridge()
+    if strict and error:
+        raise WorkflowError(error)
     return resolved
 
 
 def provider_executable(provider: str) -> Path | None:
     if provider == "other":
-        return other_bridge_executable()
+        return other_bridge_executable(strict=False)
     executable = shutil.which(provider)
     return Path(executable).resolve() if executable else None
 
@@ -1131,7 +1140,7 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
         selected_claude_model = None
     if dsh_model == "cli-default":
         dsh_model = None
-    other_executable = other_bridge_executable()
+    other_executable = other_bridge_executable(strict=False)
     runtime = {
         "codex": codex_runtime_identity(selected_codex_model, model_provider, profile),
         "claude": {
@@ -1158,6 +1167,10 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
 
 def adapter_capabilities(provider: str) -> dict[str, Any]:
     """Check the non-network CLI surface this workflow depends on."""
+    if provider == "other":
+        _, configuration_error = resolve_other_bridge()
+        if configuration_error:
+            return {"ok": False, "missing": [configuration_error]}
     executable_path = provider_executable(provider)
     if not executable_path:
         return {"ok": False, "missing": ["executable"]}
@@ -1382,12 +1395,14 @@ def resolve_verified_host_selection(
                 }
         return checks[provider]
 
-    host_check = check(host)
-    if not host_check["ok"]:
-        raise WorkflowError(
-            "host adapter failed the initialization-bound capability probe: "
-            + json.dumps(host_check, sort_keys=True)
-        )
+    host_is_selected = args.backend == "auto" or args.final_reviewer == "auto"
+    if host_is_selected:
+        host_check = check(host)
+        if not host_check["ok"]:
+            raise WorkflowError(
+                "host adapter failed the initialization-bound capability probe: "
+                + json.dumps(host_check, sort_keys=True)
+            )
 
     if args.backend == "auto":
         if args.peer_reviewer != "auto":

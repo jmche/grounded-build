@@ -466,6 +466,25 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(initialized["final_reviewer"], "dsh")
         self.assertTrue(initialized["selection_checks"]["dsh"]["ok"])
 
+    def test_unused_invalid_other_bridge_does_not_block_explicit_builtin_backend(self) -> None:
+        preflight = self.call(
+            "preflight", "--project", str(self.project), "--backend", "claude",
+            extra_env={"GROUNDED_BUILD_OTHER_COMMAND": "relative/bad"},
+        )
+        self.assertEqual(preflight["status"], "PREFLIGHT_OK")
+        self.assertEqual(preflight["planners"], {"A": "claude", "B": "claude"})
+
+    def test_explicit_backend_and_final_do_not_require_an_unused_host_bridge(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--host-adapter", "other",
+            "--final-reviewer", "claude",
+            extra_env={"GROUNDED_BUILD_OTHER_COMMAND": ""},
+        )
+        self.assertEqual(initialized["planners"], {"A": "claude", "B": "claude"})
+        self.assertEqual(initialized["final_reviewer"], "claude")
+        self.assertNotIn("other", initialized["selection_checks"])
+
     def test_other_bridge_digest_is_frozen_before_agent_invocation(self) -> None:
         initialized = self.call(
             "init", "--project", str(self.project), "--request", str(self.request),

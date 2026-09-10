@@ -67,7 +67,7 @@ credentials, and private repository content must never be committed.
 
 Grounded Build uses semantic versioning while it remains a public beta:
 
-- Patch (`0.6.x` on the current line): compatible correctness, security, documentation, prompt,
+- Patch (`0.7.x` on the current line): compatible correctness, security, documentation, prompt,
   review-policy, and other bounded refinements.
 - Minor (`0.x.0`, including values such as `0.100.0`): substantial compatible workflow capability or
   public-surface additions that deserve a distinct product milestone.
