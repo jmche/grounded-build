@@ -24,19 +24,28 @@ from pathlib import Path
 if "--version" in sys.argv:
     print("fake-agent 1.0")
     raise SystemExit(0)
+if len(sys.argv) > 1 and sys.argv[1] == "capabilities":
+    print(json.dumps({"protocol": "grounded-build-other-v1", "read_only": True,
+                      "structured_output": True, "fresh_process": True}))
+    raise SystemExit(0)
 if "--help" in sys.argv:
     print("--output-schema --output-last-message --ephemeral --sandbox --config "
           "--profile headless --patch --dump-config --json-schema --output-format --permission-mode "
           "--no-session-persistence")
     raise SystemExit(0)
-prompt = sys.argv[-1]
-provider = re.search(r"provider=(claude|codex|dsh)", prompt).group(1)
+bridge = len(sys.argv) > 1 and sys.argv[1] == "run"
+prompt = (Path(sys.argv[sys.argv.index("--prompt") + 1]).read_text(encoding="utf-8")
+          if bridge else sys.argv[-1])
+provider = re.search(r"provider=(claude|codex|dsh|other)", prompt).group(1)
 if "This is a capability check." in prompt:
     ready = not any(Path(name).exists() for name in ("dirty-tracked.txt", "dirty-staged.txt", "dirty-untracked.txt"))
     probe_path = Path(re.search(r"Read (/.+?/probe-input\.txt)\.", prompt).group(1))
     probe = {"provider": provider, "ready": ready,
              "observed": probe_path.read_text(encoding="utf-8").rstrip("\n")}
-    if "-o" in sys.argv:
+    if bridge:
+        with open(sys.argv[sys.argv.index("--output") + 1], "w", encoding="utf-8") as handle:
+            json.dump(probe, handle)
+    elif "-o" in sys.argv:
         with open(sys.argv[sys.argv.index("-o") + 1], "w", encoding="utf-8") as handle:
             json.dump(probe, handle)
     elif "OUTPUT CONTRACT" in prompt:
@@ -150,8 +159,8 @@ elif provider == "codex" and router_warning and router_warning.group(1) == fake_
 if "FAKE_529" in request_text and "independent evidence investigator A" in prompt:
     print(json.dumps({"is_error": True, "api_error_status": 529,
                       "result": "upstream provider overloaded"}))
-elif "-o" in sys.argv:
-    output = sys.argv[sys.argv.index("-o") + 1]
+elif bridge or "-o" in sys.argv:
+    output = sys.argv[sys.argv.index("--output" if bridge else "-o") + 1]
     # Deliver nothing on the first attempt when the request asks for it: the shape codex hit
     # three times running, where the turn ends with no final message at all.
     always = re.search(r"FAKE_EMPTY_ALWAYS=(\S+)", request_text)
@@ -192,12 +201,16 @@ class PlanWorkflowTest(unittest.TestCase):
             path = self.bin / name
             path.write_text(FAKE_AGENT, encoding="utf-8")
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        other = self.bin / "other-bridge"
+        other.write_text(FAKE_AGENT, encoding="utf-8")
+        other.chmod(other.stat().st_mode | stat.S_IXUSR)
         code_mode_host = self.bin / "codex-code-mode-host"
         code_mode_host.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         code_mode_host.chmod(code_mode_host.stat().st_mode | stat.S_IXUSR)
         self.env = os.environ.copy()
         self.env["PATH"] = f"{self.bin}:{self.env['PATH']}"
         self.env["GROUNDED_BUILD_PLAN_HOME"] = str(self.temp / "state")
+        self.env["GROUNDED_BUILD_OTHER_COMMAND"] = str(other)
 
     def tearDown(self) -> None:
         subprocess.run(["git", "worktree", "prune"], cwd=self.project, check=False)
@@ -332,13 +345,13 @@ class PlanWorkflowTest(unittest.TestCase):
             "preflight", "--project", str(self.project), "--backend", "auto",
             "--host-adapter", "codex", "--peer-reviewer", "dsh", "--probe")
         self.assertEqual(fallback["planners"], {"A": "codex", "B": "dsh"})
-        self.assertEqual(fallback["preferred_final_reviewer"], "dsh")
+        self.assertEqual(fallback["preferred_final_reviewer"], "codex")
 
         initialized = self.call(
             "init", "--project", str(self.project), "--request", str(self.request),
             "--backend", "auto", "--host-adapter", "codex", "--peer-reviewer", "dsh")
         self.assertEqual(initialized["planners"], {"A": "codex", "B": "dsh"})
-        self.assertEqual(initialized["final_reviewer"], "dsh")
+        self.assertEqual(initialized["final_reviewer"], "codex")
 
     def test_single_provider_uses_two_isolated_instances_and_reaches_ready(self) -> None:
         initialized = self.initialize("claude", "both")
@@ -383,7 +396,7 @@ class PlanWorkflowTest(unittest.TestCase):
             "--backend", "auto", "--host-adapter", "dsh")
         self.assertEqual(initialized["host_adapter"], "dsh")
         self.assertEqual(initialized["planners"], {"A": "dsh", "B": "codex"})
-        self.assertEqual(initialized["final_reviewer"], "codex")
+        self.assertEqual(initialized["final_reviewer"], "dsh")
 
         for slot in ("A", "B"):
             self.call(
@@ -398,7 +411,91 @@ class PlanWorkflowTest(unittest.TestCase):
             "final-review", "--project", str(self.project), "--run-id", initialized["run_id"],
             "--reviewer", "F")
         state = self.get_state(initialized)
-        self.assertEqual(state["final_reviews"]["F"]["provider"], "codex")
+        self.assertEqual(state["final_reviews"]["F"]["provider"], "dsh")
+
+    def test_other_host_uses_generic_bridge_and_keeps_final_review_on_host(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+        )
+        self.assertEqual(initialized["planners"], {"A": "other", "B": "codex"})
+        self.assertEqual(initialized["peer_reviewer"], "codex")
+        self.assertEqual(initialized["final_reviewer"], "other")
+        self.assertEqual(
+            initialized["agent_runtime"]["other"]["protocol"],
+            "grounded-build-other-v1",
+        )
+
+        for slot in ("A", "B"):
+            self.call(
+                "investigate", "--project", str(self.project),
+                "--run-id", initialized["run_id"], "--slot", slot,
+            )
+        self.run_through_cross_review(initialized)
+        self.submit_candidate(initialized)
+        self.call(
+            "final-review", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--reviewer", "F",
+        )
+        state = self.get_state(initialized)
+        self.assertEqual(state["draft_rounds"]["2"]["A"]["provider"], "other")
+        self.assertEqual(state["draft_rounds"]["2"]["B"]["provider"], "codex")
+        self.assertEqual(state["final_reviews"]["F"]["provider"], "other")
+
+    def test_other_only_installation_uses_other_for_every_planning_slot(self) -> None:
+        for provider in ("claude", "codex", "dsh"):
+            path = self.bin / provider
+            path.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+            path.chmod(0o755)
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+        )
+        self.assertEqual(initialized["planners"], {"A": "other", "B": "other"})
+        self.assertEqual(initialized["peer_reviewer"], "other")
+        self.assertEqual(initialized["final_reviewer"], "other")
+        self.assertTrue(initialized["selection_checks"]["other"]["ok"])
+
+    def test_explicit_final_reviewer_overrides_other_host_default(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+            "--final-reviewer", "dsh",
+        )
+        self.assertEqual(initialized["planners"], {"A": "other", "B": "codex"})
+        self.assertEqual(initialized["final_reviewer"], "dsh")
+        self.assertTrue(initialized["selection_checks"]["dsh"]["ok"])
+
+    def test_other_bridge_digest_is_frozen_before_agent_invocation(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other",
+            "--peer-reviewer", "other",
+        )
+        bridge = Path(self.env["GROUNDED_BUILD_OTHER_COMMAND"])
+        bridge.write_text(bridge.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+        result = self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "A", expect=2,
+        )
+        self.assertIn("bridge executable changed", result["error"])
+
+    def test_other_bridge_must_declare_the_protocol_contract(self) -> None:
+        bridge = Path(self.env["GROUNDED_BUILD_OTHER_COMMAND"])
+        bridge.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "if '--version' in sys.argv: print('bad-bridge 1.0')\n"
+            "elif sys.argv[1] == 'capabilities': print(json.dumps({'protocol': 'unknown'}))\n",
+            encoding="utf-8",
+        )
+        bridge.chmod(0o755)
+        result = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "other", expect=2,
+        )
+        self.assertIn("host adapter failed", result["error"])
+        self.assertIn("grounded-build-other-v1", result["error"])
 
     def test_host_aware_init_does_not_freeze_installed_codex_without_its_read_host(self) -> None:
         (self.bin / "codex-code-mode-host").unlink()
@@ -429,18 +526,18 @@ class PlanWorkflowTest(unittest.TestCase):
         preflight = self.call(
             "preflight", "--project", str(self.project), "--backend", "claude",
             "--host-adapter", "dsh", "--probe")
-        self.assertEqual(preflight["preferred_final_reviewer"], "codex")
-        self.assertEqual(set(preflight["capabilities"]["adapters"]), {"claude", "codex"})
-        self.assertEqual(set(preflight["probes"]), {"claude", "codex", "dsh"})
+        self.assertEqual(preflight["preferred_final_reviewer"], "dsh")
+        self.assertEqual(set(preflight["capabilities"]["adapters"]), {"claude", "dsh"})
+        self.assertEqual(set(preflight["probes"]), {"claude", "dsh"})
 
         initialized = self.call(
             "init", "--project", str(self.project), "--request", str(self.request),
             "--backend", "claude", "--host-adapter", "dsh")
         self.assertEqual(initialized["planners"], {"A": "claude", "B": "claude"})
         self.assertIsNone(initialized["peer_reviewer"])
-        self.assertEqual(initialized["final_reviewer"], "codex")
+        self.assertEqual(initialized["final_reviewer"], "dsh")
 
-    def test_explicit_backend_preflight_falls_back_for_unusable_auto_final_reviewer(self) -> None:
+    def test_explicit_backend_preflight_does_not_probe_an_unused_external_reviewer(self) -> None:
         (self.bin / "codex-code-mode-host").unlink()
         preflight = self.call(
             "preflight", "--project", str(self.project), "--backend", "claude",
@@ -449,8 +546,8 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(preflight["status"], "PREFLIGHT_OK")
         self.assertEqual(preflight["planners"], {"A": "claude", "B": "claude"})
         self.assertEqual(preflight["preferred_final_reviewer"], "dsh")
-        self.assertFalse(preflight["selection_checks"]["codex"]["ok"])
         self.assertTrue(preflight["selection_checks"]["dsh"]["ok"])
+        self.assertNotIn("codex", preflight["selection_checks"])
 
         initialized = self.call(
             "init", "--project", str(self.project), "--request", str(self.request),
@@ -2039,7 +2136,7 @@ class DshAdapterTest(unittest.TestCase):
         self.assertEqual(
             self.module.resolve_host_topology("auto", "dsh"),
             {"A": "dsh", "B": "codex"})
-        self.assertEqual(self.module.resolve_final_reviewer("auto", "dsh"), "codex")
+        self.assertEqual(self.module.resolve_final_reviewer("auto", "dsh"), "dsh")
 
         self.module.available = lambda provider: provider in {"dsh"}
         self.assertEqual(
@@ -2052,13 +2149,37 @@ class DshAdapterTest(unittest.TestCase):
         self.assertEqual(
             self.module.resolve_host_topology("auto", "codex"),
             {"A": "codex", "B": "claude"})
-        self.assertEqual(self.module.resolve_final_reviewer("auto", "codex"), "claude")
+        self.assertEqual(self.module.resolve_final_reviewer("auto", "codex"), "codex")
+
+    def test_other_host_prefers_codex_then_claude_then_dsh_and_finalizes_on_host(self) -> None:
+        self.module.available = lambda provider: provider in {"other", "claude", "codex", "dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "other"),
+            {"A": "other", "B": "codex"},
+        )
+        self.assertEqual(self.module.resolve_final_reviewer("auto", "other"), "other")
+
+        self.module.available = lambda provider: provider in {"other", "claude", "dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "other"),
+            {"A": "other", "B": "claude"},
+        )
+        self.module.available = lambda provider: provider in {"other", "dsh"}
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "other"),
+            {"A": "other", "B": "dsh"},
+        )
+        self.module.available = lambda provider: provider == "other"
+        self.assertEqual(
+            self.module.resolve_host_topology("auto", "other"),
+            {"A": "other", "B": "other"},
+        )
 
         self.module.available = lambda provider: provider in {"codex", "dsh"}
         self.assertEqual(
             self.module.resolve_host_topology("auto", "codex"),
             {"A": "codex", "B": "dsh"})
-        self.assertEqual(self.module.resolve_final_reviewer("auto", "codex"), "dsh")
+        self.assertEqual(self.module.resolve_final_reviewer("auto", "codex"), "codex")
 
     def test_explicit_peer_requires_a_bound_host_and_overrides_installed_priority(self) -> None:
         self.module.available = lambda provider: provider in {"claude", "codex", "dsh"}
@@ -2068,7 +2189,7 @@ class DshAdapterTest(unittest.TestCase):
             self.module.resolve_host_topology("auto", "codex", "dsh"),
             {"A": "codex", "B": "dsh"})
         self.assertEqual(
-            self.module.resolve_final_reviewer("auto", "codex", "dsh"), "dsh")
+            self.module.resolve_final_reviewer("auto", "codex", "dsh"), "codex")
         self.assertEqual(
             self.module.resolve_host_topology("auto", "dsh", "dsh"),
             {"A": "dsh", "B": "dsh"})

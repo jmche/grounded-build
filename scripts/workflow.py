@@ -57,7 +57,7 @@ MAX_ENVIRONMENT_SCAN_SECONDS = 30.0
 MAX_INSTRUCTION_FILES = 16
 MAX_INSTRUCTION_BYTES = 1024 * 1024
 MAX_REVIEW_DIFF_BYTES = 4 * 1024 * 1024
-SUPPORTED_REVIEWERS = ("claude", "codex", "dsh")
+SUPPORTED_REVIEWERS = ("claude", "codex", "dsh", "other")
 DEFAULT_CLAUDE_REVIEWER_MODEL = "opus"
 DEFAULT_CODEX_REVIEWER_MODEL = "gpt-5.6-sol"
 TERMINAL_STATUSES = {"FINALIZED", "SUPERSEDED", "ABANDONED"}
@@ -477,6 +477,8 @@ def dsh_settings_selection(settings: Path) -> dict[str, str]:
 
 def reviewer_runtime(args: argparse.Namespace, reviewer: str) -> dict[str, Any]:
     """Freeze the selected reviewer model separately from its CLI adapter."""
+    if reviewer == "other":
+        return planning_isolation_module().agent_runtime(args)["other"]
     if reviewer == "claude":
         requested = getattr(args, "claude_model", None)
         model = DEFAULT_CLAUDE_REVIEWER_MODEL if requested is None else requested
@@ -1794,7 +1796,11 @@ def command_init(args: argparse.Namespace) -> None:
     # Complete every free, deterministic input check before an automatic selection can make a
     # paid provider call. The probe then binds the exact runtime that this initialization freezes.
     reviewer, runtime, reviewer_selection_checks = select_implementation_reviewer(args, project)
-    if not shutil.which(reviewer):
+    if reviewer == "other":
+        reviewer_available = bool(runtime.get("executable"))
+    else:
+        reviewer_available = shutil.which(reviewer) is not None
+    if not reviewer_available:
         raise WorkflowError(f"reviewer CLI is not available on PATH: {reviewer}")
     capability = planning_isolation_module().adapter_capabilities(reviewer)
     if not capability.get("ok"):
@@ -2217,6 +2223,11 @@ def reviewer_command(
     schema: dict[str, Any] = REVIEW_SCHEMA,
     runtime: dict[str, Any] | None = None,
 ) -> list[str]:
+    if reviewer == "other":
+        return planning_isolation_module().agent_command(
+            "other", reviewer_path, context_dir, schema, raw_path, prompt,
+            runtime=runtime, allow_web=False,
+        )
     if reviewer == "dsh":
         # dsh-headless has no structured-output flag, so the schema travels IN the prompt and the
         # host parses the printed final message. Contract review needs no writable output channel.
@@ -2282,12 +2293,12 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
             if isinstance(payload, dict):
                 return payload
         raise WorkflowError("dsh output did not contain a structured review result")
-    if reviewer == "codex":
+    if reviewer in {"codex", "other"}:
         source = raw_path.read_text(encoding="utf-8") if raw_path.is_file() else stdout
         try:
             payload = json.loads(source)
         except json.JSONDecodeError as exc:
-            raise WorkflowError(f"Codex returned invalid structured output: {exc}") from exc
+            raise WorkflowError(f"{reviewer} returned invalid structured output: {exc}") from exc
         return payload
     try:
         wrapper = json.loads(stdout)
@@ -5458,7 +5469,11 @@ def command_change_reviewer(args: argparse.Namespace) -> None:
     validate_active_state(project, state)
     if state.get("status") in {"FINALIZING", "READY_TO_FINALIZE", "FINAL_VERIFICATION_REQUIRED"}:
         raise WorkflowError(f"reviewer change is not meaningful from workflow status {state.get('status')}")
-    if not shutil.which(args.reviewer):
+    if args.reviewer == "other":
+        reviewer_available = planning_isolation_module().available("other")
+    else:
+        reviewer_available = shutil.which(args.reviewer) is not None
+    if not reviewer_available:
         raise WorkflowError(f"reviewer CLI is not available on PATH: {args.reviewer}")
     capability = planning_isolation_module().adapter_capabilities(args.reviewer)
     if not capability.get("ok"):

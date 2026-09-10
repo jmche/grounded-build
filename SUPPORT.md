@@ -3,9 +3,9 @@
 ## Supported environment
 
 The current public beta supports Linux, Git, the `bubblewrap` and `socat` sandbox packages, and
-CPython 3.11–3.13. Claude, Codex, and dsh
-are supported for both planning and implementation review. Provider CLI authentication, harness
-configuration, and model availability remain the operator's responsibility.
+CPython 3.11–3.13. Claude, Codex, dsh, and a configured `grounded-build-other-v1` bridge are supported
+for both planning and implementation review. Provider CLI authentication, bridge construction,
+harness configuration, and model availability remain the operator's responsibility.
 
 The latest minor release receives compatibility and security fixes. Older minor releases remain
 available for audit and rollback but are not actively supported unless a security advisory states otherwise.

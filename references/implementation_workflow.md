@@ -1,6 +1,6 @@
 # Implement mode contract
 
-Execute a user-provided implementation plan without changing the original project until final integration. The current host coding agent implements and fixes the plan in an isolated worktree. A selected `claude`, `codex`, or `dsh` CLI reviews each fixed commit in a second isolated worktree. The reviewer may use the same agent family as the host; independence means a fresh process, isolated context, separate worktree, restricted authority, and audited output—not necessarily a different vendor or model.
+Execute a user-provided implementation plan without changing the original project until final integration. The current host coding agent implements and fixes the plan in an isolated worktree. A selected `claude`, `codex`, `dsh`, or protocol-compatible `other` CLI reviews each fixed commit in a second isolated worktree. The reviewer may use the same agent family as the host; independence means a fresh process, isolated context, separate worktree, restricted authority, and audited output—not necessarily a different vendor or model.
 
 Read `references/causal_analysis.md` before implementing a defect, failed repair, cross-layer
 mismatch, or change with an unclear responsibility boundary. Apply its production trace
@@ -29,7 +29,7 @@ Collect or infer:
 
 - `plan`: an existing local plan file, resolved to an absolute path.
 - `batch_manifest`: a host-authored file that explicitly declares this run's included and excluded total scope and maps every batch ID to plan work. This is execution authority, not reviewer output.
-- `reviewer`: exactly `claude`, `codex`, or `dsh`; it may match the host/implementer.
+- `reviewer`: exactly `claude`, `codex`, `dsh`, or `other`; it may match the host/implementer.
 - `host_adapter`: the current host's CLI adapter when automatic reviewer selection is requested.
 - `reviewer_selection_checks`: initialization-bound static and mounted-file probe evidence for each
   automatic candidate considered before the concrete reviewer is frozen.
@@ -44,7 +44,7 @@ Collect or infer:
   must govern this run. These are frozen explicitly; unrelated working-tree changes are never copied.
   Each file must be UTF-8 text, at most 1 MiB, and the run accepts at most 16 files.
 
-The agent invoking this skill is always the implementer. Do not launch another implementer. A same-family reviewer is allowed only as a fresh reviewer CLI invocation under the workflow's isolated reviewer contract; the current host conversation must never issue its own PASS. Claude and Codex use their read-only CLI modes. dsh uses path-bounded read-only file tools, reads a controller-captured fixed-SHA diff, and returns one complete structured result through its final output; it receives no writable reviewer channel and does not alter shared Git configuration.
+The agent invoking this skill is always the implementer. Do not launch another implementer. A same-family reviewer is allowed only as a fresh reviewer CLI invocation under the workflow's isolated reviewer contract; the current host conversation must never issue its own PASS. Claude and Codex use their read-only CLI modes. dsh uses path-bounded read-only file tools, reads a controller-captured fixed-SHA diff, and returns one complete structured result through its final output; it receives no writable reviewer channel and does not alter shared Git configuration. `other` uses the generic bridge and isolation contract defined in `references/planning_workflow.md`.
 
 ## Storage and isolation
 
@@ -183,19 +183,25 @@ Initialize a new run:
   --plan <absolute-plan-path> \
   --batch-manifest <absolute-batch-manifest-path> \
   --implementer <current-host-agent-name> \
-  --host-adapter <claude-or-codex-or-dsh> \
-  --reviewer <auto-or-claude-or-codex-or-dsh> \
+  --host-adapter <claude-or-codex-or-dsh-or-other> \
+  --reviewer <auto-or-claude-or-codex-or-dsh-or-other> \
   --fix-policy <ask-auto-or-never> \
   --batches <comma-separated-batch-ids> \
   --target-branch <branch> \
   [--instruction-file <absolute-contract-path>]...
 ```
 
-`--reviewer auto` prefers Codex for a non-Codex host and falls back to the host when Codex does not
-pass the initialization-bound check. For a Codex host it tries Claude, then dsh, then Codex. The check
+`--reviewer auto` prefers Codex for a Claude or dsh host and falls back to the host when Codex does not
+pass the initialization-bound check. For a Codex host it tries Claude, then dsh, then Codex. For an
+`other` host it tries Codex, then Claude, then dsh, then `other`. The check
 uses the exact model/provider/profile runtime that initialization will freeze; executable presence
 alone is insufficient. Explicit reviewer selection remains authoritative and preserves the legacy
 non-probing initialization behavior.
+
+To use `other`, set `GROUNDED_BUILD_OTHER_COMMAND` to the absolute path of a bridge implementing
+`grounded-build-other-v1` before preflight and initialization. The bridge is used for contract review,
+fixed-SHA batch review, and reviewer changes through the same frozen executable digest and read-only
+sandbox contract as Plan mode. Grounded Build contains no Pi-, OpenCode-, or vendor-specific dispatch.
 
 The current host remains the implementer and is never model-overridden by this workflow. To override the
 isolated reviewer's advanced default, append the same selection verified during preflight:
@@ -333,7 +339,7 @@ Interpret statuses as follows:
 Every real reviewer call is stored under a unique `round_N/invocation_N/` directory. A malformed result or process failure leaves a terminal invocation record but does not create a quality review. Invocation budgets stop repeated infrastructure failures from consuming unbounded external-agent budget.
 
 If the selected reviewer becomes unavailable—for example, Codex exhausts its token quota—switch to
-Claude, Codex, or dsh without restarting the run:
+Claude, Codex, dsh, or a configured `other` bridge without restarting the run:
 
 ```bash
 <controller-python> <skill-root>/scripts/workflow.py change-reviewer \

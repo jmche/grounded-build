@@ -25,9 +25,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.6.4"
+VERSION = "0.7.0"
 SCHEMA_VERSION = 2
-SUPPORTED_PROVIDERS = ("claude", "codex", "dsh")
+SUPPORTED_PROVIDERS = ("claude", "codex", "dsh", "other")
+OTHER_BRIDGE_PROTOCOL = "grounded-build-other-v1"
 MAX_INVOCATIONS_PER_ASSIGNMENT = 3
 MAX_SYNTHESIS_SUBMISSIONS = 2
 MAX_INFRASTRUCTURE_ATTEMPTS = 3
@@ -949,8 +950,31 @@ def record_findings(state: dict[str, Any], findings: list[dict[str, Any]], sourc
             ledger[key]["observations"].append(observation)
 
 
+def other_bridge_executable() -> Path | None:
+    """Resolve the one generic host bridge without guessing a coding-agent CLI."""
+    configured = os.environ.get("GROUNDED_BUILD_OTHER_COMMAND", "").strip()
+    if not configured:
+        return None
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        raise WorkflowError("GROUNDED_BUILD_OTHER_COMMAND must be an absolute executable path")
+    resolved = candidate.resolve()
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise WorkflowError(
+            "GROUNDED_BUILD_OTHER_COMMAND does not name an executable file: " + str(resolved)
+        )
+    return resolved
+
+
+def provider_executable(provider: str) -> Path | None:
+    if provider == "other":
+        return other_bridge_executable()
+    executable = shutil.which(provider)
+    return Path(executable).resolve() if executable else None
+
+
 def available(provider: str) -> bool:
-    return shutil.which(provider) is not None
+    return provider_executable(provider) is not None
 
 
 @functools.lru_cache(maxsize=None)
@@ -958,7 +982,8 @@ def executable_version(provider: str) -> str | None:
     """Return a short CLI version without making a model/API call."""
     if not available(provider):
         return None
-    executable = shutil.which(provider)
+    executable_path = provider_executable(provider)
+    executable = str(executable_path) if executable_path else None
     if not executable:
         return None
     # PATH is preserved so a script-based CLI (dsh is `#!/usr/bin/env node`) can resolve its
@@ -1106,6 +1131,7 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
         selected_claude_model = None
     if dsh_model == "cli-default":
         dsh_model = None
+    other_executable = other_bridge_executable()
     runtime = {
         "codex": codex_runtime_identity(selected_codex_model, model_provider, profile),
         "claude": {
@@ -1116,6 +1142,14 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
                 "explicit_override" if claude_model is not None else "grounded_build_default"),
         },
         "dsh": dsh_runtime_identity(dsh_model, dsh_model_provider),
+        "other": {
+            "adapter": "other", "cli_version": executable_version("other"),
+            "model": None, "model_provider": None, "profile": None,
+            "model_family": "other", "identity_source": "generic_bridge",
+            "executable": str(other_executable) if other_executable else None,
+            "executable_sha256": sha256_file(other_executable) if other_executable else None,
+            "protocol": OTHER_BRIDGE_PROTOCOL,
+        },
     }
     if not explicit_codex:
         runtime["codex"]["identity_source"] = "grounded_build_default"
@@ -1124,9 +1158,36 @@ def agent_runtime(args: argparse.Namespace | None = None) -> dict[str, dict[str,
 
 def adapter_capabilities(provider: str) -> dict[str, Any]:
     """Check the non-network CLI surface this workflow depends on."""
-    executable = shutil.which(provider)
-    if not executable:
+    executable_path = provider_executable(provider)
+    if not executable_path:
         return {"ok": False, "missing": ["executable"]}
+    executable = str(executable_path)
+    if provider == "other":
+        result = run(
+            [executable, "capabilities"], timeout=30,
+            env={**agent_environment(), "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        )
+        try:
+            declaration = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            declaration = None
+        required = {
+            "protocol": OTHER_BRIDGE_PROTOCOL,
+            "read_only": True,
+            "structured_output": True,
+            "fresh_process": True,
+        }
+        ok = result.returncode == 0 and isinstance(declaration, dict) and all(
+            declaration.get(key) == value for key, value in required.items()
+        )
+        return {
+            "ok": ok,
+            "missing": [] if ok else ["grounded-build-other-v1 capability declaration"],
+            "capability_exit": result.returncode,
+            "declaration": declaration,
+            "executable": executable,
+            "executable_sha256": sha256_file(executable_path),
+        }
     if provider == "codex":
         help_args = [executable, "exec", "--help"]
         required = ["--output-schema", "--output-last-message", "--ephemeral", "--sandbox", "--config"]
@@ -1224,6 +1285,8 @@ def external_reviewer_preference(host_adapter: str) -> tuple[str, ...]:
     """Ordered fresh-CLI reviewers outside the host's own adapter identity."""
     if host_adapter == "codex":
         return ("claude", "dsh")
+    if host_adapter == "other":
+        return ("codex", "claude", "dsh")
     return ("codex",)
 
 
@@ -1272,12 +1335,7 @@ def resolve_final_reviewer(
         raise WorkflowError("--final-reviewer auto requires --host-adapter")
     if not available(host_adapter):
         raise WorkflowError(f"host adapter is unavailable: {host_adapter}")
-    if peer_provider:
-        return peer_provider
-    return next(
-        (name for name in external_reviewer_preference(host_adapter) if available(name)),
-        host_adapter,
-    )
+    return host_adapter
 
 
 def verify_provider_selection(
@@ -1349,14 +1407,7 @@ def resolve_verified_host_selection(
         topology = {"A": host, "B": frozen_peer}
 
     if args.final_reviewer == "auto":
-        if args.backend == "auto":
-            final_reviewer = frozen_peer or host
-        else:
-            final_reviewer = host
-            for candidate in external_reviewer_preference(host):
-                if check(candidate)["ok"]:
-                    final_reviewer = candidate
-                    break
+        final_reviewer = host
     elif args.final_reviewer != "both":
         final_check = check(args.final_reviewer)
         if not final_check["ok"]:
@@ -1573,6 +1624,22 @@ def agent_command(
     provider: str, worktree: Path, context: Path, schema: dict[str, Any], raw: Path, prompt: str,
     runtime: dict[str, Any] | None = None, allow_web: bool = False,
 ) -> list[str]:
+    if provider == "other":
+        runtime = runtime or {}
+        executable = runtime.get("executable")
+        if not isinstance(executable, str) or not executable:
+            raise WorkflowError("other adapter has no frozen bridge executable")
+        schema_path = context / "schema.json"
+        prompt_path = context / "prompt.md"
+        atomic_json(schema_path, schema)
+        prompt_path.write_text(prompt, encoding="utf-8")
+        prompt_path.chmod(0o600)
+        return [
+            executable, "run", "--protocol", OTHER_BRIDGE_PROTOCOL,
+            "--workspace", str(worktree), "--context", str(context),
+            "--schema", str(schema_path), "--output", str(raw),
+            "--prompt", str(prompt_path), "--web", "enabled" if allow_web else "disabled",
+        ]
     if provider == "dsh":
         # dsh-headless has no structured-output flag, so the schema travels IN the prompt and the
         # host parses and validates the printed final message (approach (a)). The adapter is told
@@ -1724,7 +1791,17 @@ def isolated_agent_command(
     private_tmp = invocation_root / "tmp"
     private_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
-    provider = Path(command[0]).name
+    other_runtime = ((state.get("agent_runtime") or {}).get("other") or {})
+    frozen_other = other_runtime.get("executable")
+    provider = (
+        "other"
+        if isinstance(frozen_other, str) and Path(frozen_other).resolve() == executable
+        else Path(command[0]).name
+    )
+    if provider == "other":
+        expected_digest = other_runtime.get("executable_sha256")
+        if not isinstance(expected_digest, str) or sha256_file(executable) != expected_digest:
+            raise WorkflowError("other bridge executable changed after runtime selection")
     controller_inputs: list[Path] = []
     writable_outputs: list[Path] = []
     credential_mounts: list[tuple[Path, Path]] = []
@@ -1752,8 +1829,8 @@ def isolated_agent_command(
             }
         }
         command[1:1] = ["--settings", json.dumps(sandbox_settings, separators=(",", ":"))]
-    elif provider == "codex":
-        raw_index = command.index("-o") + 1
+    elif provider in {"codex", "other"}:
+        raw_index = command.index("--output" if provider == "other" else "-o") + 1
         raw_output = Path(command[raw_index])
         descriptor = os.open(
             raw_output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -1931,7 +2008,11 @@ def extract_dsh_object(provider: str, source: str) -> dict[str, Any]:
 
 
 def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw: Path) -> dict[str, Any]:
-    source = raw.read_text(encoding="utf-8") if provider == "codex" and raw.is_file() else result.stdout
+    source = (
+        raw.read_text(encoding="utf-8")
+        if provider in {"codex", "other"} and raw.is_file()
+        else result.stdout
+    )
     if not source.strip():
         raise NoFinalAnswer(f"{provider} ended its turn without a final message"
                             f"{no_answer_detail(result)}")
@@ -1941,7 +2022,7 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
         wrapper = json.loads(source)
     except json.JSONDecodeError as exc:
         raise NoFinalAnswer(describe_unparseable(provider, source, exc)) from exc
-    if provider == "codex":
+    if provider in {"codex", "other"}:
         payload = wrapper
     else:
         if wrapper.get("is_error"):

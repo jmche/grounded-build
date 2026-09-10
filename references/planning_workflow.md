@@ -8,15 +8,17 @@ Ordinary runs should follow the `next_action` returned by `plan_workflow.py`. Re
 |---|---|---|---|---|
 | `auto` | dsh or claude | host | codex when available | varies |
 | `auto` | codex | codex | claude, then dsh, when available | varies |
+| `auto` | other | other | codex, then claude, then dsh, when available | varies |
 | `auto`, preferred external unavailable | any supported host | host | host | false |
 | `auto`, no host binding (legacy) | unset | first available | second available | varies |
-| `claude`, `codex`, or `dsh` | any | selected adapter | selected adapter | false |
+| `claude`, `codex`, `dsh`, or `other` | any | selected adapter | selected adapter | false |
 
 Host-aware `auto` prefers Codex as the external reviewer for a Claude or dsh host. A Codex host
-prefers Claude, then dsh. Initialization performs static checks and a real mounted-file read with the
-exact runtime about to be frozen; it selects the first usable candidate and falls back to the host
-after every external candidate fails. An explicit peer must pass the same check or initialization
-fails. `final_reviewer=auto` follows that frozen peer selection. The checks and rejected candidates
+prefers Claude, then dsh. An `other` host prefers Codex, then Claude, then dsh. Initialization performs
+static checks and a real mounted-file read with the exact runtime about to be frozen; it selects the
+first usable candidate and falls back to the host after every external candidate fails. An explicit
+peer must pass the same check or initialization fails. `final_reviewer=auto` always selects the current
+host adapter and invokes it as a fresh isolated process. The checks and rejected candidates
 are frozen in `selection_checks`, making an installed but unusable higher-priority adapter observable
 without treating it as absent. Runs without
 `--host-adapter` retain
@@ -27,7 +29,7 @@ Separate processes, fresh sessions, isolated context, a detached read-only workt
 Cross-review is mutual: A reviews B and B reviews A. Every same-round A/B pair is launched concurrently
 from one frozen barrier input; a finisher is merged atomically and cannot alter the peer's already frozen
 context. `final_reviewer=both` independently reviews the same synthesized candidate through both slots.
-`final_reviewer=auto` follows the resolved peer and uses a fresh logical reviewer F.
+`final_reviewer=auto` uses the host adapter as a fresh logical reviewer F.
 
 Planning defaults to Opus through Claude, `gpt-5.6-sol` through Codex, and the harness-saved model through
 dsh (`~/.dsh/settings.yaml`). Explicit model, provider, or profile selection wins; `cli-default` defers model
@@ -37,6 +39,53 @@ context hashes, wall time, reported cost/turns when available, and terminal deli
 If a skill upgrade changes those hashes during a run, ordinary commands reject the drift. Preview and explicitly
 apply `migrate-engine --reason <reason> --actor <actor> --apply` to continue under the new semantics; the decision
 preserves both engine identities and does not rewrite earlier invocation records.
+
+### Generic `other` bridge
+
+`other` is one protocol adapter for hosts such as Pi or OpenCode; it is not a growing list of
+agent-specific branches. Bind the current host with an absolute executable path:
+
+```bash
+export GROUNDED_BUILD_OTHER_COMMAND=/absolute/path/to/grounded-build-other-bridge
+```
+
+The controller calls `<bridge> --version`, then `<bridge> capabilities`. Capabilities must exit zero
+and emit one JSON object containing these exact bindings (additional diagnostic fields are allowed):
+
+```json
+{
+  "protocol": "grounded-build-other-v1",
+  "read_only": true,
+  "structured_output": true,
+  "fresh_process": true
+}
+```
+
+Each planning or review call executes a newly started bridge process with this argv contract:
+
+```text
+<bridge> run --protocol grounded-build-other-v1
+  --workspace <read-only-frozen-worktree>
+  --context <read-only-invocation-context>
+  --schema <read-only-json-schema>
+  --output <single-writable-output-file>
+  --prompt <read-only-prompt-file>
+  --web <enabled|disabled>
+```
+
+The bridge must start a fresh host-agent session, constrain its repository access to `--workspace`
+and `--context`, honor `--web`, and atomically write exactly one JSON object matching `--schema` to
+`--output`. A successful exit without that object is a delivery failure. Grounded Build runs the
+bridge inside the same bubblewrap boundary as built-in adapters, with a private HOME/TMP, sanitized
+environment, read-only repository and context, and only `--output` writable. Therefore the bridge
+must be self-contained or use dependencies visible in the system runtime; authentication must use a
+mechanism that does not require Grounded Build to expose the operator's HOME, arbitrary credential
+paths, or secret environment variables. A wrapper that cannot meet those constraints must fail its
+capability declaration rather than claiming compatibility.
+
+Initialization freezes the bridge's resolved path, SHA-256 digest, version, declaration, and a real
+mounted-file read. Later invocations reject bridge digest drift. This gives every conforming host the
+same auditable adapter path while leaving host-specific CLI translation outside Grounded Build.
 
 ## Evidence, scope, and priority contracts
 

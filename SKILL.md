@@ -2,8 +2,8 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.6.4
-  compatibility: Linux, Git, Python 3.11+, bubblewrap and socat (both sandbox packages; the provider CLI sandbox is fail-closed), and at least one Claude, Codex, or dsh CLI adapter
+  version: 0.7.0
+  compatibility: Linux, Git, Python 3.11+, bubblewrap and socat (both sandbox packages; the provider CLI sandbox is fail-closed), and at least one Claude, Codex, dsh, or protocol-compatible other CLI adapter
 ---
 
 # Grounded Build
@@ -47,8 +47,8 @@ Use `scripts/plan_workflow.py`. Detailed state and failure semantics are in [ref
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py preflight \
   --project <absolute-project> --base-ref <ref> \
-  --backend <auto|claude|codex|dsh> --host-adapter <claude|codex|dsh> \
-  --peer-reviewer <auto|claude|codex|dsh>
+  --backend <auto|claude|codex|dsh|other> --host-adapter <claude|codex|dsh|other> \
+  --peer-reviewer <auto|claude|codex|dsh|other>
 ```
 
 Use `--probe` for an early availability check. It makes one small paid, sandboxed call per selected
@@ -58,11 +58,12 @@ preflight result cannot go stale or be applied to different model/provider setti
 
 Planning defaults to Claude Opus and Codex `gpt-5.6-sol`; the dsh adapter reads its model from the
 harness settings (`~/.dsh/settings.yaml`). With `--host-adapter`, `auto` binds slot A to a fresh
-isolated instance of the host adapter and prefers Codex for the non-host slot. If the host is Codex,
-it prefers Claude and then dsh. Initialization checks those candidates in order with the exact runtime
-being frozen and automatically falls back to the host when no external candidate passes. An explicit
-`--peer-reviewer` or final reviewer must pass its initialization-bound check or initialization fails;
-`--final-reviewer auto` follows the frozen peer. Without a host binding, legacy
+isolated instance of the host adapter. Claude and dsh hosts prefer Codex for slot B; a Codex host
+prefers Claude and then dsh; an `other` host prefers Codex, then Claude, then dsh. Initialization
+checks those candidates in order with the exact runtime being frozen and automatically falls back
+to the host when no external candidate passes. An explicit `--peer-reviewer` or final reviewer must
+pass its initialization-bound check or initialization fails. `--final-reviewer auto` always invokes
+a fresh isolated instance of the current host adapter. Without a host binding, legacy
 `auto` uses `claude -> dsh -> codex`. Explicit user selection always wins:
 
 ```bash
@@ -80,8 +81,8 @@ Use `cli-default` as a model value to defer to that CLI/harness. A Codex provide
 
 Write the objective, constraints, exclusions, priorities, success conditions, and known decisions to a local
 Markdown request file. Standard planning uses one fresh final reviewer by default. `--final-reviewer auto`
-applies the same host-aware preference: Codex for a non-Codex host, Claude then dsh for a Codex host,
-and the host's fresh isolated CLI when no preferred external adapter is available. Reserve
+always selects the current host adapter; it is a new isolated CLI process, never the authoring
+conversation. Reserve
 `final-reviewer=both` for deep planning, an explicitly requested dual review, or a demonstrated
 high-consequence reason. Process and context isolation establish reviewer independence; paying two
 final reviewers is not required merely to make a standard run independent.
@@ -101,9 +102,9 @@ and third-party summaries are never evidence.
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py init \
   --project <project> --request <request.md> --base-ref <ref> \
-  --backend <backend> --host-adapter <claude|codex|dsh> \
-  --peer-reviewer <auto|claude|codex|dsh> \
-  --final-reviewer <auto|both|claude|codex|dsh> \
+  --backend <backend> --host-adapter <claude|codex|dsh|other> \
+  --peer-reviewer <auto|claude|codex|dsh|other> \
+  --final-reviewer <auto|both|claude|codex|dsh|other> \
   --planning-depth <standard|deep> \
   --research-policy <local-only|authoritative-web> \
   [Codex selection options from preflight]
@@ -116,6 +117,19 @@ intended planning authority.
 
 Record `run_id`, `base_ref`, `baseline_sha`, the excluded source-worktree changes,
 `agent_runtime`, and the returned `next_action`.
+
+For Pi, OpenCode, or another unsupported host CLI, configure one protocol bridge rather than adding
+agent-specific branches to Grounded Build:
+
+```bash
+export GROUNDED_BUILD_OTHER_COMMAND=/absolute/path/to/grounded-build-other-bridge
+```
+
+The bridge contract is specified in `references/planning_workflow.md`. It must be an executable,
+self-contained entry point that launches a fresh host instance inside the existing read-only sandbox,
+accepts prompt/schema/workspace paths, and writes one schema-valid JSON object to the designated output.
+Grounded Build freezes its resolved path, digest, version, capability declaration, and mounted-file probe.
+It does not interpolate a shell command, guess a host CLI's flags, or expose the user's HOME or secrets.
 If a later skill update causes an engine-drift rejection, never bypass it by editing state. Preview and obtain
 approval for `migrate-engine --reason <reason> --actor <actor> --apply`; this preserves the old and new identities.
 If an interrupted controller leaves one assignment marked `RUNNING`, preview and explicitly apply

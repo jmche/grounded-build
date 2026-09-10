@@ -142,7 +142,9 @@ Plan and Implement are independent workflows with separate state and review boun
 
 Two isolated planning slots inspect one frozen Git commit. They investigate independently, draft
 independently, and cross-review evidence. Standard mode sends the host-synthesized plan to one fresh
-final reviewer; deep or explicitly high-assurance runs may send it to both.
+instance of the current host adapter for final review; deep or explicitly high-assurance runs may send
+it to both planning slots instead. Slot B and the implementation reviewer prefer a usable non-host
+adapter, while explicit user selections always win.
 
 ```text
 frozen request + Git SHA
@@ -218,10 +220,13 @@ that installed the skill. Read [SECURITY.md](SECURITY.md) before using it with s
 | Claude CLI | Plan + Implement reviewer | Tested through a restricted fresh process. |
 | Codex CLI | Plan + Implement reviewer | Adapter identity is separate from model identity. |
 | dsh | Plan + Implement reviewer | Uses the local harness selection unless overridden. |
+| Generic `other` bridge | Plan + Implement reviewer | One `grounded-build-other-v1` protocol supports conforming hosts without agent-specific engine branches. |
 | macOS / Windows | No | No silent fallback to a weaker sandbox is provided. |
 
-At least one provider CLI must already be installed and authenticated. Grounded Build never installs
-provider CLIs, project dependencies, or interpreters on your behalf.
+At least one provider CLI must already be installed and authenticated. For Pi, OpenCode, or another
+host without a built-in adapter, set `GROUNDED_BUILD_OTHER_COMMAND` to an absolute executable that
+implements the bridge protocol documented in `references/planning_workflow.md`. Grounded Build never
+installs provider CLIs, bridge wrappers, project dependencies, or interpreters on your behalf.
 
 ## Resume without guessing
 
@@ -236,7 +241,7 @@ deployments.
 
 ## Public beta status
 
-Version `v0.6.4` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
+Version `v0.7.0` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
 release gate are production-oriented, but broader provider and repository coverage is still needed
 before a general-availability claim.
 

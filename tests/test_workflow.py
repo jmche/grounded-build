@@ -50,6 +50,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.make_fake_reviewer("codex")
         self.make_fake_reviewer("claude")
         self.make_fake_reviewer("dsh")
+        self.make_fake_reviewer("other")
         code_mode_host = self.bin_dir / "codex-code-mode-host"
         code_mode_host.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         code_mode_host.chmod(0o755)
@@ -57,6 +58,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.environment["PATH"] = f"{self.bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["GROUNDED_BUILD_IMPLEMENT_HOME"] = str(self.state_home)
         self.environment["GROUNDED_BUILD_TESTING"] = "1"
+        self.environment["GROUNDED_BUILD_OTHER_COMMAND"] = str(self.bin_dir / "other")
         dsh_home = self.root / "dsh-home"
         dsh_home.mkdir()
         (dsh_home / "settings.yaml").write_text(
@@ -86,19 +88,26 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 if "--version" in sys.argv:
                     print("fake-{name} 1.0")
                     raise SystemExit(0)
+                if len(sys.argv) > 1 and sys.argv[1] == "capabilities":
+                    print(json.dumps({{"protocol": "grounded-build-other-v1", "read_only": True,
+                                      "structured_output": True, "fresh_process": True}}))
+                    raise SystemExit(0)
                 if "--help" in sys.argv:
                     print("--profile headless --patch --dump-config --json-schema --output-format "
                           "--permission-mode --no-session-persistence --output-schema "
                           "--output-last-message --ephemeral --sandbox --config")
                     raise SystemExit(0)
-                prompt = sys.argv[-1]
+                bridge = len(sys.argv) > 1 and sys.argv[1] == "run"
+                prompt = (open(sys.argv[sys.argv.index("--prompt") + 1], encoding="utf-8").read()
+                          if bridge else sys.argv[-1])
                 if "This is a capability check." in prompt:
                     probe_path = re.search(r"Read (/.+?/probe-input\\.txt)\\.", prompt).group(1)
                     with open(probe_path, encoding="utf-8") as handle:
                         observed = handle.read().rstrip("\\n")
                     payload = {{"provider": "{name}", "ready": True, "observed": observed}}
-                    if "{name}" == "codex":
-                        with open(sys.argv[sys.argv.index("-o") + 1], "w", encoding="utf-8") as handle:
+                    if bridge or "{name}" == "codex":
+                        flag = "--output" if bridge else "-o"
+                        with open(sys.argv[sys.argv.index(flag) + 1], "w", encoding="utf-8") as handle:
                             json.dump(payload, handle)
                     elif "{name}" == "dsh":
                         print(json.dumps(payload))
@@ -187,8 +196,9 @@ class WorkflowIntegrationTests(unittest.TestCase):
                             "rationale": "fixture repository assertion passed",
                         }} for item in selected_criteria],
                     }}
-                if "{name}" == "codex":
-                    output = sys.argv[sys.argv.index("-o") + 1]
+                if bridge or "{name}" == "codex":
+                    flag = "--output" if bridge else "-o"
+                    output = sys.argv[sys.argv.index(flag) + 1]
                     with open(output, "w", encoding="utf-8") as handle:
                         json.dump(payload, handle)
                 elif "{name}" == "dsh":
@@ -372,6 +382,48 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(fallback["reviewer"], "dsh")
         self.assertFalse(fallback["reviewer_selection_checks"]["claude"]["ok"])
         self.assertTrue(fallback["reviewer_selection_checks"]["dsh"]["ok"])
+
+    def test_other_host_auto_reviewer_prefers_codex(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "other", "--implementer", "other", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "codex")
+        self.assertTrue(initialized["reviewer_selection_checks"]["codex"]["ok"])
+
+    def test_other_only_installation_uses_other_as_implementation_reviewer(self) -> None:
+        for reviewer in ("codex", "claude", "dsh"):
+            path = self.bin_dir / reviewer
+            path.write_text("#!/bin/sh\nexit 42\n", encoding="utf-8")
+            path.chmod(0o755)
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "other", "--implementer", "other", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.assertEqual(initialized["reviewer"], "other")
+        self.assertTrue(initialized["reviewer_selection_checks"]["other"]["ok"])
+
+    def test_explicit_other_reviewer_handles_contract_and_fixed_sha_review(self) -> None:
+        initialized = self.initialize("other", implementer="other")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer_runtime"]["adapter"], "other")
+        self.assertEqual(status["reviewer_runtime"]["protocol"], "grounded-build-other-v1")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        reviewed_sha = self.commit_batch_change(implementation)
+        review = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        )
+        self.assertEqual(review["status"], "REVIEW_PASS")
+        self.assertEqual(review["reviewed_sha"], reviewed_sha)
+        report = json.loads(Path(str(review["report_path"])).read_text(encoding="utf-8"))
+        self.assertEqual(report["reviewer"], "other")
 
     def test_dsh_reviews_the_contract_and_fixed_sha_batch(self) -> None:
         initialized = self.initialize("dsh")
@@ -3610,7 +3662,7 @@ class DocumentationContractTests(unittest.TestCase):
             self.assertIn("exact-HEAD", document)
         self.assertIn("Never use filenames, line counts, or keyword rules", implementation)
 
-    def test_public_contract_documents_dsh_as_an_implementation_reviewer(self) -> None:
+    def test_public_contract_documents_all_implementation_reviewers(self) -> None:
         documents = {
             "skill": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
             "readme": (SKILL_ROOT / "README.md").read_text(encoding="utf-8"),
@@ -3619,10 +3671,14 @@ class DocumentationContractTests(unittest.TestCase):
                 SKILL_ROOT / "references" / "implementation_workflow.md"
             ).read_text(encoding="utf-8"),
         }
-        self.assertEqual(WORKFLOW_MODULE.SUPPORTED_REVIEWERS, ("claude", "codex", "dsh"))
+        self.assertEqual(
+            WORKFLOW_MODULE.SUPPORTED_REVIEWERS,
+            ("claude", "codex", "dsh", "other"),
+        )
         for name, document in documents.items():
             with self.subTest(document=name):
                 self.assertIn("dsh", document)
+                self.assertIn("other", document)
                 self.assertNotIn("dsh is supported for planning only", document.lower())
                 self.assertNotIn("not an Implement reviewer", document)
                 self.assertNotIn("planning backend only", document.lower())

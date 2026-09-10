@@ -2,6 +2,20 @@
 
 All notable changes use semantic versioning.
 
+## [0.7.0] - 2026-09-10
+
+- Added the generic `grounded-build-other-v1` bridge for Pi, OpenCode, and other host agents without
+  adding per-agent branches to the workflow engines. The bridge path, executable digest, version,
+  capability declaration, and real mounted-file probe are frozen and audited.
+- Made host-aware planning bind A and the default fresh final reviewer to the current host. Slot B
+  prefers Codex for Claude/dsh hosts, Claude then dsh for Codex, and Codex then Claude then dsh for
+  `other`; every chain falls back to the host when it is the only usable provider.
+- Applied the same external preference and host fallback to implementation review while preserving
+  explicit peer, final-reviewer, backend, and implementation-reviewer selections as authoritative.
+- Fixed Codex companion-host mounting and classified successful exits containing router startup
+  errors as infrastructure failures rather than valid reviews; planning and implementation now share
+  the same verified runtime-selection and isolation path.
+
 ## [0.6.4] - 2026-09-07
 
 - Made one fresh final reviewer the standard planning recommendation while retaining dual final
