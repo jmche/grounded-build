@@ -130,6 +130,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 if os.environ.get("FAKE_{name.upper()}_QUOTA") == "1":
                     print("429 rate limit: five-hour token quota exhausted", file=sys.stderr)
                     raise SystemExit(42)
+                if os.environ.get("FAKE_{name.upper()}_NON_RATE") == "1":
+                    print("configuration error: unknown field quota_policy; "
+                          "request id 429 failed validation", file=sys.stderr)
+                    raise SystemExit(42)
                 if os.environ.get("FAKE_{name.upper()}_EXIT") == "1":
                     raise SystemExit(42)
                 def field(label):
@@ -492,6 +496,29 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertTrue(classifier("429 too many requests"))
         self.assertTrue(classifier("five-hour usage limit reached"))
         self.assertFalse(classifier("separate transport failure"))
+        self.assertFalse(classifier("configuration error: unknown field quota_policy"))
+        self.assertFalse(classifier("invalid value request_quota in schema"))
+        self.assertFalse(classifier("request id 429 failed validation"))
+
+    def test_auto_reviewer_non_rate_failure_does_not_fall_back(self) -> None:
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "auto",
+            "--host-adapter", "dsh", "--implementer", "dsh", "--fix-policy", "ask",
+            "--batches", "1", "--target-branch", "main",
+        )
+        self.environment["FAKE_CODEX_NON_RATE"] = "1"
+        failed = self.workflow(
+            "contract-review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_NON_RATE")
+        self.assertEqual(failed["status"], "REVIEWER_ERROR")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(status["reviewer"], "codex")
+        self.assertEqual(status["automatic_reviewer_fallbacks"], [])
 
     def test_auto_reviewer_rate_limit_stops_when_host_is_unavailable(self) -> None:
         initialized = self.workflow(

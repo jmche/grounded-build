@@ -151,6 +151,11 @@ quota_error = re.search(r"FAKE_RATE_LIMIT=(\S+)", request_text)
 if quota_error and provider == "codex" and quota_error.group(1) == fake_assignment(prompt):
     print("429 rate limit: five-hour token quota exhausted", file=sys.stderr)
     raise SystemExit(42)
+non_rate_error = re.search(r"FAKE_NON_RATE_FAILURE=(\S+)", request_text)
+if non_rate_error and provider == "codex" and non_rate_error.group(1) == fake_assignment(prompt):
+    print("configuration error: unknown field quota_policy; request id 429 failed validation",
+          file=sys.stderr)
+    raise SystemExit(42)
 if provider == "codex" and router_error and router_error.group(1) == fake_assignment(prompt):
     print("2026-09-09T00:00:00Z ERROR codex_core::tools::router: "
           "error=failed to spawn code-mode host /opt/codex-code-mode-host: "
@@ -503,6 +508,26 @@ class PlanWorkflowTest(unittest.TestCase):
         state = self.get_state(initialized)
         self.assertEqual(state["status"], "NEEDS_USER_DECISION")
         self.assertEqual(state["pending_decision"]["kind"], "RATE_LIMIT")
+        self.assertEqual(state["slot_provider_overrides"], {})
+
+    def test_auto_b_non_rate_failure_does_not_fall_back(self) -> None:
+        self.request.write_text(
+            "# Objective\nCreate a verified plan.\nFAKE_NON_RATE_FAILURE=investigate-B\n",
+            encoding="utf-8",
+        )
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "auto", "--host-adapter", "dsh",
+        )
+        failed = self.call(
+            "investigate", "--project", str(self.project),
+            "--run-id", initialized["run_id"], "--slot", "B", expect=2,
+        )
+        self.assertIn("ADAPTER_EXIT", failed["error"])
+        state = self.get_state(initialized)
+        self.assertEqual(state["status"], "NEEDS_USER_DECISION")
+        self.assertEqual(state["pending_decision"]["kind"], "ADAPTER_EXIT")
+        self.assertEqual(state["automatic_fallbacks"], [])
         self.assertEqual(state["slot_provider_overrides"], {})
 
     def test_auto_selected_b_can_fall_back_to_other_host_bridge(self) -> None:

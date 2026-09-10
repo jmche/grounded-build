@@ -2122,7 +2122,7 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
             joined = f"{status} {detail}".lower()
             if "401" in joined or "auth" in joined or "unauthorized" in joined:
                 kind, retryable = "AUTHENTICATION", False
-            elif is_rate_limit_failure(joined):
+            elif status == "429" or is_rate_limit_failure(detail):
                 kind, retryable = "RATE_LIMIT", True
             elif "529" in joined or "overload" in joined:
                 kind, retryable = "PROVIDER_OVERLOAD", True
@@ -2158,13 +2158,24 @@ def classify_failed_invocation(
 
 
 def is_rate_limit_failure(detail: str) -> bool:
-    """Recognize explicit provider quota signals without matching incidental text."""
+    """Recognize bounded provider rate-limit evidence, not incidental identifiers."""
     lowered = detail.lower()
-    return bool(re.search(r"(?<!\d)429(?!\d)", lowered)) or any(
-        marker in lowered for marker in (
-            "rate limit", "rate_limit", "ratelimit", "quota",
-            "too many requests", "usage limit", "rate exceeded",
-        )
+    if any(marker in lowered for marker in (
+        "rate limit", "rate_limit", "ratelimit", "too many requests",
+        "rate exceeded", "insufficient_quota",
+    )):
+        return True
+    if any(re.search(pattern, lowered) for pattern in (
+        r"\bhttp(?:\s+status)?\s*[:=]?\s*429\b",
+        r"\bstatus(?:\s+code)?\s*[:=]?\s*429\b",
+        r"\b(?:error|response)\s+(?:code\s*)?[:=]?\s*429\b",
+        r"\b429\s+(?:rate|quota|too\s+many\s+requests)\b",
+    )):
+        return True
+    exhaustion = r"(?:exhausted|exceeded|depleted|reached|used\s+up|hit)"
+    return bool(
+        re.search(rf"\b(?:quota|usage\s+limit)\b.{{0,48}}\b{exhaustion}\b", lowered)
+        or re.search(rf"\b{exhaustion}\b.{{0,48}}\b(?:quota|usage\s+limit)\b", lowered)
     )
 
 
