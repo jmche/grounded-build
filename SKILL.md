@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.7.0
+  version: 0.7.1
   compatibility: Linux, Git, Python 3.11+, bubblewrap and socat (both sandbox packages; the provider CLI sandbox is fail-closed), and at least one Claude, Codex, dsh, or protocol-compatible other CLI adapter
 ---
 
@@ -40,6 +40,10 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
   move that role to the available frozen host and retry the same work. Never override an explicit
   user selection; if the host is unavailable, preserve the existing typed recovery path.
 - Stop at every typed user decision and at implementation approval. Never infer authority from plan approval.
+- Implementation review keeps P0/P1/P2 in consequence order. P2 is constructive and nonblocking;
+  pure preference is not a ledger finding. When a nonterminal typed decision is applied only after
+  ordinary review rounds are exhausted, one decision-, batch-, and SHA-bound closeout review can
+  confirm recovery without creating an unbounded repair loop or minting PASS from adjudication.
 
 ## Plan workflow
 

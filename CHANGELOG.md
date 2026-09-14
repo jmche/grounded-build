@@ -2,6 +2,18 @@
 
 All notable changes use semantic versioning.
 
+## [0.7.1] - 2026-09-14
+
+- Closed the exhausted-review liveness gap: a nonterminal typed fix, deferral, or decision-only
+  resume applied at the quality-round boundary now authorizes one audited closeout review bound to
+  the decision, batch, and exact implementation SHA. Infrastructure and verification detours do not
+  consume it; one valid non-PASS result terminates the repair loop without fabricating approval.
+  Implementation state advances to schema v11 so schema-v10 runs adopt this route only through an
+  explicit evidence-preserving migration.
+- Made review triage explicit and deterministic: findings are returned in P0, P1, P2 consequence
+  order, P2 remains constructive and nonblocking, and preference-only advice stays outside the
+  finding ledger.
+
 ## [0.7.0] - 2026-09-10
 
 - Added the generic `grounded-build-other-v1` bridge for Pi, OpenCode, and other host agents without

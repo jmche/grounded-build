@@ -36,7 +36,11 @@ A decidable condition names an observable result: for example, a command and exp
 - `P1`: reproducible correctness, compatibility, recovery, or explicit acceptance-criteria failure in the current batch. It blocks only when supported by a concrete location, trigger, consequence, and required outcome.
 - `P2`: maintainability, low-probability hardening, performance, diagnostics, or preference-level improvement. It does not block PASS.
 
-Do not report style or naming preferences without a concrete failure consequence. Do not inflate uncertainty into P1.
+Return findings in consequence order: P0 first, then P1, then P2. Within one severity, put the
+responsible authority or root cause before downstream symptoms. A constructive P2 is nonblocking and
+may accompany PASS, but it must never demand repair or another review cycle. Keep pure style, naming, and personal
+preference advice out of the findings ledger when it has no concrete failure consequence. Do not
+inflate uncertainty into P1.
 
 ## Finding identity and lifecycle
 
@@ -73,6 +77,12 @@ authority, public contract, state or security boundary, scope, prior assumption,
 The controller retains full transport for same-SHA reviews after user adjudication and for cumulative
 final reviews whose criterion results cover every batch. Do not otherwise restart a fresh unlimited
 architecture review each round.
+
+After the ordinary quality-round limit is exhausted, the controller may authorize one closeout
+review bound to the applied typed decision, batch, and exact implementation SHA. Treat it as terminal
+confirmation of that decision or repair, not a new discovery cycle. Infrastructure or schema failure
+does not consume it. If an effective P0/P1 still remains, report it honestly; the controller will stop
+the repair loop rather than mint another closeout.
 
 Verdicts:
 

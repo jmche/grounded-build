@@ -86,7 +86,7 @@ review. Target movement is integration divergence, not execution staleness.
 - Do not use `git reset --hard`, `git clean`, automatic stash, silent rebase, or automatic conflict resolution.
 - Do not delete worktree directories directly; use the script's cleanup operation.
 - Continue fixed-baseline execution if the target advances. Previously issued review approvals do not authorize the combined code; use reviewed reconciliation before integration.
-- The ordinary cap is four valid review rounds per batch: one full discovery review and three bounded re-reviews. Reviewer infrastructure errors do not consume a round. Three separately audited exceptions may each add at most one round: a convergence-boundary grant, a review-budget grant, and a new-commit re-review after an effective PASS. Thus the absolute non-legacy maximum is seven; none is automatic except the single new-commit re-review, and that exemption requires a controller-effective PASS for the prior SHA.
+- The ordinary cap is four valid review rounds per batch: one full discovery review and three bounded re-reviews. Reviewer infrastructure errors do not consume a round. Three separately audited exceptions may each add at most one ordinary round: a convergence-boundary grant, a review-budget grant, and a new-commit re-review after an effective PASS. A nonterminal typed decision applied only after those available rounds are exhausted authorizes one terminal closeout review bound to that decision, batch, and exact SHA. Thus the absolute non-legacy maximum is eight. Infrastructure or malformed output does not consume the closeout; one valid non-PASS result does, and cannot open another repair cycle.
 - Count every real reviewer invocation separately from valid quality rounds. Infrastructure failures consume invocation budget and remain auditable even though they do not consume repair budget.
 - Treat `plan/original.md` and `plan/batches.md` with their recorded digests as the run authority. The manifest defines this run's total included/excluded scope and batch mapping. A later edit or move of either source is informational; a changed snapshot is corruption.
 - Never overwrite a contract, review, or verification attempt. Every invocation receives a unique append-only directory and event record.
@@ -401,11 +401,12 @@ Convergence policy:
 - Rounds 2–4 verify prior findings and repair regressions; they do not restart an unlimited architecture review.
 - P0 always blocks.
 - Evidence-backed, in-scope P1 blocks. On later rounds a newly discovered P1 blocks only when introduced by a fix or previously masked.
-- P2, pre-existing findings, unrelated findings, and late nonqualifying P1 findings are recorded as deferred and do not block PASS.
+- P2, pre-existing findings, unrelated findings, and late nonqualifying P1 findings are recorded as deferred and do not block PASS. Pure preferences without a concrete failure consequence stay out of the finding ledger.
+- Reviewer findings are presented in consequence order, P0 then P1 then P2; the workflow preserves the reviewer's order within a tier.
 - Finding IDs and semantic fingerprints remain stable across rounds. Missing prior OPEN findings remain open unless the reviewer explicitly verifies their resolution.
 - A severity upgrade from deferred to blocking requires user adjudication.
 - Two consecutive rounds without reducing effective blocking findings return `NEEDS_USER_DECISION`.
-- Round 4 is the final adjudication round. If blocking findings remain, do not auto-fix again; return `NEEDS_USER_DECISION`.
+- Round 4 is the final ordinary adjudication round. If blocking findings remain, do not auto-fix again; return `NEEDS_USER_DECISION`.
 
 `NEEDS_USER_DECISION` is a typed state, not prose. Read `pending_decision` from status, show its allowed choices, and preview/apply the selected choice:
 
@@ -421,7 +422,16 @@ Convergence policy:
   --reason <reason> --actor <actor> --apply
 ```
 
-P0 cannot be deferred. A batch may receive at most one explicit extra quality review. Applied decisions are included in subsequent reviewer context and never masquerade as reviewer approval.
+P0 cannot be deferred. Each declared review-grant class may be used at most once. Applied decisions are included in subsequent reviewer context and never masquerade as reviewer approval.
+
+If `RETURN_TO_FIX`, `DEFER_ELIGIBLE_P1`, or `RESUME_WITH_DECISION` is applied after the batch has
+exhausted every then-available ordinary quality round, the engine records exactly one closeout
+authorization. `RETURN_TO_FIX` requires a new commit; deferral or a decision-only resume may retain
+the same SHA. The first paid attempt binds the authorization to exact HEAD, while infrastructure,
+malformed output, and `NEEDS_VERIFICATION` leave it retryable only at that SHA. The first valid quality
+result consumes it. PASS permits acceptance; any other effective result offers only `SUPERSEDE_RUN`
+or `ABORT_RUN`, never another fix/defer/review loop. This recovery is a route back to independent review,
+not user-authored PASS or completion authority.
 
 Runs created before the finding ledger existed receive a narrow compatibility path. A resolved ID absent from the ledger is tolerated only when a same-batch, pre-policy formal report proves that ID existed; the policy records `LEGACY_UNTRACKED_RESOLUTION` and does not fabricate a fingerprint or ledger entry. Such a stranded batch may use exactly one fifth recovery review. Unknown IDs without that evidence remain `REVIEWER_ERROR`, leave state unchanged, and do not consume a valid round.
 
@@ -558,6 +568,9 @@ Schema migration authenticates the legacy event chain and final checkpoint befor
 field. A schema-number downgrade cannot convert edited state into trusted current-schema state. Migration
 backups are reusable only when byte-identical to the still-current legacy state, allowing an interrupted
 migration to resume without accepting an unrelated backup.
+Schema v11 requires explicit migration before a schema-v10 run adopts decision- and SHA-bound closeout
+review recovery; migration preserves its frozen reviewer templates and prior review evidence and initializes
+an empty closeout-grant ledger rather than inventing an authorization.
 Schema v10 adds explicit migration before a schema-v9 run adopts ancestry-bound delta review
 transport; it preserves the run's frozen reviewer templates and earlier review evidence. Schema v9
 validates the exact run-local paths, regular-file type, and SHA-256 digests of both

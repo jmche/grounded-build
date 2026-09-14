@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 DEFAULT_TIMEOUT_SECONDS = 1800
 MAX_REVIEW_ROUNDS = 4
 DEFAULT_MAX_REVIEW_INVOCATIONS_PER_BATCH = 10
@@ -1045,7 +1045,7 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
         or Path(state.get("run_directory", "")).resolve() != path.parent.resolve()
     ):
         raise WorkflowError("workflow state identity does not match the requested project/run")
-    if loaded_schema in {2, 3, 4, 5, 6, 7, 8, 9}:
+    if loaded_schema in {2, 3, 4, 5, 6, 7, 8, 9, 10}:
         validate_legacy_state_integrity(state, int(loaded_schema))
         state["schema_version"] = SCHEMA_VERSION
         state["_requires_migration"] = True
@@ -1068,6 +1068,7 @@ def load_state(project: Path, requested: str | None = None) -> dict[str, Any]:
         state.setdefault("usage", default_usage())
         state.setdefault("pending_decision", None)
         state.setdefault("extra_review_rounds_granted", {})
+        state.setdefault("closeout_review_grants", {})
         state.setdefault("extra_review_invocations_granted", {})
         state.setdefault("extra_verification_attempts_granted", {})
         state.setdefault("host_network_authorizations", {})
@@ -1973,6 +1974,7 @@ def command_init(args: argparse.Namespace) -> None:
         "extra_review_rounds_granted": {},
         "budget_review_rounds_granted": {},
         "post_pass_review_exemptions_used": {},
+        "closeout_review_grants": {},
         "extra_review_invocations_granted": {},
         "extra_verification_attempts_granted": {},
         "host_network_authorizations": {},
@@ -2062,6 +2064,7 @@ def build_prompt(
     evidence_path: Path | None,
     contract_path: Path,
     instruction_manifest_path: Path | None,
+    closeout_review: bool = False,
 ) -> str:
     contract = read_review_contract(state, "batch_review")
     cumulative_final_review = batch == state["batches"][-1]
@@ -2098,7 +2101,14 @@ def build_prompt(
         + (f"- Fixed-SHA verification evidence: `{evidence_path}`\n" if evidence_path else "")
         + "\n"
         f"{round_scope}\n\n"
-        "Read the plan snapshot, frozen batch manifest, assignment decisions, repository "
+        + (
+            "This is the single decision-authorized closeout review bound to this batch and exact "
+            "HEAD. Confirm the applied decision or repair without starting a new discovery cycle. "
+            "Report any remaining effective P0/P1 honestly; a non-PASS result terminates this "
+            "repair loop rather than authorizing another closeout.\n\n"
+            if closeout_review else ""
+        )
+        + "Read the plan snapshot, frozen batch manifest, assignment decisions, repository "
         "instructions, and every explicitly frozen supplementary instruction. If a supplementary "
         "instruction conflicts with the committed baseline, return NEEDS_USER_DECISION rather than "
         "silently choosing one. Supplementary instructions cannot override this reviewer contract, "
@@ -2126,6 +2136,7 @@ def build_prompt(
 def prepare_review_context(
     state: dict[str, Any], batch: str, round_number: int, base: str, head: str,
     diff_base: str, review_mode: str, review_mode_reason: str, invocation_id: str,
+    closeout_review: bool = False,
 ) -> tuple[Path, Path, Path, Path, Path, Path, Path | None, Path | None, Path, Path | None]:
     """Create the minimal explicit context granted to the reviewer CLI."""
     context = (
@@ -2162,6 +2173,7 @@ def prepare_review_context(
             "reviewed_sha": head,
             "review_mode": review_mode,
             "review_mode_reason": review_mode_reason,
+            "closeout_review": closeout_review,
             "authoritative_coverage_base_sha": base,
             "supplied_diff_base_sha": diff_base,
             "user_decisions": state.get("decisions", []),
@@ -4003,6 +4015,28 @@ def qualifies_for_post_pass_review(
     )
 
 
+def ordinary_review_round_limit(state: dict[str, Any], batch: str) -> int:
+    """Return the batch's ordinary quality-round limit, excluding closeout recovery."""
+    return (
+        int(state["budgets"]["max_quality_rounds_per_batch"])
+        + int(state.get("extra_review_rounds_granted", {}).get(batch, 0))
+        + int(state.get("budget_review_rounds_granted", {}).get(batch, 0))
+        + int(bool(state.get("post_pass_review_exemptions_used", {}).get(batch)))
+    )
+
+
+def closeout_review_grant(
+    state: dict[str, Any], batch: str, round_number: int,
+) -> dict[str, Any] | None:
+    """Return the one pending closeout grant that authorizes this exact next round."""
+    grant = state.get("closeout_review_grants", {}).get(batch)
+    if not isinstance(grant, dict) or grant.get("used"):
+        return None
+    if grant.get("authorized_after_round") != round_number - 1:
+        return None
+    return grant
+
+
 def select_review_transport(
     implementation: Path,
     authoritative_base: str,
@@ -4058,12 +4092,7 @@ def command_review(args: argparse.Namespace) -> None:
     legacy_recovery_round = legacy_recovery_round_allowed(
         state, args.batch, round_number
     )
-    round_limit = (
-        int(state["budgets"]["max_quality_rounds_per_batch"])
-        + int(state.get("extra_review_rounds_granted", {}).get(args.batch, 0))
-        + int(state.get("budget_review_rounds_granted", {}).get(args.batch, 0))
-        + int(bool(state.get("post_pass_review_exemptions_used", {}).get(args.batch)))
-    )
+    round_limit = ordinary_review_round_limit(state, args.batch)
     implementation_head = git(implementation, "rev-parse", "HEAD")
     last_review = prior[-1] if prior else None
     post_pass_exemption = bool(
@@ -4074,10 +4103,37 @@ def command_review(args: argparse.Namespace) -> None:
             bool(state.get("post_pass_review_exemptions_used", {}).get(args.batch)),
         )
     )
-    if round_number > round_limit and not legacy_recovery_round and not post_pass_exemption:
-        allowed_choices = ["DEFER_ELIGIBLE_P1", "ABORT_RUN"]
-        if not state.get("budget_review_rounds_granted", {}).get(args.batch):
-            allowed_choices.insert(0, "GRANT_ONE_REVIEW")
+    closeout_grant = closeout_review_grant(state, args.batch, round_number)
+    closeout_review = bool(
+        round_number > round_limit
+        and not legacy_recovery_round
+        and not post_pass_exemption
+        and closeout_grant is not None
+    )
+    if closeout_review and closeout_grant is not None:
+        authorization_sha = closeout_grant.get("authorization_sha")
+        if closeout_grant.get("requires_new_sha") and implementation_head == authorization_sha:
+            raise WorkflowError(
+                "the authorized closeout review requires a new fix commit after adjudication"
+            )
+        bound_sha = closeout_grant.get("bound_sha")
+        if isinstance(bound_sha, str) and bound_sha != implementation_head:
+            raise WorkflowError(
+                "the closeout review is already bound to a different implementation SHA"
+            )
+    if (
+        round_number > round_limit
+        and not legacy_recovery_round
+        and not post_pass_exemption
+        and not closeout_review
+    ):
+        existing_closeout = state.get("closeout_review_grants", {}).get(args.batch)
+        if isinstance(existing_closeout, dict):
+            allowed_choices = ["SUPERSEDE_RUN", "ABORT_RUN"]
+        else:
+            allowed_choices = ["DEFER_ELIGIBLE_P1", "ABORT_RUN"]
+            if not state.get("budget_review_rounds_granted", {}).get(args.batch):
+                allowed_choices.insert(0, "GRANT_ONE_REVIEW")
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
             "decision_id": f"decision-{slug(args.batch)}-{len(state['decisions']) + 1:03d}",
@@ -4198,7 +4254,7 @@ def command_review(args: argparse.Namespace) -> None:
         context_instruction_manifest,
     ) = prepare_review_context(
         state, args.batch, round_number, base, head,
-        diff_base, review_mode, review_mode_reason, invocation_id,
+        diff_base, review_mode, review_mode_reason, invocation_id, closeout_review,
     )
     supplied_diff_bytes = context_diff.stat().st_size
     schema_path = context_dir / "review_schema.json"
@@ -4208,6 +4264,7 @@ def command_review(args: argparse.Namespace) -> None:
         diff_base, review_mode, review_mode_reason,
         context_plan, context_batch_manifest, context_assignment, context_diff, context_ledger,
         context_legacy, context_evidence, context_contract, context_instruction_manifest,
+        closeout_review,
     )
     prompt_path.write_text(prompt, encoding="utf-8")
     prompt_path.chmod(0o600)
@@ -4234,10 +4291,21 @@ def command_review(args: argparse.Namespace) -> None:
                 "authoritative_coverage_base_sha": base,
                 "supplied_diff_base_sha": diff_base,
                 "supplied_diff_bytes": supplied_diff_bytes,
+                "closeout_review": closeout_review,
                 "command": command[:-1] + ["<PROMPT>"],
                 "prompt_path": str(prompt_path),
             }
         )
+    if closeout_review and closeout_grant is not None and not closeout_grant.get("bound_sha"):
+        closeout_grant["bound_sha"] = head
+        closeout_grant["bound_at"] = utc_now()
+        append_event(state, "CLOSEOUT_REVIEW_BOUND", {
+            "batch": args.batch,
+            "round": round_number,
+            "decision_id": closeout_grant["decision_id"],
+            "reviewed_sha": head,
+        })
+        save_state(state)
     started = time.monotonic()
     launch_error: str | None = None
     try:
@@ -4342,6 +4410,10 @@ def command_review(args: argparse.Namespace) -> None:
         assert result is not None
         payload = extract_review(state["reviewer"], result.stdout, raw_path)
         validate_review_payload(payload, state["reviewer"], args.batch, base, head, state)
+        payload["findings"] = sorted(
+            payload["findings"],
+            key=lambda finding: {"P0": 0, "P1": 1, "P2": 2}[finding["severity"]],
+        )
         ensure_clean(reviewer_path, "reviewer")
         if payload["verdict"] == "NEEDS_VERIFICATION":
             request_report = batch_dir / "verification_request.json"
@@ -4395,6 +4467,10 @@ def command_review(args: argparse.Namespace) -> None:
                 "review_round_consumed": False,
             }, 3)
         policy = apply_convergence_policy(state, payload, args.batch, round_number, head)
+        if closeout_review and policy["effective_verdict"] != "PASS":
+            policy["effective_verdict"] = "NEEDS_USER_DECISION"
+            if "CLOSEOUT_REVIEW_DID_NOT_PASS" not in policy["decision_reasons"]:
+                policy["decision_reasons"].append("CLOSEOUT_REVIEW_DID_NOT_PASS")
     except WorkflowError as exc:
         invocation.update({"status": "CONTRACT_ERROR", "error": str(exc), "completed_at": utc_now()})
         append_event(state, "INVOCATION_CONTRACT_ERROR", {
@@ -4409,7 +4485,12 @@ def command_review(args: argparse.Namespace) -> None:
             },
             4,
         )
-    report_document = {**payload, "effective_verdict": policy["effective_verdict"], "policy": policy}
+    report_document = {
+        **payload,
+        "effective_verdict": policy["effective_verdict"],
+        "policy": policy,
+        "closeout_review": closeout_review,
+    }
     atomic_json(report_path, report_document)
     atomic_json(Path(state["run_directory"]) / "finding_ledger.json", state["finding_ledger"])
     invocation.update({
@@ -4433,8 +4514,22 @@ def command_review(args: argparse.Namespace) -> None:
             "supplied_diff_base_sha": diff_base,
             "supplied_diff_bytes": supplied_diff_bytes,
             "duration_seconds": duration,
+            "closeout_review": closeout_review,
         }
     )
+    if closeout_review and closeout_grant is not None:
+        closeout_grant["used"] = True
+        closeout_grant["used_at"] = utc_now()
+        closeout_grant["used_round"] = round_number
+        closeout_grant["reviewed_sha"] = head
+        closeout_grant["effective_verdict"] = policy["effective_verdict"]
+        append_event(state, "CLOSEOUT_REVIEW_USED", {
+            "batch": args.batch,
+            "round": round_number,
+            "decision_id": closeout_grant["decision_id"],
+            "reviewed_sha": head,
+            "effective_verdict": policy["effective_verdict"],
+        })
     if post_pass_exemption:
         state.setdefault("post_pass_review_exemptions_used", {})[args.batch] = {
             "round": round_number,
@@ -4451,42 +4546,46 @@ def command_review(args: argparse.Namespace) -> None:
         "NEEDS_USER_DECISION": "NEEDS_USER_DECISION",
     }[policy["effective_verdict"]]
     if policy["effective_verdict"] == "NEEDS_USER_DECISION":
-        allowed = ["ABORT_RUN"]
-        if any(
-            reason == "NO_PROGRESS_FOR_TWO_ROUNDS"
-            or reason.startswith("SEVERITY_UPGRADE:")
-            or reason.startswith("OBLIGATION_DRIFT:")
-            for reason in policy["decision_reasons"]
-        ):
-            allowed.insert(0, "RETURN_TO_FIX")
-        if "REVIEWER_REQUESTED_DECISION" in policy["decision_reasons"] or any(
-            reason.startswith("CROSS_BATCH_MATERIAL_FINDING:")
-            for reason in policy["decision_reasons"]
-        ):
-            allowed.insert(0, "RESUME_WITH_DECISION")
-        maximum = state["budgets"]["max_quality_rounds_per_batch"]
-        convergence_granted = int(
-            state.get("extra_review_rounds_granted", {}).get(args.batch, 0)
-        )
-        budget_granted = int(
-            state.get("budget_review_rounds_granted", {}).get(args.batch, 0)
-        )
-        post_pass_granted = int(bool(
-            state.get("post_pass_review_exemptions_used", {}).get(args.batch)
-        ))
-        if (
-            round_number >= maximum + convergence_granted + budget_granted + post_pass_granted
-            and convergence_granted < 1
-        ):
-            allowed.insert(0, "GRANT_ONE_REVIEW")
-        if any(
-            item["batch"] == args.batch and item["status"] == "OPEN" and item["severity"] == "P1"
-            for item in state["finding_ledger"].values()
-        ):
-            allowed.insert(0, "DEFER_ELIGIBLE_P1")
+        if closeout_review:
+            allowed = ["SUPERSEDE_RUN", "ABORT_RUN"]
+        else:
+            allowed = ["ABORT_RUN"]
+            if any(
+                reason == "NO_PROGRESS_FOR_TWO_ROUNDS"
+                or reason.startswith("SEVERITY_UPGRADE:")
+                or reason.startswith("OBLIGATION_DRIFT:")
+                for reason in policy["decision_reasons"]
+            ):
+                allowed.insert(0, "RETURN_TO_FIX")
+            if "REVIEWER_REQUESTED_DECISION" in policy["decision_reasons"] or any(
+                reason.startswith("CROSS_BATCH_MATERIAL_FINDING:")
+                for reason in policy["decision_reasons"]
+            ):
+                allowed.insert(0, "RESUME_WITH_DECISION")
+            maximum = state["budgets"]["max_quality_rounds_per_batch"]
+            convergence_granted = int(
+                state.get("extra_review_rounds_granted", {}).get(args.batch, 0)
+            )
+            budget_granted = int(
+                state.get("budget_review_rounds_granted", {}).get(args.batch, 0)
+            )
+            post_pass_granted = int(bool(
+                state.get("post_pass_review_exemptions_used", {}).get(args.batch)
+            ))
+            if (
+                round_number >= maximum + convergence_granted + budget_granted + post_pass_granted
+                and convergence_granted < 1
+            ):
+                allowed.insert(0, "GRANT_ONE_REVIEW")
+            if any(
+                item["batch"] == args.batch and item["status"] == "OPEN" and item["severity"] == "P1"
+                for item in state["finding_ledger"].values()
+            ):
+                allowed.insert(0, "DEFER_ELIGIBLE_P1")
         state["pending_decision"] = {
             "decision_id": f"decision-{slug(args.batch)}-{len(state['decisions']) + 1:03d}",
-            "type": "REVIEW_CONVERGENCE", "batch": args.batch,
+            "type": "CLOSEOUT_REVIEW_DID_NOT_PASS" if closeout_review else "REVIEW_CONVERGENCE",
+            "batch": args.batch,
             "allowed_choices": allowed, "created_at": utc_now(),
             "reasons": policy["decision_reasons"],
         }
@@ -4521,6 +4620,7 @@ def command_review(args: argparse.Namespace) -> None:
             "duration_seconds": duration,
             "final_review_round": round_number >= MAX_REVIEW_ROUNDS,
             "legacy_recovery_round": legacy_recovery_round,
+            "closeout_review": closeout_review,
         },
         0 if policy["effective_verdict"] == "PASS" else (3 if policy["effective_verdict"] == "NEEDS_USER_DECISION" else 2),
     )
@@ -4625,6 +4725,23 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         "choice": args.choice, "reason": args.reason, "actor": args.actor,
         "finding_ids": finding_ids, "created_at": utc_now(),
     }
+    closeout_batch = pending.get("batch")
+    completed_batch_rounds = sum(
+        1 for item in state.get("reviews", []) if item.get("batch") == closeout_batch
+    )
+    authorize_closeout = bool(
+        isinstance(closeout_batch, str)
+        and pending.get("type") in {"REVIEW_CONVERGENCE", "REVIEW_BUDGET_EXHAUSTED"}
+        and args.choice in {"RETURN_TO_FIX", "DEFER_ELIGIBLE_P1", "RESUME_WITH_DECISION"}
+        and completed_batch_rounds >= ordinary_review_round_limit(state, closeout_batch)
+        and not isinstance(state.get("closeout_review_grants", {}).get(closeout_batch), dict)
+    )
+    if authorize_closeout:
+        decision["closeout_review_authorization"] = {
+            "batch": closeout_batch,
+            "authorized_after_round": completed_batch_rounds,
+            "requires_new_sha": args.choice == "RETURN_TO_FIX",
+        }
     if args.choice == "GRANT_ONE_REVIEW":
         batch = pending.get("batch")
         if not isinstance(batch, str):
@@ -4725,9 +4842,32 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         state["status"] = str(pending.get("previous_status", "IMPLEMENTING"))
     else:
         raise WorkflowError(f"choice requires its dedicated contract command: {args.choice}")
+    if authorize_closeout:
+        implementation = validate_implementation(state)
+        authorization_sha = git(implementation, "rev-parse", "HEAD")
+        state.setdefault("closeout_review_grants", {})[str(closeout_batch)] = {
+            "decision_id": decision["id"],
+            "pending_decision_id": args.decision_id,
+            "choice": args.choice,
+            "authorized_after_round": completed_batch_rounds,
+            "authorization_sha": authorization_sha,
+            "requires_new_sha": args.choice == "RETURN_TO_FIX",
+            "bound_sha": None,
+            "used": False,
+            "authorized_at": utc_now(),
+        }
     state["pending_decision"] = None
     state["decisions"].append(decision)
     append_event(state, "USER_ADJUDICATED", decision)
+    if authorize_closeout:
+        append_event(state, "CLOSEOUT_REVIEW_AUTHORIZED", {
+            "batch": closeout_batch,
+            "decision_id": decision["id"],
+            "pending_decision_id": args.decision_id,
+            "choice": args.choice,
+            "authorization_sha": authorization_sha,
+            "authorized_after_round": completed_batch_rounds,
+        })
     save_state(state)
     emit({"status": "ADJUDICATED", "run_id": state["run_id"], "decision": decision, "run_status": state["status"]})
 
@@ -4863,6 +5003,7 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "contract_review_invocations": state.get("contract_review_invocations", []),
         "budgets": state.get("budgets", {}), "usage": state.get("usage", {}),
         "pending_decision": state.get("pending_decision"),
+        "closeout_review_grants": state.get("closeout_review_grants", {}),
         "final_verification": state.get("final_verification"),
         "final_sha": state["final_sha"], "plan_digest": state["plan_digest"],
         "plan_snapshot": state["plan_snapshot"],

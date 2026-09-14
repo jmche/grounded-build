@@ -2368,6 +2368,34 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(current["review_contract"], original_contract)
         self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema9"))
 
+    def test_schema10_run_requires_explicit_closeout_recovery_migration(self) -> None:
+        initialized = self.initialize_raw("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        original_contract = json.loads(json.dumps(state["review_contract"]))
+        state.pop("closeout_review_grants")
+        self.write_authenticated_legacy_state(state_path, state, 10)
+
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
+        )
+        self.assertEqual(status["status"], "MIGRATION_REQUIRED")
+        preview = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"])
+        )
+        self.assertEqual(preview["from_schema"], 10)
+        self.assertEqual(preview["to_schema"], WORKFLOW_MODULE.SCHEMA_VERSION)
+        self.assertFalse(preview["review_contract_migration"])
+        migrated = self.workflow(
+            "migrate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--apply",
+        )
+        current = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["schema_version"], WORKFLOW_MODULE.SCHEMA_VERSION)
+        self.assertEqual(current["review_contract"], original_contract)
+        self.assertEqual(current["closeout_review_grants"], {})
+        self.assertTrue(Path(str(migrated["backup_path"])).name.startswith("workflow.schema10"))
+
     def test_sequential_migration_uses_the_actual_loaded_schema(self) -> None:
         initialized = self.initialize_raw("codex")
         state_path = Path(str(initialized["run_directory"])) / "workflow.json"
@@ -2638,6 +2666,192 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(first["status"], "REVIEW_PASS")
         later_head = self.commit_batch_change(implementation, "implemented once more\n")
         return initialized, first, later_head
+
+    def _reach_exhausted_review_decision(
+        self, reviewer_decision_at_final: bool = False,
+    ) -> tuple[dict, Path, dict]:
+        """Reach the final ordinary review with one stable OPEN P1."""
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        run_id = str(initialized["run_id"])
+        finding = {
+            "id": "F-1-001", "fingerprint": "persistent-closeout-defect",
+            "severity": "P1", "novelty": "INITIAL_REVIEW",
+            "why_not_detectable_earlier": "", "introduced_by_sha": "",
+            "severity_change_justification": "", "location": "tracked.txt:1",
+            "trigger": "the fixture content is reviewed",
+            "consequence": "the required content remains incorrect",
+            "required_outcome": "make the fixture content correct",
+        }
+        self.environment["FAKE_FINDINGS"] = json.dumps([finding])
+        for round_number in range(1, 4):
+            self.commit_batch_change(implementation, f"unfixed round {round_number}\n")
+            result = self.workflow(
+                "review", "--project", str(self.project), "--run-id", run_id,
+                "--batch", "1", expected=3 if round_number == 3 else 2,
+            )
+            if round_number == 3:
+                self.assertEqual(result["status"], "NEEDS_USER_DECISION")
+                pending = self.workflow(
+                    "status", "--project", str(self.project), "--run-id", run_id,
+                )["pending_decision"]
+                self.workflow(
+                    "adjudicate", "--project", str(self.project), "--run-id", run_id,
+                    "--decision-id", str(pending["decision_id"]),
+                    "--choice", "RETURN_TO_FIX", "--reason", "complete the bounded repair",
+                    "--actor", "test-user", "--apply",
+                )
+        self.commit_batch_change(implementation, "unfixed round 4\n")
+        if reviewer_decision_at_final:
+            self.environment["FAKE_REVIEW_NEEDS_DECISION"] = "1"
+        final = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id,
+            "--batch", "1", expected=3,
+        )
+        self.environment.pop("FAKE_REVIEW_NEEDS_DECISION", None)
+        self.assertEqual(final["status"], "NEEDS_USER_DECISION")
+        return initialized, implementation, finding
+
+    def test_exhausted_return_to_fix_gets_one_sha_bound_closeout_and_can_accept(self) -> None:
+        initialized, implementation, finding = self._reach_exhausted_review_decision()
+        run_id = str(initialized["run_id"])
+        pending = self.workflow(
+            "status", "--project", str(self.project), "--run-id", run_id,
+        )["pending_decision"]
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(pending["decision_id"]), "--choice", "RETURN_TO_FIX",
+            "--reason", "apply the final bounded repair", "--actor", "test-user", "--apply",
+        )
+        without_commit = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id,
+            "--batch", "1", expected=1,
+        )
+        self.assertIn("requires a new fix commit", without_commit["error"])
+
+        closeout_head = self.commit_batch_change(implementation, "fixed for closeout\n")
+        self.environment["FAKE_CODEX_EXIT"] = "1"
+        infrastructure = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id,
+            "--batch", "1", expected=4,
+        )
+        self.assertEqual(infrastructure["status"], "REVIEWER_ERROR")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        grant = json.loads(state_path.read_text(encoding="utf-8"))["closeout_review_grants"]["1"]
+        self.assertEqual(grant["bound_sha"], closeout_head)
+        self.assertFalse(grant["used"])
+
+        self.environment.pop("FAKE_CODEX_EXIT")
+        self.environment["FAKE_FINDINGS"] = "[]"
+        self.environment["FAKE_RESOLVED_FINDING_IDS"] = json.dumps([finding["id"]])
+        closeout = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+        )
+        self.assertEqual(closeout["status"], "REVIEW_PASS")
+        self.assertTrue(closeout["closeout_review"])
+        self.assertEqual(closeout["reviewed_sha"], closeout_head)
+        accepted = self.workflow(
+            "accept", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+            "--review-file", str(closeout["report_path"]),
+        )
+        self.assertEqual(accepted["status"], "BATCH_ACCEPTED")
+        self.environment.pop("FAKE_FINDINGS")
+        self.environment.pop("FAKE_RESOLVED_FINDING_IDS")
+
+    def test_exhausted_deferral_gets_same_sha_closeout(self) -> None:
+        initialized, _, finding = self._reach_exhausted_review_decision()
+        run_id = str(initialized["run_id"])
+        status = self.workflow("status", "--project", str(self.project), "--run-id", run_id)
+        head = status["implementation_sha"]
+        pending = status["pending_decision"]
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(pending["decision_id"]), "--choice", "DEFER_ELIGIBLE_P1",
+            "--finding-ids", str(finding["id"]), "--reason", "defer the eligible P1",
+            "--actor", "test-user", "--apply",
+        )
+        self.environment["FAKE_FINDINGS"] = "[]"
+        closeout = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+        )
+        self.assertEqual(closeout["status"], "REVIEW_PASS")
+        self.assertTrue(closeout["closeout_review"])
+        self.assertEqual(closeout["reviewed_sha"], head)
+        self.assertEqual(closeout["review_mode_reason"], "SAME_SHA_AFTER_USER_DECISION")
+        self.environment.pop("FAKE_FINDINGS")
+
+    def test_nonpassing_closeout_is_terminal_for_the_repair_loop(self) -> None:
+        initialized, implementation, _ = self._reach_exhausted_review_decision()
+        run_id = str(initialized["run_id"])
+        pending = self.workflow(
+            "status", "--project", str(self.project), "--run-id", run_id,
+        )["pending_decision"]
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(pending["decision_id"]), "--choice", "RETURN_TO_FIX",
+            "--reason", "attempt the final bounded repair", "--actor", "test-user", "--apply",
+        )
+        self.commit_batch_change(implementation, "still unfixed at closeout\n")
+        closeout = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id,
+            "--batch", "1", expected=3,
+        )
+        self.assertEqual(closeout["status"], "NEEDS_USER_DECISION")
+        self.assertIn("CLOSEOUT_REVIEW_DID_NOT_PASS", closeout["decision_reasons"])
+        terminal = self.workflow(
+            "status", "--project", str(self.project), "--run-id", run_id,
+        )["pending_decision"]
+        self.assertEqual(terminal["type"], "CLOSEOUT_REVIEW_DID_NOT_PASS")
+        self.assertEqual(terminal["allowed_choices"], ["SUPERSEDE_RUN", "ABORT_RUN"])
+        self.environment.pop("FAKE_FINDINGS")
+
+    def test_exhausted_decision_only_resume_gets_same_sha_closeout(self) -> None:
+        initialized, _, finding = self._reach_exhausted_review_decision(
+            reviewer_decision_at_final=True
+        )
+        run_id = str(initialized["run_id"])
+        status = self.workflow("status", "--project", str(self.project), "--run-id", run_id)
+        pending = status["pending_decision"]
+        self.assertIn("RESUME_WITH_DECISION", pending["allowed_choices"])
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(pending["decision_id"]), "--choice", "RESUME_WITH_DECISION",
+            "--reason", "retain the declared authority", "--actor", "test-user", "--apply",
+        )
+        self.environment["FAKE_FINDINGS"] = "[]"
+        self.environment["FAKE_RESOLVED_FINDING_IDS"] = json.dumps([finding["id"]])
+        closeout = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+        )
+        self.assertEqual(closeout["status"], "REVIEW_PASS")
+        self.assertTrue(closeout["closeout_review"])
+        self.assertEqual(closeout["reviewed_sha"], status["implementation_sha"])
+        self.environment.pop("FAKE_FINDINGS")
+        self.environment.pop("FAKE_RESOLVED_FINDING_IDS")
+
+    def test_review_findings_are_returned_in_declared_severity_order(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        findings = []
+        for severity in ("P2", "P0", "P1"):
+            findings.append({
+                "id": f"F-{severity}", "fingerprint": f"fixture-{severity.lower()}",
+                "severity": severity, "novelty": "INITIAL_REVIEW",
+                "why_not_detectable_earlier": "", "introduced_by_sha": "",
+                "severity_change_justification": "", "location": "tracked.txt:1",
+                "trigger": "the fixture is reviewed", "consequence": f"{severity} consequence",
+                "required_outcome": f"resolve the {severity} consequence",
+            })
+        self.environment["FAKE_FINDINGS"] = json.dumps(findings)
+        reviewed = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=2,
+        )
+        self.assertEqual(
+            [finding["severity"] for finding in reviewed["findings"]], ["P0", "P1", "P2"]
+        )
+        self.environment.pop("FAKE_FINDINGS")
 
     def test_a_commit_after_pass_is_reviewable_instead_of_wedging_the_run(self) -> None:
         self.plan.write_text(
@@ -3904,6 +4118,23 @@ class DocumentationContractTests(unittest.TestCase):
             self.assertIn("named", document)
         self.assertIn("verdict=NEEDS_USER_DECISION", reviewer)
         self.assertIn("exactly one P1 finding", reviewer)
+
+    def test_review_tiers_and_closeout_recovery_are_shared_contracts(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        workflow = (SKILL_ROOT / "references" / "implementation_workflow.md").read_text(
+            encoding="utf-8"
+        )
+        reviewer = (SKILL_ROOT / "references" / "reviewer_prompt.md").read_text(
+            encoding="utf-8"
+        )
+        for document in (skill, workflow, reviewer):
+            self.assertIn("P0", document)
+            self.assertIn("P1", document)
+            self.assertIn("P2", document)
+            self.assertIn("closeout", document.lower())
+            self.assertIn("nonblocking", document.lower())
+        self.assertIn("exact implementation SHA", reviewer)
+        self.assertIn("SUPERSEDE_RUN", workflow)
 
     def test_runtime_contract_explains_controller_identity_and_venv_bridge(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
