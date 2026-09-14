@@ -2805,6 +2805,67 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(terminal["allowed_choices"], ["SUPERSEDE_RUN", "ABORT_RUN"])
         self.environment.pop("FAKE_FINDINGS")
 
+    def test_closeout_invocation_exhaustion_has_one_grant_then_terminal_choices(self) -> None:
+        initialized, implementation, _ = self._reach_exhausted_review_decision()
+        run_id = str(initialized["run_id"])
+        pending = self.workflow(
+            "status", "--project", str(self.project), "--run-id", run_id,
+        )["pending_decision"]
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(pending["decision_id"]), "--choice", "RETURN_TO_FIX",
+            "--reason", "attempt the final bounded repair", "--actor", "test-user", "--apply",
+        )
+        self.commit_batch_change(implementation, "fixed for invocation closeout\n")
+        self.environment["FAKE_CODEX_EXIT"] = "1"
+        # Four valid reviews already consumed four invocations. Six infrastructure failures bind
+        # but do not consume the closeout and bring this batch to its normal invocation cap.
+        for _ in range(6):
+            self.workflow(
+                "review", "--project", str(self.project), "--run-id", run_id,
+                "--batch", "1", expected=4,
+            )
+        first_park = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id,
+            "--batch", "1", expected=3,
+        )["pending_decision"]
+        self.assertEqual(
+            first_park["allowed_choices"],
+            ["GRANT_ONE_REVIEW_INVOCATION", "SUPERSEDE_RUN", "ABORT_RUN"],
+        )
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(first_park["decision_id"]),
+            "--choice", "GRANT_ONE_REVIEW_INVOCATION", "--reason", "one final call",
+            "--actor", "test-user", "--apply",
+        )
+        self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id,
+            "--batch", "1", expected=4,
+        )
+        second_park = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id,
+            "--batch", "1", expected=3,
+        )["pending_decision"]
+        self.assertEqual(second_park["allowed_choices"], ["SUPERSEDE_RUN", "ABORT_RUN"])
+        state = self.workflow("status", "--project", str(self.project), "--run-id", run_id)
+        self.assertFalse(state["closeout_review_grants"]["1"]["used"])
+        for choice in second_park["allowed_choices"]:
+            preview = self.workflow(
+                "adjudicate", "--project", str(self.project), "--run-id", run_id,
+                "--decision-id", str(second_park["decision_id"]), "--choice", choice,
+                "--reason", "terminal closeout choice", "--actor", "test-user",
+            )
+            self.assertEqual(preview["status"], "ADJUDICATION_PREVIEW")
+        abandoned = self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(second_park["decision_id"]), "--choice", "ABORT_RUN",
+            "--reason", "closeout calls are exhausted", "--actor", "test-user", "--apply",
+        )
+        self.assertEqual(abandoned["run_status"], "ABANDONED")
+        self.environment.pop("FAKE_CODEX_EXIT")
+        self.environment.pop("FAKE_FINDINGS")
+
     def test_exhausted_decision_only_resume_gets_same_sha_closeout(self) -> None:
         initialized, _, finding = self._reach_exhausted_review_decision(
             reviewer_decision_at_final=True
@@ -3126,7 +3187,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(parked["reason"], "REVIEW_INVOCATION_BUDGET_EXHAUSTED")
         decision = parked["pending_decision"]
-        self.assertIn("GRANT_ONE_REVIEW_INVOCATION", decision["allowed_choices"])
+        self.assertEqual(
+            decision["allowed_choices"],
+            ["GRANT_ONE_REVIEW_INVOCATION", "SUPERSEDE_RUN", "ABORT_RUN"],
+        )
         self.assertIn("previous_status", decision)
 
     def test_granted_invocation_restores_the_parked_status_and_is_usable(self) -> None:
@@ -3158,28 +3222,43 @@ class WorkflowIntegrationTests(unittest.TestCase):
         implementation = Path(str(initialized["implementation_worktree"]))
         self.commit_batch_change(implementation, "implemented\n")
         self._exhaust_review_invocations(initialized)
-        for expected_choice_available in (True, False):
-            parked = self.workflow(
-                "review", "--project", str(self.project),
-                "--run-id", str(initialized["run_id"]), "--batch", "1", expected=3,
+        parked = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=3,
+        )
+        decision_id = parked["pending_decision"]["decision_id"]
+        self.workflow(
+            "adjudicate", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--decision-id", decision_id,
+            "--choice", "GRANT_ONE_REVIEW_INVOCATION", "--reason", "one final call",
+            "--actor", "test-user", "--apply",
+        )
+        self.environment["FAKE_CODEX_EXIT"] = "1"
+        self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=4,
+        )
+        self.environment.pop("FAKE_CODEX_EXIT")
+        exhausted = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "1", expected=3,
+        )["pending_decision"]
+        self.assertEqual(exhausted["allowed_choices"], ["SUPERSEDE_RUN", "ABORT_RUN"])
+        for choice in exhausted["allowed_choices"]:
+            preview = self.workflow(
+                "adjudicate", "--project", str(self.project),
+                "--run-id", str(initialized["run_id"]),
+                "--decision-id", str(exhausted["decision_id"]), "--choice", choice,
+                "--reason", "terminal invocation-budget choice", "--actor", "test-user",
             )
-            decision_id = parked["pending_decision"]["decision_id"]
-            args = [
-                "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-                "--decision-id", decision_id, "--choice", "GRANT_ONE_REVIEW_INVOCATION",
-                "--reason", "another call", "--actor", "test-user", "--apply",
-            ]
-            if expected_choice_available:
-                self.workflow(*args)
-                self.environment["FAKE_CODEX_EXIT"] = "1"
-                self.workflow(
-                    "review", "--project", str(self.project),
-                    "--run-id", str(initialized["run_id"]), "--batch", "1", expected=4,
-                )
-                self.environment.pop("FAKE_CODEX_EXIT")
-            else:
-                refused = self.workflow(*args, expected=1)
-                self.assertIn("already used for this batch", refused["error"])
+            self.assertEqual(preview["status"], "ADJUDICATION_PREVIEW")
+        superseded = self.workflow(
+            "adjudicate", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]),
+            "--decision-id", str(exhausted["decision_id"]), "--choice", "SUPERSEDE_RUN",
+            "--reason", "ordinary review calls are exhausted", "--actor", "test-user", "--apply",
+        )
+        self.assertEqual(superseded["run_status"], "SUPERSEDED")
 
     def test_obligation_drift_reaches_a_typed_decision_with_both_exits(self) -> None:
         """A finding restated at a third location stops the batch and offers a real choice."""

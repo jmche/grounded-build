@@ -4203,11 +4203,10 @@ def command_review(args: argparse.Namespace) -> None:
     git(reviewer_path, "switch", "--detach", head)
     ensure_clean(reviewer_path, "reviewer")
 
-    # An invocation budget is a bounded resource like the round budget beside it, and running
-    # out of one is a fact that a single grant can change -- yet this decision used to offer only
-    # ABORT_RUN and DEFER_ELIGIBLE_P1, and DEFER refuses outright when the batch holds no eligible
-    # OPEN P1, leaving abandonment as the only move. It now mirrors REVIEW_BUDGET_EXHAUSTED: one
-    # explicit extra invocation, once per batch, restoring the status the run parked from.
+    # An invocation budget is a bounded resource like the round budget beside it. Only its one
+    # explicit invocation grant can restore call authority; deferring a finding changes semantic
+    # policy but cannot make another reviewer call executable. Once that grant is spent, advertise
+    # only honest terminal routes instead of returning the run to the same exhausted guard.
     if (
         not args.dry_run
         and int(state["usage"]["review_invocations_by_batch"].get(args.batch, 0))
@@ -4215,13 +4214,14 @@ def command_review(args: argparse.Namespace) -> None:
         + int(state["extra_review_invocations_granted"].get(args.batch, 0))
     ):
         previous_status = state["status"]
+        allowed_choices = ["SUPERSEDE_RUN", "ABORT_RUN"]
+        if not state.get("extra_review_invocations_granted", {}).get(args.batch):
+            allowed_choices.insert(0, "GRANT_ONE_REVIEW_INVOCATION")
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
             "decision_id": f"review-call-budget-{slug(args.batch)}-{len(state['decisions']) + 1:03d}",
             "type": "REVIEW_INVOCATION_BUDGET_EXHAUSTED", "batch": args.batch,
-            "allowed_choices": [
-                "GRANT_ONE_REVIEW_INVOCATION", "DEFER_ELIGIBLE_P1", "ABORT_RUN",
-            ],
+            "allowed_choices": allowed_choices,
             "previous_status": previous_status,
             "created_at": utc_now(),
         }

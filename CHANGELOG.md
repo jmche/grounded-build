@@ -13,6 +13,9 @@ All notable changes use semantic versioning.
 - Made review triage explicit and deterministic: findings are returned in P0, P1, P2 consequence
   order, P2 remains constructive and nonblocking, and preference-only advice stays outside the
   finding ledger.
+- Removed dead invocation-budget choices: the one extra reviewer call is advertised only while it
+  remains available, deferral is not presented as call-capacity recovery, and exhausted runs expose
+  only auditable supersession or abandonment.
 
 ## [0.7.0] - 2026-09-10
 
