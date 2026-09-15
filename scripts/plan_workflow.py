@@ -3203,7 +3203,12 @@ def validate_review(
     }
     checked = payload.get("blocking_finding_ids_checked")
     if len(checked) != len(set(checked)) or set(checked) != required_blocking:
-        raise WorkflowError("review receipt must check every blocking stable finding exactly once")
+        missing = sorted(required_blocking - set(checked))
+        unexpected = sorted(set(checked) - required_blocking)
+        repeats = sorted({item for item in checked if checked.count(item) > 1})
+        raise WorkflowError(
+            "review receipt must check every blocking stable finding exactly once: "
+            f"missing={missing}, unexpected={unexpected}, repeated={repeats}")
     findings = payload.get("findings")
     if not isinstance(findings, list):
         raise WorkflowError("review findings must be a list")
@@ -4193,8 +4198,10 @@ def command_final_review(args: argparse.Namespace) -> None:
         "whether every exit condition names a finite observation. The plan may choose between drafts only when "
         "the choice is supported by evidence; do not demand excluded work without identifying a request conflict. "
         "PASS is valid only when no supported P0 or P1 finding remains; if you emit any P0/P1 finding, verdict must "
-        "be FAIL or NEEDS_USER_DECISION. Read synthesis_manifest.json and return a digest-bound criteria receipt; "
-        "each named criterion and every blocking stable finding must be checked exactly once. "
+        "be FAIL or NEEDS_USER_DECISION. Read {context}/blocking_findings.json: its "
+        "required_blocking_finding_ids list is EXACTLY the set to return in blocking_finding_ids_checked "
+        "(no more, no less, no repeats), and severity_by_id gives each key's severity. Return a digest-bound "
+        "criteria receipt; every named criterion must be checked exactly once. "
         "Do not edit files. Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, "
         "baseline_sha={sha}, scope_digest={scope_digest}, candidate_plan_sha256={plan_digest}, and "
         "candidate_batch_manifest_sha256={batch_digest}, and "
@@ -4205,12 +4212,27 @@ def command_final_review(args: argparse.Namespace) -> None:
         scope_digest=state["scope_digest"], plan_digest=state["candidate"]["plan_sha256"],
         batch_digest=state["candidate"]["batch_manifest_sha256"],
         manifest_digest=state["candidate"]["synthesis_manifest_sha256"], context="{context}")
+    # The receipt must name every blocking stable finding EXACTLY once, so the reviewer is handed the
+    # list instead of deriving it: the dispositions in synthesis_manifest.json carry no severity, and a
+    # live final review was rejected for a set it could not know.
+    _blocking_path = Path(state["run_directory"]) / "final_reviews" / "blocking_findings.json"
+    _blocking_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(_blocking_path, {
+        "required_blocking_finding_ids": sorted(
+            key for key, record in (state.get("finding_ledger") or {}).items()
+            if (record.get("canonical") or {}).get("severity") in {"P0", "P1"}),
+        "severity_by_id": {
+            key: (record.get("canonical") or {}).get("severity")
+            for key, record in sorted((state.get("finding_ledger") or {}).items())
+        },
+    })
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
         "scope_authority.json": Path(state["scope_authority_path"]),
         "causal_analysis.md": CAUSAL_ANALYSIS,
         "finding_ledger.json": Path(state["finding_ledger_path"]),
+        "blocking_findings.json": _blocking_path,
         "implementation_plan.md": Path(state["candidate"]["plan"]),
         "batches.md": Path(state["candidate"]["batch_manifest"]),
         "synthesis_manifest.json": Path(state["candidate"]["synthesis_manifest"]),

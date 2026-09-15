@@ -59,6 +59,12 @@ All notable changes use semantic versioning.
   still sees everything the claim rests on. An entry naming nothing resolvable is still rejected —
   it would have no verifiable anchor at all.
 
+- Handed the final reviewer the blocking set it must check. The receipt has to name every P0/P1
+  stable finding exactly once, while the reviewer's context listed dispositions WITHOUT severity, so
+  a live final review was rejected for a set it could not derive. The context now carries
+  `blocking_findings.json` (`required_blocking_finding_ids` plus `severity_by_id`), the prompt names
+  it as the exact set to return, and the complaint reports what was missing, unexpected or repeated.
+
 ## [0.7.2] - 2026-09-15
 
 - Made planning evidence receipts consequential: required evidence, root-cause traces, repository
