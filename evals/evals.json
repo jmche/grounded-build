@@ -159,6 +159,20 @@
         "Verification is the consequential unit test plus relevant regression coverage.",
         "The requested one-function scope remains frozen."
       ]
+    },
+    {
+      "id": 14,
+      "prompt": "Use grounded-build to plan the requested parser repair. During investigation you may notice that replacing the adjacent serializer would be useful, but I have not authorized that extra work. If a product choice blocks the root-cause plan, ask me once before drafting. Do not treat a reviewer saying VERIFIED or PASS as proof by itself.",
+      "expected_output": "Both investigators first produce traceable evidence receipts. Blocking user questions are batched before drafting, the serializer remains excluded unless its exact proposed-extension id is explicitly authorized, every cross-review disposes the frozen finding ledger, and final PASS is bound to the exact synthesized candidate and review criteria.",
+      "files": [],
+      "assertions": [
+        "A blocking investigation question reaches NEEDS_USER_DECISION before either draft starts.",
+        "An omitted proposed extension remains excluded and cannot appear in plan_scope_ids.",
+        "Repository and command evidence are bound to the frozen baseline and non-empty digest receipts.",
+        "Every integrated draft dispositions every stable finding from its round barrier exactly once.",
+        "Synthesis binds plan, batches, scopes, finding dispositions, and residual questions in a machine-readable manifest.",
+        "Final PASS covers every review criterion and blocking stable finding for the exact candidate digests."
+      ]
     }
   ]
 }

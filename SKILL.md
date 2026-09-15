@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.7.1
+  version: 0.7.2
   compatibility: Linux, Git, Python 3.11+, bubblewrap and socat (both sandbox packages; the provider CLI sandbox is fail-closed), and at least one Claude, Codex, dsh, or protocol-compatible other CLI adapter
 ---
 
@@ -27,6 +27,9 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
 - Agreement is not evidence. Bind claims to files, symbols, tests, commands, or authoritative sources.
 - Freeze scope before investigation. Divergence may widen evidence, causal analysis, failure-path coverage,
   alternatives, and verification, but never the user-authorized objective.
+- `TARGET-001` is the frozen request authority. A `PROPOSED_EXTENSION-NNN` remains excluded until a
+  typed investigation-boundary decision explicitly supplies the same id through `--authorize-scope-id`.
+  Never infer authorization from prose or from an agent assigning a scope label.
 - Use [references/causal_analysis.md](references/causal_analysis.md) to trace authority, actual inputs,
   responsible producers, consumer interpretation, and the earliest responsible decision. Apply it
   proportionally; do not force a large causal model onto a direct, uncontested local edit.
@@ -151,8 +154,13 @@ python3 <skill-root>/scripts/plan_workflow.py next \
 
 - For `RUN_AGENT_BATCH`, inspect every `preview_commands` entry, then launch every listed `commands` entry concurrently and wait at the stated barrier. Never wait for A before starting B in the same round.
 - For `RUN_AGENT`, execute `preview_command`, inspect it, then execute `command` (used for single-reviewer stages).
-- For `HOST_SYNTHESIS`, run its command and read every returned artifact. Write `implementation_plan.md` and `batches.md` in the returned output directory. Resolve disagreement by evidence and preserve unresolved product choices.
+- For `HOST_SYNTHESIS`, run its command and read every returned artifact. Write `implementation_plan.md`,
+  `batches.md`, and `synthesis_manifest.json` in the returned output directory. The JSON receipt binds
+  both document digests, the authorized plan scopes, every stable finding disposition, and residual
+  non-blocking questions. Resolve disagreement by evidence and preserve unresolved product choices.
 - For `ASK_USER`, present the evidence and allowed typed decision; preview the corresponding adjudication before `--apply`.
+  For an investigation boundary, answer the batched questions once and pass each extension the user
+  actually authorizes as a repeated `--authorize-scope-id`; every omitted proposal remains excluded.
 - For `STOP_FOR_IMPLEMENTATION_APPROVAL`, export and stop.
 
 Repeat `next` after each completed action. Do not guess a slot, reviewer, phase, or retry.
@@ -168,6 +176,11 @@ The workflow computes stable `F-*` fingerprints from scope, problem, and causal 
 dispose those ledger keys and must submit genuinely new findings in full solution form. Draft-time repository
 discoveries go into structured `new_evidence`; unrecorded observations cannot be cited. Integrators may propose
 evidence-backed aliases for semantically duplicate `F-*` observations, but uncertain equivalence remains separate.
+Evidence receipts use non-empty claims and locators, a lowercase SHA-256 digest, and the frozen baseline
+as `version_or_commit` for repository and command evidence. Residual questions are structured and identify
+their scope, decision owner, blocking effect, options, rationale, and evidence. Blocking user questions are
+batched after both investigations and stop before drafting; blocking planner-owned questions are invalid.
+Every integrated draft declares `plan_scope_ids` and disposes the complete frozen finding ledger exactly once.
 
 Before submitting synthesis, run:
 
@@ -181,8 +194,15 @@ Fix errors and consider every warning. Each `Bxx:` block should explicitly label
 ```bash
 python3 <skill-root>/scripts/plan_workflow.py submit-synthesis \
   --project <project> --run-id <run-id> \
-  --plan <implementation_plan.md> --batch-manifest <batches.md>
+  --plan <implementation_plan.md> --batch-manifest <batches.md> \
+  --synthesis-manifest <synthesis_manifest.json>
 ```
+
+The synthesis manifest must bind the exact plan and batch digests, declare authorized plan scope ids,
+disposition every stable finding exactly once, map accepted P0/P1 findings to batches, cite contrary
+evidence for rejected findings, and contain no blocking unresolved question. Final reviewers return a
+candidate-bound receipt covering request, scope, evidence/root cause, dependencies, budgets, and batch
+acceptance; every blocking stable finding must be checked before PASS can mint `READY`.
 
 ### 4. Export and stop
 

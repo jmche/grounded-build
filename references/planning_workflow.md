@@ -95,6 +95,13 @@ suffix, such as `TARGET-001` or `EVIDENCE_ONLY-003`; bare class names are invali
 `OUT_OF_SCOPE` cannot enter a candidate. A later round may deepen evidence or causal/verification coverage,
 but it cannot enlarge the objective.
 
+The initial contract authorizes only `TARGET-001`, whose authority is the digest-bound request. Support
+and evidence ids refine that objective but cannot redefine it. A proposed extension is not authorized
+merely because an agent labels it: after both investigations, the engine batches blocking user questions
+into one `INVESTIGATION_BOUNDARY`. Each accepted extension is recorded explicitly with
+`--authorize-scope-id PROPOSED_EXTENSION-NNN`; omitted proposals remain excluded. Draft and integration
+outputs declare `plan_scope_ids`, and the engine rejects unauthorized extensions and `OUT_OF_SCOPE` ids.
+
 `preflight` and `init` accept `--base-ref <ref>` (default `HEAD`) and resolve it once to a committed
 SHA. A dirty source checkout is reported but does not block either command; staged, modified, and
 untracked content is excluded from the detached planning worktree. Use an explicit ref when `HEAD`
@@ -106,6 +113,19 @@ the draft may cite it. Local repository evidence is primary. With
 `research_policy=authoritative-web`, investigation calls alone may consult official project documentation or
 the official GitHub repository. Each external record includes its URL, retrieval time, version/tag/commit,
 content digest, and supported claim. Search snippets are discovery aids only.
+
+Evidence receipt fields are consequential. Claims, locators, retrieval/version bindings, and digests are
+non-empty; digests are lowercase SHA-256 values; repository and command evidence bind
+`version_or_commit` to the frozen baseline. These checks establish traceability, not semantic truth—the
+authorized reviewer still judges whether the evidence supports the claim.
+Repository locators are baseline-relative file paths with an optional line range, and their digest is
+checked against the complete frozen file. Command and external-source digests remain producer receipts
+because replaying commands or network retrieval inside a deterministic validator would change authority.
+
+Residual questions are structured with scope id, decision owner, blocking flag, rationale, explicit
+options, and evidence ids. A blocking planner-owned question is invalid because the investigator still
+owns that work. Blocking user-owned questions stop before draft and are presented as one batch. Drafts
+and synthesis may carry only non-blocking residual uncertainty.
 
 Every planning stage receives `causal_analysis.md`. Use its universal production trace for material
 defects and responsibility disputes, then adapt evidence to deterministic, generative, external,
@@ -124,6 +144,9 @@ at the round barrier. Integration rounds may accept or reject known keys; new di
 complete finding contract before receiving a stable key. Evidence-backed `finding_aliases` may identify
 multiple observations of the same underlying defect without deleting provenance. Repeated local IDs,
 wording similarity, or agreement alone do not establish semantic equivalence.
+Every draft_02/draft_03 output must place each key from its frozen round ledger exactly once in
+`accepted_finding_ids` or `rejected_finding_ids`. PASS cannot coexist with a P0/P1 review finding or a
+blocking unresolved user question.
 
 ## State progression
 
@@ -156,11 +179,16 @@ The `next` command returns exactly one of:
 
 ## Synthesis contract
 
-The final plan and manifest must state total included/excluded scope; scope ids; numbered items, dependencies,
+The final plan and batch manifest must state total included/excluded scope; scope ids; numbered items, dependencies,
 components, and semantics; existing budget meanings; ordered `Bxx` mapping; finite exit observations and
 verification commands; compatibility, migration, rollback, recovery, risk, evidence limitations, and
 dispositions of disputed proposals. Material findings use solution form: problem, evidence, root cause or
 honest unresolved status, affected surfaces, recommended solution, alternatives/tradeoffs, and verification.
+
+Host synthesis also produces `synthesis_manifest.json`. This machine-readable receipt binds the baseline,
+scope digest, plan digest, and batch-manifest digest; declares plan scope ids; disposes every stable finding
+exactly once; maps accepted blocking findings to batches; cites evidence for rejections; and carries no
+blocking unresolved question. It does not decide whether a solution is meaningful—the final reviewer does.
 
 `check-synthesis` catches structural errors and warns before a paid final review. It compares plan and manifest
 batch sets, validates dependency references and acyclicity, flags repeatable work without numeric bounds, and
@@ -168,12 +196,19 @@ checks stable finding dispositions when run during submission. Every `Bxx:` bloc
 `Exit observation:` and `Verification:` so the deterministic check can recognize it. Its warnings do not prove
 semantic quality; final reviewers still inspect repository evidence.
 
+Submission rejects a missing or invalid synthesis manifest. Final and convergence reviewers receive it and
+return a receipt bound to the exact candidate digests. The receipt covers request coverage, scope control,
+evidence/root cause, dependency order, budget bounds, and batch acceptance exactly once, plus every blocking
+stable finding. Only an all-PASS receipt can contribute to `READY`.
+
 ## Typed decisions
 
 Read the decision and its stable key from `pending_decisions` in status. Show its evidence and allowed choices to the user. Pass that key as `--decision-id` when running `adjudicate` once without `--apply`, then apply the exact same decision ID, approved choice, actor, and reason. A stale preview must be refreshed rather than applied to a different pending decision.
 
 If the controller is interrupted while an invocation record says `RUNNING`, reacquire that exact assignment through `recover-invocation`, preview it, and apply with an actor and reason. Recovery preserves the spent quality attempt and audit record. It is also the required escape before `migrate-engine` when engine drift and a stale invocation coincide; never delete or edit the record by hand.
 
+- Investigation boundary: answer the batched questions, explicitly authorize each accepted extension id,
+  and continue, or abandon. Omitted proposed extensions remain excluded.
 - Planning, convergence, or final boundary: resolve and continue, or abandon. Resolving a
   convergence boundary returns to synthesis; it never treats the interrupted review as approval.
 - Synthesis budget exhausted: at most one explicit extra synthesis, or abandon.

@@ -149,6 +149,13 @@ implementation reviewer later reports a rate limit, that role persistently falls
 and retries the same work without consuming a quality attempt. Other failures and explicit choices
 stay on the audited manual recovery path.
 
+Planning does not treat stage completion as proof. Evidence receipts bind non-empty claims, locators,
+digests, and the baseline; blocking investigation questions are batched for the user before drafting;
+and proposed scope extensions require their exact ids to be explicitly authorized. Mutual review must
+dispose the complete frozen finding ledger. Host synthesis emits the readable plan and batches plus a
+digest-bound `synthesis_manifest.json`; final PASS requires a candidate-bound receipt covering every
+review criterion and blocking finding.
+
 ```text
 frozen request + Git SHA
   -> independent investigations
@@ -244,7 +251,7 @@ deployments.
 
 ## Public beta status
 
-Version `v0.7.1` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
+Version `v0.7.2` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
 release gate are production-oriented, but broader provider and repository coverage is still needed
 before a general-availability claim.
 

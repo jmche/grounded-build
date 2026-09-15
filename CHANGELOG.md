@@ -2,6 +2,18 @@
 
 All notable changes use semantic versioning.
 
+## [0.7.2] - 2026-09-15
+
+- Made planning evidence receipts consequential: required evidence, root-cause traces, repository
+  facts, and residual questions can no longer satisfy the workflow with empty declarations or
+  unbound digests.
+- Added a pre-draft user boundary for blocking investigation questions and explicit authorization
+  for proposed scope extensions; unresolved planner-owned questions cannot be handed downstream.
+- Required every integrated draft to declare its plan scope, disposition the complete frozen
+  finding ledger, and keep PASS consistent with blocking findings and unresolved decisions.
+- Added a digest-bound synthesis manifest with complete finding dispositions and a final-review
+  criteria receipt bound to the exact candidate, scope, and blocking ledger.
+
 ## [0.7.1] - 2026-09-14
 
 - Closed the exhausted-review liveness gap: a nonterminal typed fix, deferral, or decision-only

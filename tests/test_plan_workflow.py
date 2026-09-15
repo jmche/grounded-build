@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
@@ -19,7 +20,7 @@ SCRIPT = ROOT / "scripts" / "plan_workflow.py"
 
 
 FAKE_AGENT = r'''#!/usr/bin/env python3
-import json, os, re, subprocess, sys, time
+import hashlib, json, os, re, subprocess, sys, time
 from pathlib import Path
 if "--version" in sys.argv:
     print("fake-agent 1.0")
@@ -58,6 +59,7 @@ scope_match = re.search(r"scope_digest=([0-9a-f]{64})", prompt)
 scope_digest = scope_match.group(1) if scope_match else ""
 context_match = re.search(r"Read (/.+?)/request\.md", prompt)
 request_text = (Path(context_match.group(1)) / "request.md").read_text() if context_match else ""
+context_dir = Path(context_match.group(1)) if context_match else None
 canary_match = re.search(r"FORBIDDEN_CANARY=(.+)", request_text)
 canary_visible = bool(canary_match and Path(canary_match.group(1).strip()).exists())
 git_ok = subprocess.run(["git", "status", "--porcelain"], capture_output=True).returncode == 0
@@ -66,13 +68,19 @@ if sleep_match:
     time.sleep(float(sleep_match.group(1)))
 if "independent evidence investigator" in prompt:
     slot = re.search(r"investigator ([AB])", prompt).group(1)
+    questions = ([{
+        "id": f"{slot}-Q1", "scope_id": "PROPOSED_EXTENSION-001",
+        "question": "Should the adjacent capability enter the plan?", "decision_owner": "USER",
+        "blocking": True, "rationale": "It changes the authorized objective",
+        "options": ["authorize", "exclude"], "evidence_ids": [f"{slot}-E1"],
+    }] if f"FAKE_BLOCKING_SCOPE_QUESTION={slot}" in request_text else [])
     payload = {
         "provider": provider, "slot": slot, "baseline_sha": sha, "scope_digest": scope_digest,
         "summary": f"investigated {slot}",
         "evidence": [{"id": f"{slot}-E1", "scope_id": "TARGET-001", "claim": "README exists",
                       "status": "VERIFIED", "source_type": "REPOSITORY", "locator": "README.md:1",
                       "retrieved_at": "2026-01-01T00:00:00Z", "version_or_commit": sha,
-                      "content_sha256": "0" * 64}],
+                      "content_sha256": hashlib.sha256(Path("README.md").read_bytes()).hexdigest()}],
         "findings": ([{
             "id": f"{slot}-finding", "scope_id": "TARGET-001", "severity": "P1",
             "urgency": "U1", "lane": "MUST_RESOLVE", "evidence_status": "VERIFIED",
@@ -80,13 +88,16 @@ if "independent evidence investigator" in prompt:
             "root_cause_status": "PROVEN", "causal_chain": [f"producer {slot} omitted guard"],
             "affected_surfaces": ["workflow"], "recommended_solution": "add the guard",
             "alternatives_and_tradeoffs": [], "verification": ["run regression"],
-        }] if "FAKE_NONEMPTY_FINDINGS" in request_text else []), "unresolved_questions": [],
+        }] if "FAKE_NONEMPTY_FINDINGS" in request_text else []), "unresolved_questions": questions,
     }
+    if f"FAKE_EMPTY_EVIDENCE={slot}" in request_text:
+        payload["evidence"][0]["locator"] = ""
 elif "independent planning instance" in prompt:
     slot = re.search(r"instance ([AB])", prompt).group(1)
     payload = {
         "provider": provider, "slot": slot, "baseline_sha": sha, "scope_digest": scope_digest,
         "evidence_ids": [f"{slot}-E1"], "new_evidence": [],
+        "plan_scope_ids": ["TARGET-001"],
         "summary": f"independent {slot}; canary_visible={canary_visible}; git_ok={git_ok}",
         "repository_facts": [{"id": f"{slot}-F1", "claim": "README exists", "evidence": "README.md:1", "confidence": "VERIFIED"}],
         "plan_markdown": f"# Plan {slot}\n\n## Scope\nRepository-grounded proposal from {slot}.\n\n## Batches\n- B01: verify with a named command.\n",
@@ -107,11 +118,16 @@ elif "independent reviewer and integrator slot" in prompt or "independent deep-p
     else:
         verdict = "PASS"
         findings = []
+    ledger_path = context_dir / "finding_ledger.json"
+    ledger_keys = sorted(json.loads(ledger_path.read_text())["findings"]) if ledger_path.is_file() else []
+    if f"FAKE_OMIT_DISPOSITIONS={slot}" in request_text:
+        ledger_keys = []
     payload = {"provider": provider, "slot": slot, "reviewer_slot": slot, "target": target,
                "round": round_number, "baseline_sha": sha, "scope_digest": scope_digest,
                "verdict": verdict, "summary": "checked", "findings": findings,
                "plan_markdown": f"# Integrated plan {round_number}{slot}\n\n## Scope\nTARGET-001\n",
-               "accepted_finding_ids": [], "rejected_finding_ids": [], "new_findings": [],
+               "plan_scope_ids": ["TARGET-001"],
+               "accepted_finding_ids": ledger_keys, "rejected_finding_ids": [], "new_findings": [],
                "finding_aliases": [],
                "unresolved_questions": []}
 else:
@@ -128,7 +144,24 @@ else:
     if f"FAKE_NESTED_BAD_SEVERITY={slot}" in request_text:
         verdict = "PASS"
         findings = [{"id": "bad-severity", "severity": "P0 ", "claim": "unsafe", "evidence": "plan", "required_change": "fix"}]
-    payload = {"provider": provider, "reviewer_slot": slot, "target": target, "baseline_sha": sha, "verdict": verdict, "summary": "final checked", "findings": findings}
+    plan_digest = re.search(r"candidate_plan_sha256=([0-9a-f]{64})", prompt).group(1)
+    batch_digest = re.search(r"candidate_batch_manifest_sha256=([0-9a-f]{64})", prompt).group(1)
+    ledger_path = context_dir / "finding_ledger.json"
+    ledger = json.loads(ledger_path.read_text())["findings"] if ledger_path.is_file() else {}
+    blocking = sorted(key for key, record in ledger.items()
+                      if record.get("canonical", {}).get("severity") in {"P0", "P1"})
+    criterion_status = "PASS" if verdict == "PASS" else verdict
+    criteria = [{"criterion": name, "status": criterion_status, "evidence": "inspected candidate and baseline"}
+                for name in ("REQUEST_COVERAGE", "SCOPE_CONTROL", "EVIDENCE_AND_ROOT_CAUSE",
+                             "DEPENDENCY_ORDER", "BUDGET_BOUNDS", "BATCH_ACCEPTANCE")]
+    if f"FAKE_MISSING_CRITERION={slot}" in request_text:
+        criteria.pop()
+    payload = {"provider": provider, "reviewer_slot": slot, "target": target,
+               "baseline_sha": sha, "scope_digest": scope_digest,
+               "candidate_plan_sha256": plan_digest,
+               "candidate_batch_manifest_sha256": batch_digest,
+               "verdict": verdict, "summary": "final checked", "criteria": criteria,
+               "blocking_finding_ids_checked": blocking, "findings": findings}
 def fake_assignment(prompt_text):
     """Derive the workflow's assignment name from the prompt, for empty-delivery markers."""
     if "independent evidence investigator" in prompt_text:
@@ -264,12 +297,35 @@ class PlanWorkflowTest(unittest.TestCase):
         directory = Path(output["output_directory"])
         plan = directory / "host_plan.md"
         batches = directory / "host_batches.md"
+        manifest = directory / "host_synthesis_manifest.json"
         plan.write_text("# Implementation plan\n\n## Scope\nTARGET-001: Implement the request.\n\n## Verification\nRun a named test.\n", encoding="utf-8")
         batches.write_text("# Batches\n\n- B01: request scope; exit when the named test returns zero.\n", encoding="utf-8")
+        self.write_synthesis_manifest(initialized, plan, batches, manifest)
         self.call(
             "submit-synthesis", "--project", str(self.project), "--run-id", initialized["run_id"],
             "--plan", str(plan), "--batch-manifest", str(batches),
+            "--synthesis-manifest", str(manifest),
         )
+
+    def write_synthesis_manifest(
+        self, initialized: dict, plan: Path, batches: Path, manifest: Path,
+    ) -> None:
+        state = self.get_state(initialized)
+        dispositions = []
+        for finding_id, record in state["finding_ledger"].items():
+            evidence_ids = list((record.get("canonical") or {}).get("evidence_ids", []))
+            dispositions.append({
+                "finding_id": finding_id, "disposition": "ACCEPTED",
+                "rationale": "covered by the implementation batch", "evidence_ids": evidence_ids,
+                "batch_ids": ["B01"],
+            })
+        manifest.write_text(json.dumps({
+            "baseline_sha": state["baseline_sha"], "scope_digest": state["scope_digest"],
+            "plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
+            "batch_manifest_sha256": hashlib.sha256(batches.read_bytes()).hexdigest(),
+            "plan_scope_ids": ["TARGET-001"], "finding_dispositions": dispositions,
+            "unresolved_questions": [],
+        }), encoding="utf-8")
 
     def test_init_freezes_an_explicit_ref_without_requiring_a_clean_source_worktree(self) -> None:
         baseline = self.baseline
@@ -1109,6 +1165,62 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("Outcome: `ABANDONED`", report)
         self.assertIn("No plan was approved", report)
 
+    def test_empty_evidence_receipt_is_rejected_before_it_can_become_verified(self) -> None:
+        self.request.write_text(self.request.read_text() + "\nFAKE_EMPTY_EVIDENCE=A\n")
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        rejected = self.call(
+            "investigate", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--slot", "A", expect=2)
+        self.assertIn("evidence fields must be non-empty", rejected["error"])
+
+    def test_blocking_investigation_questions_are_batched_before_drafting(self) -> None:
+        self.request.write_text(self.request.read_text() + "\nFAKE_BLOCKING_SCOPE_QUESTION=A\n")
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        run_id = initialized["run_id"]
+        self.call("investigate", "--project", str(self.project), "--run-id", run_id, "--slot", "A")
+        boundary = self.call(
+            "investigate", "--project", str(self.project), "--run-id", run_id, "--slot", "B")
+        self.assertEqual(boundary["status"], "NEEDS_USER_DECISION")
+        state = self.get_state(initialized)
+        self.assertEqual(state["pending_decision"]["type"], "INVESTIGATION_BOUNDARY")
+        self.assertEqual(len(state["pending_decision"]["questions"]), 1)
+        blocked = self.call(
+            "draft", "--project", str(self.project), "--run-id", run_id, "--slot", "A", expect=2)
+        self.assertIn("not allowed", blocked["error"])
+        resumed = self.call(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", self.pending_decision_id(initialized),
+            "--choice", "RESOLVE_AND_CONTINUE", "--authorize-scope-id", "PROPOSED_EXTENSION-001",
+            "--decision", "include the adjacent capability", "--actor", "tester", "--apply")
+        self.assertEqual(resumed["status"], "EVIDENCE_READY")
+        self.assertIn("PROPOSED_EXTENSION-001", self.get_state(initialized)["authorized_scope_ids"])
+
+    def test_cross_review_cannot_omit_a_frozen_blocking_finding(self) -> None:
+        self.request.write_text(
+            self.request.read_text() + "\nFAKE_NONEMPTY_FINDINGS\nFAKE_OMIT_DISPOSITIONS=A\n")
+        initialized = self.initialize("claude", "claude")
+        run_id = initialized["run_id"]
+        for slot in ("A", "B"):
+            self.call("draft", "--project", str(self.project), "--run-id", run_id, "--slot", slot)
+        rejected = self.call(
+            "cross-review", "--project", str(self.project), "--run-id", run_id,
+            "--slot", "A", expect=2)
+        self.assertIn("did not disposition known finding keys", rejected["error"])
+
+    def test_final_pass_requires_a_complete_candidate_bound_criteria_receipt(self) -> None:
+        self.request.write_text(self.request.read_text() + "\nFAKE_MISSING_CRITERION=F\n")
+        initialized = self.initialize("claude", "claude")
+        self.run_through_cross_review(initialized)
+        self.submit_candidate(initialized)
+        rejected = self.call(
+            "final-review", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--reviewer", "F", expect=2)
+        self.assertIn("cover every criterion exactly once", rejected["error"])
+
     def test_investigation_is_a_hard_gate_before_drafting(self) -> None:
         initialized = self.call(
             "init", "--project", str(self.project), "--request", str(self.request),
@@ -1225,9 +1337,12 @@ class PlanWorkflowTest(unittest.TestCase):
             "# Batches\n\n- B01: corrected scope; exit when the named test returns zero.\n",
             encoding="utf-8",
         )
+        manifest = directory / "replacement_synthesis_manifest.json"
+        self.write_synthesis_manifest(initialized, plan, batches, manifest)
         self.call(
             "submit-synthesis", "--project", str(self.project), "--run-id", run_id,
             "--plan", str(plan), "--batch-manifest", str(batches),
+            "--synthesis-manifest", str(manifest),
         )
         current = self.get_state(initialized)
         self.assertNotEqual(current["candidate"]["plan_sha256"], old_digest)
@@ -1601,13 +1716,16 @@ class PlanWorkflowTest(unittest.TestCase):
         directory = Path(output["output_directory"])
         plan = directory / "implementation_plan.md"
         batches = directory / "batches.md"
+        manifest = directory / "synthesis_manifest.json"
         plan.write_text("# Implementation plan\n\n## Scope\nTARGET-001: Implement the request.\n", encoding="utf-8")
         batches.write_text("# Batches\n\n- B01: scope; exit when the named test returns zero.\n",
                            encoding="utf-8")
+        self.write_synthesis_manifest(initialized, plan, batches, manifest)
 
         result = self.call(
             "submit-synthesis", "--project", str(self.project), "--run-id", initialized["run_id"],
             "--plan", str(plan), "--batch-manifest", str(batches),
+            "--synthesis-manifest", str(manifest),
         )
         self.assertEqual(result["status"], "FINAL_REVIEW_REQUIRED")
         self.assertEqual(Path(result["candidate"]["plan"]), plan,
@@ -2416,6 +2534,16 @@ class HostProtocolTest(unittest.TestCase):
             "B02: two\nDependencies: B01 B99\nExit observation: done\nVerification: test\n")
         self.assertTrue(any("unknown batches" in item for item in diagnostics["errors"]))
         self.assertTrue(any("cycle" in item for item in diagnostics["errors"]))
+
+    def test_plan_scope_requires_typed_extension_authorization(self) -> None:
+        state = self.state("DRAFTING")
+        state["authorized_scope_ids"] = ["TARGET-001"]
+        with self.assertRaises(self.module.WorkflowError):
+            self.module.validate_plan_scope_ids(
+                ["TARGET-001", "PROPOSED_EXTENSION-001"], state, "test plan")
+        state["authorized_scope_ids"].append("PROPOSED_EXTENSION-001")
+        self.module.validate_plan_scope_ids(
+            ["TARGET-001", "PROPOSED_EXTENSION-001"], state, "test plan")
 
     def test_recursive_schema_subset_rejects_boolean_numbers_and_extra_fields(self) -> None:
         schema = {

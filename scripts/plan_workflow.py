@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex", "dsh", "other")
 OTHER_BRIDGE_PROTOCOL = "grounded-build-other-v1"
@@ -70,6 +70,26 @@ CODEX_POLICY_OVERRIDES = (
 
 EVIDENCE_STATUSES = ["VERIFIED", "STRONGLY_INFERRED", "WEAKLY_INFERRED", "UNRESOLVED", "REFUTED"]
 PRIORITY_LANES = ["STOP_THE_LINE", "MUST_RESOLVE", "INVESTIGATE_IF_BUDGET", "RECORD_ONLY"]
+REVIEW_CRITERIA = [
+    "REQUEST_COVERAGE", "SCOPE_CONTROL", "EVIDENCE_AND_ROOT_CAUSE",
+    "DEPENDENCY_ORDER", "BUDGET_BOUNDS", "BATCH_ACCEPTANCE",
+]
+
+QUESTION_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "id": {"type": "string"},
+        "scope_id": {"type": "string"},
+        "question": {"type": "string"},
+        "decision_owner": {"type": "string", "enum": ["USER", "PLANNER"]},
+        "blocking": {"type": "boolean"},
+        "rationale": {"type": "string"},
+        "options": {"type": "array", "items": {"type": "string"}},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["id", "scope_id", "question", "decision_owner", "blocking",
+                 "rationale", "options", "evidence_ids"],
+}
 
 EVIDENCE_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object", "additionalProperties": False,
@@ -119,7 +139,7 @@ INVESTIGATION_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string"},
         "evidence": {"type": "array", "items": EVIDENCE_ITEM_SCHEMA},
         "findings": {"type": "array", "items": FINDING_SCHEMA},
-        "unresolved_questions": {"type": "array", "items": {"type": "string"}},
+        "unresolved_questions": {"type": "array", "items": QUESTION_SCHEMA},
     },
     "required": ["provider", "slot", "baseline_sha", "scope_digest", "summary", "evidence",
                  "findings", "unresolved_questions"],
@@ -137,6 +157,7 @@ DRAFT_SCHEMA: dict[str, Any] = {
         "scope_digest": {"type": "string"},
         "evidence_ids": {"type": "array", "items": {"type": "string"}},
         "new_evidence": {"type": "array", "items": EVIDENCE_ITEM_SCHEMA},
+        "plan_scope_ids": {"type": "array", "items": {"type": "string"}},
         "repository_facts": {
             "type": "array",
             "items": {
@@ -152,10 +173,10 @@ DRAFT_SCHEMA: dict[str, Any] = {
             },
         },
         "plan_markdown": {"type": "string"},
-        "unresolved_questions": {"type": "array", "items": {"type": "string"}},
+        "unresolved_questions": {"type": "array", "items": QUESTION_SCHEMA},
     },
     "required": [
-        "provider", "slot", "baseline_sha", "scope_digest", "evidence_ids", "new_evidence", "summary", "repository_facts",
+        "provider", "slot", "baseline_sha", "scope_digest", "evidence_ids", "new_evidence", "plan_scope_ids", "summary", "repository_facts",
         "plan_markdown", "unresolved_questions",
     ],
 }
@@ -171,6 +192,7 @@ INTEGRATION_SCHEMA: dict[str, Any] = {
         "round": {"type": "integer", "enum": [2, 3]},
         "baseline_sha": {"type": "string"}, "scope_digest": {"type": "string"},
         "summary": {"type": "string"}, "plan_markdown": {"type": "string"},
+        "plan_scope_ids": {"type": "array", "items": {"type": "string"}},
         "accepted_finding_ids": {"type": "array", "items": {"type": "string"}},
         "rejected_finding_ids": {"type": "array", "items": {"type": "string"}},
         "new_findings": {"type": "array", "items": FINDING_SCHEMA},
@@ -195,10 +217,10 @@ INTEGRATION_SCHEMA: dict[str, Any] = {
             },
             "required": ["id", "severity", "claim", "evidence", "required_change"],
         }},
-        "unresolved_questions": {"type": "array", "items": {"type": "string"}},
+        "unresolved_questions": {"type": "array", "items": QUESTION_SCHEMA},
     },
     "required": ["provider", "slot", "reviewer_slot", "target", "round", "baseline_sha", "scope_digest", "summary",
-                 "plan_markdown", "accepted_finding_ids", "rejected_finding_ids",
+                 "plan_markdown", "plan_scope_ids", "accepted_finding_ids", "rejected_finding_ids",
                  "new_findings", "finding_aliases", "verdict", "findings", "unresolved_questions"],
 }
 
@@ -211,8 +233,21 @@ REVIEW_SCHEMA: dict[str, Any] = {
         "reviewer_slot": {"type": "string", "enum": ["A", "B", "F"]},
         "target": {"type": "string"},
         "baseline_sha": {"type": "string"},
+        "scope_digest": {"type": "string"},
+        "candidate_plan_sha256": {"type": "string"},
+        "candidate_batch_manifest_sha256": {"type": "string"},
         "verdict": {"type": "string", "enum": ["PASS", "FAIL", "NEEDS_USER_DECISION"]},
         "summary": {"type": "string"},
+        "criteria": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "criterion": {"type": "string", "enum": REVIEW_CRITERIA},
+                "status": {"type": "string", "enum": ["PASS", "FAIL", "NEEDS_USER_DECISION"]},
+                "evidence": {"type": "string"},
+            },
+            "required": ["criterion", "status", "evidence"],
+        }},
+        "blocking_finding_ids_checked": {"type": "array", "items": {"type": "string"}},
         "findings": {
             "type": "array",
             "items": {
@@ -229,7 +264,35 @@ REVIEW_SCHEMA: dict[str, Any] = {
             },
         },
     },
-    "required": ["provider", "reviewer_slot", "target", "baseline_sha", "verdict", "summary", "findings"],
+    "required": ["provider", "reviewer_slot", "target", "baseline_sha", "scope_digest",
+                 "candidate_plan_sha256", "candidate_batch_manifest_sha256", "verdict",
+                 "summary", "criteria", "blocking_finding_ids_checked", "findings"],
+}
+
+
+SYNTHESIS_MANIFEST_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "baseline_sha": {"type": "string"},
+        "scope_digest": {"type": "string"},
+        "plan_sha256": {"type": "string"},
+        "batch_manifest_sha256": {"type": "string"},
+        "plan_scope_ids": {"type": "array", "items": {"type": "string"}},
+        "finding_dispositions": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "finding_id": {"type": "string"},
+                "disposition": {"type": "string", "enum": ["ACCEPTED", "REJECTED", "DEFERRED"]},
+                "rationale": {"type": "string"},
+                "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                "batch_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["finding_id", "disposition", "rationale", "evidence_ids", "batch_ids"],
+        }},
+        "unresolved_questions": {"type": "array", "items": QUESTION_SCHEMA},
+    },
+    "required": ["baseline_sha", "scope_digest", "plan_sha256", "batch_manifest_sha256",
+                 "plan_scope_ids", "finding_dispositions", "unresolved_questions"],
 }
 
 
@@ -625,6 +688,33 @@ def normalize_pending_decisions(state: dict[str, Any]) -> None:
         state["pending_decision"] = None
 
 
+def investigation_boundary(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return one batched user boundary after both independent investigations."""
+    if set(state.get("investigations", {})) != {"A", "B"}:
+        return None
+    resolved = set(state.get("resolved_question_ids", []))
+    questions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for slot in ("A", "B"):
+        payload = json.loads(Path(state["investigations"][slot]["path"]).read_text(encoding="utf-8"))
+        for question in payload.get("unresolved_questions", []):
+            if not question.get("blocking") or question["id"] in resolved or question["id"] in seen:
+                continue
+            questions.append(question)
+            seen.add(question["id"])
+    if not questions:
+        return None
+    return {
+        "type": "INVESTIGATION_BOUNDARY", "source": "investigations-A+B",
+        "questions": questions,
+        "proposed_extension_ids": sorted({
+            question["scope_id"] for question in questions
+            if question["scope_id"].startswith("PROPOSED_EXTENSION-")
+        }),
+        "resume_status": "EVIDENCE_READY", "created_at": utc_now(),
+    }
+
+
 def save_state(state: dict[str, Any]) -> None:
     normalize_pending_decisions(state)
     state["updated_at"] = utc_now()
@@ -833,6 +923,10 @@ def save_parallel_stage(state: dict[str, Any], stage: str) -> None:
             latest["status"] = "NEEDS_USER_DECISION"
         elif stage == "investigate":
             latest["status"] = "EVIDENCE_READY" if set(latest["investigations"]) == {"A", "B"} else "INVESTIGATING"
+            boundary = investigation_boundary(latest)
+            if boundary:
+                add_pending_decision(latest, boundary)
+                latest["status"] = "NEEDS_USER_DECISION"
         elif stage == "draft":
             latest["status"] = "DRAFTS_READY" if set(latest["drafts"]) == {"A", "B"} else "DRAFTING"
             if latest["status"] == "DRAFTS_READY":
@@ -938,6 +1032,21 @@ def record_artifact(state: dict[str, Any], key: str, path: Path) -> None:
     state.setdefault("artifacts", {})[key] = {"path": str(path), "sha256": sha256_file(path)}
 
 
+def write_scope_authority(state: dict[str, Any]) -> Path:
+    """Publish the current request amendments without rewriting the frozen request contract."""
+    path = Path(state["run_directory"]) / "input" / "scope_authority.json"
+    atomic_json(path, {
+        "request_sha256": sha256_file(Path(state["request_snapshot"])),
+        "scope_digest": state["scope_digest"],
+        "authorized_scope_ids": sorted(set(state.get("authorized_scope_ids", ["TARGET-001"]))),
+        "excluded_scope_ids": sorted(set(state.get("excluded_scope_ids", []))),
+        "resolved_question_ids": sorted(set(state.get("resolved_question_ids", []))),
+    })
+    state["scope_authority_path"] = str(path)
+    record_artifact(state, "scope-authority", path)
+    return path
+
+
 def engine_contract() -> dict[str, Any]:
     """Identity of the local semantics that a run is allowed to use."""
     files = {
@@ -956,6 +1065,131 @@ def engine_contract() -> dict[str, Any]:
 def valid_scope_id(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(
         r"(?:TARGET|REQUIRED_SUPPORT|EVIDENCE_ONLY|PROPOSED_EXTENSION|OUT_OF_SCOPE)-\d{3,}", value))
+
+
+def nonempty(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def validate_plan_scope_ids(scope_ids: Any, state: dict[str, Any], where: str) -> None:
+    if not isinstance(scope_ids, list) or not scope_ids:
+        raise WorkflowError(f"{where} must declare at least one plan scope id")
+    if len(scope_ids) != len(set(scope_ids)):
+        raise WorkflowError(f"{where} repeats a plan scope id")
+    if "TARGET-001" not in scope_ids:
+        raise WorkflowError(f"{where} must include the frozen objective TARGET-001")
+    authorized_extensions = set(state.get("authorized_scope_ids", []))
+    for scope_id in scope_ids:
+        if not valid_scope_id(scope_id):
+            raise WorkflowError(f"{where} has an invalid scope id: {scope_id!r}")
+        scope_class = scope_id.split("-", 1)[0]
+        if scope_class == "TARGET" and scope_id != "TARGET-001":
+            raise WorkflowError(f"{where} cites an unknown target: {scope_id}")
+        if scope_class == "OUT_OF_SCOPE":
+            raise WorkflowError(f"{where} cannot include OUT_OF_SCOPE work: {scope_id}")
+        if scope_class == "PROPOSED_EXTENSION" and scope_id not in authorized_extensions:
+            raise WorkflowError(f"{where} includes an extension without typed user authorization: {scope_id}")
+
+
+def validate_declared_scope_references(text_value: str, declared: list[str], where: str) -> None:
+    referenced = set(re.findall(
+        r"\b(?:TARGET|REQUIRED_SUPPORT|EVIDENCE_ONLY|PROPOSED_EXTENSION|OUT_OF_SCOPE)-\d{3,}\b",
+        text_value))
+    undeclared = referenced - set(declared)
+    if undeclared:
+        raise WorkflowError(f"{where} text cites undeclared scope ids: {sorted(undeclared)}")
+
+
+def validate_evidence_items(
+    items: Any, state: dict[str, Any], where: str, *, require_nonempty: bool = True,
+) -> set[str]:
+    if not isinstance(items, list) or (require_nonempty and not items):
+        raise WorkflowError(f"{where} must contain evidence")
+    ids: list[str] = []
+    for item in items:
+        evidence_id = item.get("id")
+        if not all(nonempty(item.get(field)) for field in (
+                "id", "claim", "locator", "retrieved_at", "version_or_commit", "content_sha256")):
+            raise WorkflowError(f"{where} evidence fields must be non-empty")
+        if not re.fullmatch(r"[0-9a-f]{64}", item["content_sha256"]):
+            raise WorkflowError(f"{where} evidence {evidence_id!r} has an invalid content digest")
+        try:
+            datetime.fromisoformat(item["retrieved_at"].replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise WorkflowError(f"{where} evidence {evidence_id!r} has an invalid retrieval time") from exc
+        if not valid_scope_id(item.get("scope_id")):
+            raise WorkflowError(f"{where} evidence {evidence_id!r} has an invalid scope id")
+        if item["source_type"] in {"REPOSITORY", "COMMAND"} \
+                and item["version_or_commit"] != state["baseline_sha"]:
+            raise WorkflowError(f"{where} evidence {evidence_id!r} is not bound to the baseline SHA")
+        if item["source_type"] == "REPOSITORY":
+            locator = re.fullmatch(r"([^:\n]+?)(?::\d+(?:-\d+)?)?", item["locator"])
+            if locator is None:
+                raise WorkflowError(
+                    f"{where} repository evidence {evidence_id!r} locator must be a relative path "
+                    "with an optional line range")
+            relative = Path(locator.group(1))
+            worktree = Path(state["worktree"]).resolve()
+            source = (worktree / relative).resolve()
+            if relative.is_absolute() or not source.is_relative_to(worktree) or not source.is_file():
+                raise WorkflowError(f"{where} repository evidence {evidence_id!r} locator is not a baseline file")
+            if sha256_file(source) != item["content_sha256"]:
+                raise WorkflowError(f"{where} repository evidence {evidence_id!r} digest mismatch")
+        ids.append(evidence_id)
+    if len(ids) != len(set(ids)):
+        raise WorkflowError(f"{where} evidence ids must be unique")
+    return set(ids)
+
+
+def state_evidence_ids(state: dict[str, Any]) -> set[str]:
+    evidence_ids: set[str] = set()
+    for record in state.get("investigations", {}).values():
+        payload = json.loads(Path(record["path"]).read_text(encoding="utf-8"))
+        evidence_ids.update(item["id"] for item in payload.get("evidence", []))
+    for record in state.get("drafts", {}).values():
+        payload = json.loads(Path(record["path"]).read_text(encoding="utf-8"))
+        evidence_ids.update(item["id"] for item in payload.get("new_evidence", []))
+    return evidence_ids
+
+
+def validate_questions(
+    questions: Any, known_evidence: set[str], where: str, *, allow_blocking_user: bool,
+) -> None:
+    if not isinstance(questions, list):
+        raise WorkflowError(f"{where} unresolved questions must be an array")
+    ids: list[str] = []
+    for question in questions:
+        if not all(nonempty(question.get(field)) for field in ("id", "question", "rationale")):
+            raise WorkflowError(f"{where} unresolved question fields must be non-empty")
+        if not valid_scope_id(question.get("scope_id")):
+            raise WorkflowError(f"{where} unresolved question has an invalid scope id")
+        if not set(question.get("evidence_ids", [])).issubset(known_evidence):
+            raise WorkflowError(f"{where} unresolved question cites unknown evidence")
+        if question.get("blocking") and question.get("decision_owner") == "PLANNER":
+            raise WorkflowError(f"{where} cannot hand an unresolved blocking planner question downstream")
+        if question.get("blocking") and not allow_blocking_user:
+            raise WorkflowError(f"{where} cannot proceed with a blocking user question")
+        if question.get("decision_owner") == "USER" and not question.get("options"):
+            raise WorkflowError(f"{where} user question must offer at least one explicit option")
+        ids.append(question["id"])
+    if len(ids) != len(set(ids)):
+        raise WorkflowError(f"{where} unresolved question ids must be unique")
+
+
+def validate_finding_content(finding: dict[str, Any], known_evidence: set[str], where: str) -> None:
+    if not valid_scope_id(finding.get("scope_id")):
+        raise WorkflowError(f"{where} finding {finding.get('id')} has an invalid scope id")
+    if not all(nonempty(finding.get(field)) for field in ("id", "problem", "recommended_solution")):
+        raise WorkflowError(f"{where} finding identity, problem, and solution must be non-empty")
+    if not finding.get("evidence_ids") or not set(finding["evidence_ids"]).issubset(known_evidence):
+        raise WorkflowError(f"{where} finding {finding.get('id')} requires known evidence")
+    if not finding.get("causal_chain") or not all(nonempty(item) for item in finding["causal_chain"]):
+        raise WorkflowError(f"{where} finding {finding.get('id')} requires a non-empty causal trace")
+    if not finding.get("affected_surfaces") or not finding.get("verification"):
+        raise WorkflowError(f"{where} finding {finding.get('id')} requires affected surfaces and verification")
+    if finding.get("lane") == "STOP_THE_LINE" and finding.get("evidence_status") not in {
+            "VERIFIED", "STRONGLY_INFERRED"}:
+        raise WorkflowError("STOP_THE_LINE requires verified or strongly inferred evidence")
 
 
 def finding_fingerprint(finding: dict[str, Any]) -> str:
@@ -1562,14 +1796,19 @@ def finalize_ready_candidate(state: dict[str, Any]) -> None:
     final_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     final_plan = final_dir / "implementation_plan.md"
     final_batches = final_dir / "batches.md"
+    final_manifest = final_dir / "synthesis_manifest.json"
     shutil.copyfile(Path(state["candidate"]["plan"]), final_plan)
     shutil.copyfile(Path(state["candidate"]["batch_manifest"]), final_batches)
+    shutil.copyfile(Path(state["candidate"]["synthesis_manifest"]), final_manifest)
     record_artifact(state, "final-plan", final_plan)
     record_artifact(state, "final-batches", final_batches)
+    record_artifact(state, "final-synthesis-manifest", final_manifest)
     state["final"] = {
         "plan": str(final_plan), "batch_manifest": str(final_batches),
+        "synthesis_manifest": str(final_manifest),
         "plan_sha256": sha256_file(final_plan),
         "batch_manifest_sha256": sha256_file(final_batches),
+        "synthesis_manifest_sha256": sha256_file(final_manifest),
     }
     state["status"] = "READY"
     state["final"]["report"] = str(write_terminal_report(state, "READY"))
@@ -2567,26 +2806,31 @@ def validate_draft(payload: dict[str, Any], state: dict[str, Any], slot: str) ->
         raise WorkflowError("draft baseline SHA mismatch")
     if payload["scope_digest"] != state["scope_digest"]:
         raise WorkflowError("draft scope digest mismatch")
-    if not isinstance(payload["plan_markdown"], str) or not payload["plan_markdown"].strip():
+    if not nonempty(payload.get("summary")) or not nonempty(payload.get("plan_markdown")):
         raise WorkflowError("draft plan is empty")
+    validate_plan_scope_ids(payload["plan_scope_ids"], state, "draft")
+    validate_declared_scope_references(payload["plan_markdown"], payload["plan_scope_ids"], "draft")
     investigation = json.loads(Path(state["investigations"][slot]["path"]).read_text(encoding="utf-8"))
     new_evidence = payload.get("new_evidence")
-    if not isinstance(new_evidence, list):
-        raise WorkflowError("draft new_evidence must be an array")
-    new_ids = [item.get("id") for item in new_evidence if isinstance(item, dict)]
-    if len(new_ids) != len(set(new_ids)):
-        raise WorkflowError("draft new evidence ids must be unique")
-    if any(not valid_scope_id(item.get("scope_id")) for item in new_evidence):
-        raise WorkflowError("draft new evidence has an invalid scope id")
-    known_evidence = {item["id"] for item in investigation["evidence"]} | set(new_ids)
+    new_ids = validate_evidence_items(
+        new_evidence, state, "draft new_evidence", require_nonempty=False)
+    if any(not evidence_id.startswith(f"{slot}-") for evidence_id in new_ids):
+        raise WorkflowError("draft new evidence ids must be prefixed by their slot")
+    known_evidence = {item["id"] for item in investigation["evidence"]} | new_ids
     if not set(payload["evidence_ids"]).issubset(known_evidence):
         raise WorkflowError("draft cites evidence outside its independent investigation")
+    if not payload["evidence_ids"]:
+        raise WorkflowError("draft must cite at least one evidence item")
     facts = payload["repository_facts"]
     if not isinstance(facts, list) or not facts:
         raise WorkflowError("draft must include repository facts")
     ids = [item.get("id") for item in facts if isinstance(item, dict)]
     if len(ids) != len(set(ids)):
         raise WorkflowError("draft fact ids must be unique")
+    for fact in facts:
+        if not all(nonempty(fact.get(field)) for field in ("id", "claim", "evidence")):
+            raise WorkflowError("draft repository facts must be non-empty")
+    validate_questions(payload["unresolved_questions"], known_evidence, "draft", allow_blocking_user=False)
 
 
 def validate_investigation(payload: dict[str, Any], state: dict[str, Any], slot: str) -> None:
@@ -2597,27 +2841,20 @@ def validate_investigation(payload: dict[str, Any], state: dict[str, Any], slot:
         raise WorkflowError("investigation identity mismatch")
     if payload["baseline_sha"] != state["baseline_sha"] or payload["scope_digest"] != state["scope_digest"]:
         raise WorkflowError("investigation baseline or scope mismatch")
-    evidence = payload.get("evidence")
-    if not isinstance(evidence, list) or not evidence:
-        raise WorkflowError("investigation must contain evidence")
-    evidence_ids = [item.get("id") for item in evidence if isinstance(item, dict)]
-    if len(evidence_ids) != len(set(evidence_ids)):
-        raise WorkflowError("investigation evidence ids must be unique")
-    if any(not valid_scope_id(item.get("scope_id")) for item in evidence):
-        raise WorkflowError("investigation evidence has an invalid scope id")
+    if not nonempty(payload.get("summary")):
+        raise WorkflowError("investigation summary must be non-empty")
+    known = validate_evidence_items(payload.get("evidence"), state, "investigation")
+    if any(not evidence_id.startswith(f"{slot}-") for evidence_id in known):
+        raise WorkflowError("investigation evidence ids must be prefixed by their slot")
     finding_ids = [item.get("id") for item in payload.get("findings", []) if isinstance(item, dict)]
     if len(finding_ids) != len(set(finding_ids)):
         raise WorkflowError("investigation finding ids must be unique")
-    known = set(evidence_ids)
     for finding in payload.get("findings", []):
-        if not valid_scope_id(finding.get("scope_id")):
-            raise WorkflowError(f"finding {finding.get('id')} has an invalid scope id")
-        if not set(finding.get("evidence_ids", [])).issubset(known):
-            raise WorkflowError(f"finding {finding.get('id')} cites unknown evidence")
-        if finding.get("lane") == "STOP_THE_LINE" and finding.get("evidence_status") not in {
-            "VERIFIED", "STRONGLY_INFERRED"
-        }:
-            raise WorkflowError("STOP_THE_LINE requires verified or strongly inferred evidence")
+        validate_finding_content(finding, known, "investigation")
+    validate_questions(
+        payload["unresolved_questions"], known, "investigation", allow_blocking_user=True)
+    if any(not question["id"].startswith(f"{slot}-") for question in payload["unresolved_questions"]):
+        raise WorkflowError("investigation question ids must be prefixed by their slot")
 
 
 def validate_integration(
@@ -2631,10 +2868,16 @@ def validate_integration(
     if (payload["provider"] != provider or payload["slot"] != slot
             or payload["reviewer_slot"] != slot or payload["round"] != round_number):
         raise WorkflowError("integrated draft identity mismatch")
+    expected_target = f"draft-{'B' if slot == 'A' else 'A'}" if round_number == 2 else "draft-02-both"
+    if payload["target"] != expected_target:
+        raise WorkflowError("integrated draft target mismatch")
     if payload["baseline_sha"] != state["baseline_sha"] or payload["scope_digest"] != state["scope_digest"]:
         raise WorkflowError("integrated draft baseline or scope mismatch")
-    if not payload["plan_markdown"].strip():
+    if not nonempty(payload.get("summary")) or not nonempty(payload.get("plan_markdown")):
         raise WorkflowError("integrated draft plan is empty")
+    validate_plan_scope_ids(payload["plan_scope_ids"], state, "integrated draft")
+    validate_declared_scope_references(
+        payload["plan_markdown"], payload["plan_scope_ids"], "integrated draft")
     if payload["verdict"] != "PASS" and not payload["findings"]:
         raise WorkflowError("a non-PASS integrated review requires findings")
     dispositions = payload["accepted_finding_ids"] + payload["rejected_finding_ids"]
@@ -2644,9 +2887,25 @@ def validate_integration(
     unknown = set(dispositions) - allowed_keys
     if unknown:
         raise WorkflowError(f"integrated draft dispositions cite unknown finding keys: {sorted(unknown)}")
+    missing = allowed_keys - set(dispositions)
+    if missing:
+        raise WorkflowError(f"integrated draft did not disposition known finding keys: {sorted(missing)}")
+    known_evidence = state_evidence_ids(state)
     for finding in payload["new_findings"]:
-        if not valid_scope_id(finding.get("scope_id")):
-            raise WorkflowError(f"new finding {finding.get('id')} has an invalid scope id")
+        validate_finding_content(finding, known_evidence, "integrated draft")
+    validate_questions(
+        payload["unresolved_questions"], known_evidence, "integrated draft",
+        allow_blocking_user=payload["verdict"] == "NEEDS_USER_DECISION")
+    blocking_review_findings = [
+        item for item in payload["findings"] if item.get("severity") in {"P0", "P1"}
+    ]
+    if payload["verdict"] == "PASS" and blocking_review_findings:
+        raise WorkflowError("PASS integrated review cannot contain P0/P1 findings")
+    if payload["verdict"] == "FAIL" and not blocking_review_findings:
+        raise WorkflowError("FAIL integrated review requires at least one P0/P1 finding")
+    for finding in payload["findings"]:
+        if not all(nonempty(finding.get(field)) for field in ("id", "claim", "evidence", "required_change")):
+            raise WorkflowError("integrated review findings must be non-empty")
     ledger_keys = allowed_keys
     aliases_seen: set[str] = set()
     for alias in payload["finding_aliases"]:
@@ -2659,6 +2918,9 @@ def validate_integration(
             raise WorkflowError(f"finding aliases cite unknown keys: {sorted(unknown_aliases)}")
         if canonical in members or aliases_seen.intersection(members):
             raise WorkflowError("finding aliases must be acyclic and non-overlapping")
+        if not nonempty(alias.get("rationale")) or not alias.get("evidence_ids") \
+                or not set(alias["evidence_ids"]).issubset(known_evidence):
+            raise WorkflowError("finding aliases require a rationale and known evidence")
         aliases_seen.update(members)
 
 
@@ -2696,6 +2958,37 @@ def validate_review(
         raise WorkflowError("review identity mismatch")
     if payload["target"] != target or payload["baseline_sha"] != state["baseline_sha"]:
         raise WorkflowError("review target or baseline mismatch")
+    candidate = state.get("candidate") or {}
+    if payload["scope_digest"] != state["scope_digest"] \
+            or payload["candidate_plan_sha256"] != candidate.get("plan_sha256") \
+            or payload["candidate_batch_manifest_sha256"] != candidate.get("batch_manifest_sha256"):
+        raise WorkflowError("review receipt is not bound to the candidate and scope")
+    if not nonempty(payload.get("summary")):
+        raise WorkflowError("review summary must be non-empty")
+    criteria = payload.get("criteria")
+    names = [item.get("criterion") for item in criteria] if isinstance(criteria, list) else []
+    if len(names) != len(set(names)) or set(names) != set(REVIEW_CRITERIA):
+        raise WorkflowError("review receipt must cover every criterion exactly once")
+    if any(not nonempty(item.get("evidence")) for item in criteria):
+        raise WorkflowError("every review criterion requires an evidence-backed explanation")
+    criterion_statuses = {item["status"] for item in criteria}
+    if payload["verdict"] == "PASS" and criterion_statuses != {"PASS"}:
+        raise WorkflowError("PASS review requires every criterion to PASS")
+    if "NEEDS_USER_DECISION" in criterion_statuses and payload["verdict"] != "NEEDS_USER_DECISION":
+        raise WorkflowError("a user-boundary criterion requires NEEDS_USER_DECISION")
+    if "FAIL" in criterion_statuses and payload["verdict"] == "PASS":
+        raise WorkflowError("a failed review criterion cannot produce PASS")
+    if payload["verdict"] == "FAIL" and "FAIL" not in criterion_statuses:
+        raise WorkflowError("FAIL review requires at least one failed criterion")
+    if payload["verdict"] == "NEEDS_USER_DECISION" and "NEEDS_USER_DECISION" not in criterion_statuses:
+        raise WorkflowError("NEEDS_USER_DECISION review requires a matching criterion")
+    required_blocking = {
+        key for key, record in state.get("finding_ledger", {}).items()
+        if (record.get("canonical") or {}).get("severity") in {"P0", "P1"}
+    }
+    checked = payload.get("blocking_finding_ids_checked")
+    if len(checked) != len(set(checked)) or set(checked) != required_blocking:
+        raise WorkflowError("review receipt must check every blocking stable finding exactly once")
     findings = payload.get("findings")
     if not isinstance(findings, list):
         raise WorkflowError("review findings must be a list")
@@ -2709,6 +3002,9 @@ def validate_review(
     ids = [item.get("id") for item in findings if isinstance(item, dict)]
     if len(ids) != len(set(ids)):
         raise WorkflowError("review finding ids must be unique")
+    for finding in findings:
+        if not all(nonempty(finding.get(field)) for field in ("id", "claim", "evidence", "required_change")):
+            raise WorkflowError("review findings must be non-empty")
 
 
 def validate_ready_invariants(state: dict[str, Any]) -> None:
@@ -2730,7 +3026,7 @@ def validate_ready_invariants(state: dict[str, Any]) -> None:
     candidate = state.get("candidate") or {}
     final = state.get("final") or {}
     root = Path(state["run_directory"]).resolve()
-    for key in ("plan", "batch_manifest"):
+    for key in ("plan", "batch_manifest", "synthesis_manifest"):
         candidate_path = Path(candidate.get(key, "")).resolve()
         final_path = Path(final.get(key, "")).resolve()
         if not candidate_path.is_relative_to(root) or not final_path.is_relative_to(root / "final"):
@@ -2818,7 +3114,7 @@ def next_action(state: dict[str, Any]) -> dict[str, Any]:
     if status == "SYNTHESIS_REQUIRED":
         return {"kind": "HOST_SYNTHESIS", "stage": "synthesis",
                 "command": [*base, "synthesis-context", *common],
-                "requires": ["implementation_plan.md", "batches.md"]}
+                "requires": ["implementation_plan.md", "batches.md", "synthesis_manifest.json"]}
     if status in {"CONVERGENCE_REVIEW_REQUIRED", "CONVERGENCE_REVIEWING"}:
         return parallel_actions("convergence-review", "--reviewer", state["convergence_reviews"])
     if status in {"FINAL_REVIEW_REQUIRED", "FINAL_REVIEWING"}:
@@ -2914,6 +3210,50 @@ def synthesis_diagnostics(
     return {"errors": errors, "warnings": warnings}
 
 
+def validate_synthesis_manifest(
+    manifest: dict[str, Any], state: dict[str, Any], plan: Path, batches: Path,
+) -> None:
+    validate_json_schema(manifest, SYNTHESIS_MANIFEST_SCHEMA)
+    if manifest["baseline_sha"] != state["baseline_sha"] or manifest["scope_digest"] != state["scope_digest"]:
+        raise WorkflowError("synthesis manifest baseline or scope mismatch")
+    if manifest["plan_sha256"] != sha256_file(plan) \
+            or manifest["batch_manifest_sha256"] != sha256_file(batches):
+        raise WorkflowError("synthesis manifest digest does not bind the submitted documents")
+    validate_plan_scope_ids(manifest["plan_scope_ids"], state, "synthesis manifest")
+    validate_declared_scope_references(
+        plan.read_text(encoding="utf-8") + "\n" + batches.read_text(encoding="utf-8"),
+        manifest["plan_scope_ids"], "synthesis")
+    known_evidence = state_evidence_ids(state)
+    validate_questions(
+        manifest["unresolved_questions"], known_evidence, "synthesis manifest",
+        allow_blocking_user=False)
+    ledger = state.get("finding_ledger", {})
+    dispositions = manifest["finding_dispositions"]
+    ids = [item["finding_id"] for item in dispositions]
+    if len(ids) != len(set(ids)):
+        raise WorkflowError("synthesis manifest repeats a finding disposition")
+    if set(ids) != set(ledger):
+        missing = sorted(set(ledger) - set(ids))
+        unknown = sorted(set(ids) - set(ledger))
+        raise WorkflowError(
+            f"synthesis manifest must disposition the complete ledger; missing={missing}, unknown={unknown}")
+    batch_ids = set(re.findall(r"(?m)^\s*(?:[-*]\s*|#+\s*)?(B\d{2,})\s*:", batches.read_text(encoding="utf-8")))
+    for item in dispositions:
+        if not nonempty(item["rationale"]):
+            raise WorkflowError("synthesis finding dispositions require a rationale")
+        if not set(item["evidence_ids"]).issubset(known_evidence):
+            raise WorkflowError(f"synthesis disposition {item['finding_id']} cites unknown evidence")
+        if not set(item["batch_ids"]).issubset(batch_ids):
+            raise WorkflowError(f"synthesis disposition {item['finding_id']} cites an unknown batch")
+        severity = (ledger[item["finding_id"]].get("canonical") or {}).get("severity")
+        if severity in {"P0", "P1"} and item["disposition"] == "DEFERRED":
+            raise WorkflowError(f"blocking finding {item['finding_id']} cannot be deferred")
+        if severity in {"P0", "P1"} and item["disposition"] == "ACCEPTED" and not item["batch_ids"]:
+            raise WorkflowError(f"accepted blocking finding {item['finding_id']} must map to a batch")
+        if item["disposition"] == "REJECTED" and not item["evidence_ids"]:
+            raise WorkflowError(f"rejected finding {item['finding_id']} requires contrary evidence")
+
+
 def command_preflight(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     runtime = agent_runtime(args)
@@ -3000,11 +3340,12 @@ def command_init(args: argparse.Namespace) -> None:
         "objective_id": "TARGET-001",
         "objective_source": "request.md",
         "objective_sha256": sha256_file(request_snapshot),
+        "initially_authorized_scope_ids": ["TARGET-001"],
         "in_scope_rule": "Only work required to satisfy the frozen request and recorded user decisions.",
         "scope_id_format": "^(TARGET|REQUIRED_SUPPORT|EVIDENCE_ONLY|PROPOSED_EXTENSION|OUT_OF_SCOPE)-[0-9]{3,}$",
         "support_classes": ["TARGET", "REQUIRED_SUPPORT", "EVIDENCE_ONLY"],
         "extension_classes": ["PROPOSED_EXTENSION", "OUT_OF_SCOPE"],
-        "extension_rule": "PROPOSED_EXTENSION requires a typed user decision before entering the plan.",
+        "extension_rule": "PROPOSED_EXTENSION requires a typed user decision and an explicit authorized scope id before entering any plan.",
     })
     scope_digest = sha256_file(scope_contract)
     finding_ledger_path = root / "input" / "finding_ledger.json"
@@ -3035,6 +3376,9 @@ def command_init(args: argparse.Namespace) -> None:
         "finding_ledger_path": str(finding_ledger_path),
         "finding_ledger": {},
         "finding_aliases": {},
+        "authorized_scope_ids": ["TARGET-001"],
+        "excluded_scope_ids": [],
+        "resolved_question_ids": [],
         "planning_depth": args.planning_depth,
         "research_policy": args.research_policy,
         "backend_requested": args.backend,
@@ -3080,6 +3424,7 @@ def command_init(args: argparse.Namespace) -> None:
     record_artifact(state, "request", request_snapshot)
     record_artifact(state, "scope-contract", scope_contract)
     record_artifact(state, "finding-ledger", finding_ledger_path)
+    write_scope_authority(state)
     save_state(state)
     emit({
         "status": state["status"], "run_id": run_id, "run_directory": str(root),
@@ -3123,6 +3468,13 @@ def command_investigate(args: argparse.Namespace) -> None:
         "matching exactly TARGET-001, REQUIRED_SUPPORT-NNN, EVIDENCE_ONLY-NNN, PROPOSED_EXTENSION-NNN, or OUT_OF_SCOPE-NNN "
         "(NNN is at least three digits; a bare class name is invalid). "
         "anything outside the frozen objective is OUT_OF_SCOPE or a PROPOSED_EXTENSION and must not enter the plan. "
+        "Evidence fields are receipts, not labels: use non-empty claims and locators, a 64-character lowercase "
+        "content digest, and bind repository/command evidence version_or_commit to the baseline SHA. For repository "
+        "evidence, locator is a repository-relative file path with an optional :start-end line range and the digest "
+        "is for the complete baseline file. A PROVEN "
+        "finding needs a concrete causal trace, affected surfaces, and verification. Return unresolved questions "
+        "as structured objects; a blocking question may name USER as decision_owner, while a PLANNER-owned "
+        "question must be resolved before delivery. Batch all residual user choices instead of asking serially. "
         "Trace symptoms to root cause where evidence permits; label hypotheses honestly. Rank first by scope gate, then "
         "user priority, severity, urgency, dependency/blocking effect, causal leverage, evidence strength, and effort. "
         "Keep verification priority separate from solution priority. {web_rule} Return only schema JSON with "
@@ -3134,6 +3486,7 @@ def command_investigate(args: argparse.Namespace) -> None:
         state, f"investigate-{slot}", provider, slot,
         {"request.md": Path(state["request_snapshot"]),
          "scope_contract.json": Path(state["scope_contract"]),
+         "scope_authority.json": Path(state["scope_authority_path"]),
          "causal_analysis.md": CAUSAL_ANALYSIS},
         INVESTIGATION_SCHEMA, prompt, args.timeout, args.dry_run,
         validator=lambda value: validate_investigation(value, state, slot),
@@ -3167,7 +3520,9 @@ def command_draft(args: argparse.Namespace) -> None:
         "You cannot see the other planner's work. "
         "Re-check repository facts before planning. If that check discovers evidence absent from investigation.json, "
         "record it in new_evidence with a valid suffixed scope id and cite it from evidence_ids; never cite an unrecorded "
-        "observation. Use evidence ids and preserve uncertainty. Produce a detailed "
+        "observation. Read any typed decisions supplied in the context. Use evidence ids and preserve uncertainty. "
+        "Declare plan_scope_ids; OUT_OF_SCOPE is forbidden and PROPOSED_EXTENSION is allowed only when the state "
+        "records explicit user authorization. No blocking unresolved question may remain in a draft. Produce a detailed "
         "implementation plan ordered by the frozen priority rules, with root-cause-driven solutions, finite batch boundaries, "
         "dependencies, budget-sensitive retry limits, and decidable acceptance observations. Do not edit "
         "the repository. Return only JSON matching the supplied schema. Set provider={provider}, slot={slot}, "
@@ -3180,7 +3535,12 @@ def command_draft(args: argparse.Namespace) -> None:
         {"request.md": Path(state["request_snapshot"]),
          "scope_contract.json": Path(state["scope_contract"]),
          "causal_analysis.md": CAUSAL_ANALYSIS,
-         "investigation.json": Path(state["investigations"][slot]["path"])},
+         "investigation.json": Path(state["investigations"][slot]["path"]),
+         **{
+             f"decision_{index:03d}.json": decision
+             for index, decision in enumerate(
+                 sorted((Path(state["run_directory"]) / "decisions").glob("*.json")), 1)
+         }},
         DRAFT_SCHEMA, prompt, args.timeout, args.dry_run,
         validator=lambda value: validate_draft(value, state, slot),
     )
@@ -3229,7 +3589,9 @@ def command_cross_review(args: argparse.Namespace) -> None:
         "underlying defect, propose an evidence-backed finding_aliases entry; do not merge them merely because wording "
         "looks similar. Reject scope extensions. This round "
         "is divergent: add missing in-scope causal, failure-path, alternative, and verification coverage, never a new "
-        "objective. Do not edit files. Return only schema JSON with provider={provider}, slot={slot}, "
+        "objective. Every frozen ledger key must appear exactly once in accepted_finding_ids or "
+        "rejected_finding_ids. Declare plan_scope_ids, and return NEEDS_USER_DECISION whenever a blocking user "
+        "question remains. Do not edit files. Return only schema JSON with provider={provider}, slot={slot}, "
         "reviewer_slot={slot}, target={target}, round=2, baseline_sha={sha}, scope_digest={scope_digest}."
         + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
@@ -3237,6 +3599,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
+        "scope_authority.json": Path(state["scope_authority_path"]),
         "causal_analysis.md": CAUSAL_ANALYSIS,
         "finding_ledger.json": barrier_ledger,
         "own_investigation.json": Path(state["investigations"][slot]["path"]),
@@ -3292,20 +3655,24 @@ def command_diverge(args: argparse.Namespace) -> None:
     barrier_keys = barrier.get("finding_keys")
     target = "draft-02-both"
     prompt = (
-        "You are independent deep-planning slot {slot}, producing divergent draft_03. Read the frozen request, "
-        "scope contract, causal analysis protocol, stable finding ledger, both investigations, and both draft_02 plans. Re-check repository evidence before accepting "
+        "You are independent deep-planning slot {slot}, producing divergent draft_03. Read {context}/request.md, "
+        "{context}/scope_contract.json, {context}/causal_analysis.md, {context}/finding_ledger.json, both investigations, "
+        "and both draft_02 plans. Re-check repository evidence before accepting "
         "a claim. Mine only in-scope omissions: deeper causal chains, failure paths, required support, alternatives, "
         "and verification. Novelty without a scope id or evidentiary effect must be rejected. Do not broaden the user "
         "objective. Preserve priority order and explicitly disposition stable F-* ledger keys; return a genuinely new "
         "finding in full solution form. Propose evidence-backed finding_aliases when multiple stable keys are observations "
-        "of one defect; preserve separate keys when equivalence is not established. Return schema JSON with "
+        "of one defect; preserve separate keys when equivalence is not established. Every frozen key needs exactly "
+        "one accepted/rejected disposition. Declare plan_scope_ids and do not PASS with a blocking question or P0/P1 "
+        "review finding. Return schema JSON with "
         "provider={provider}, slot={slot}, reviewer_slot={slot}, target={target}, round=3, baseline_sha={sha}, "
         "scope_digest={scope_digest}." + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
-             scope_digest=state["scope_digest"])
+             scope_digest=state["scope_digest"], context="{context}")
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
+        "scope_authority.json": Path(state["scope_authority_path"]),
         "causal_analysis.md": CAUSAL_ANALYSIS,
         "finding_ledger.json": barrier_ledger,
         "investigation_A.json": Path(state["investigations"]["A"]["path"]),
@@ -3348,7 +3715,9 @@ def command_synthesis_context(args: argparse.Namespace) -> None:
         "repository evidence rather than vote count. Preserve material disagreements and unresolved product "
         "choices. Scope-lock every item to the frozen objective, preserve priority order, and record each material "
         "finding as problem, evidence, root cause, affected surfaces, solution/tradeoffs, and verification. Produce "
-        "`implementation_plan.md` and `batches.md`. The plan must distinguish proposed plan "
+        "`implementation_plan.md`, `batches.md`, and `synthesis_manifest.json`. The JSON manifest must bind both "
+        "document digests, declare authorized plan scope ids, disposition every stable finding exactly once, and "
+        "carry only non-blocking residual questions. The plan must distinguish proposed plan "
         "items from future Git commits; each batch needs a finite, decidable exit observation. Do not implement.\n",
         encoding="utf-8",
     )
@@ -3360,6 +3729,9 @@ def command_synthesis_context(args: argparse.Namespace) -> None:
         "status": "SYNTHESIS_REQUIRED", "run_id": state["run_id"], "assignment": str(assignment),
         "request": state["request_snapshot"],
         "scope_contract": state["scope_contract"],
+        "scope_authority": state["scope_authority_path"],
+        "authorized_scope_ids": state.get("authorized_scope_ids", ["TARGET-001"]),
+        "excluded_scope_ids": state.get("excluded_scope_ids", []),
         "finding_ledger": state["finding_ledger_path"],
         "causal_analysis": str(CAUSAL_ANALYSIS),
         "investigations": {key: value["path"] for key, value in state["investigations"].items()},
@@ -3386,8 +3758,9 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
         emit({"status": state["status"], "pending_decision": state["pending_decision"]}, 3)
     plan = Path(args.plan).expanduser().resolve()
     batches = Path(args.batch_manifest).expanduser().resolve()
-    if not plan.is_file() or not batches.is_file():
-        raise WorkflowError("both synthesized plan and batch manifest must exist")
+    manifest_path = Path(args.synthesis_manifest).expanduser().resolve()
+    if not plan.is_file() or not batches.is_file() or not manifest_path.is_file():
+        raise WorkflowError("synthesized plan, batch manifest, and synthesis manifest must exist")
     plan_text = plan.read_text(encoding="utf-8")
     batches_text = batches.read_text(encoding="utf-8")
     diagnostics = synthesis_diagnostics(plan_text, batches_text, state.get("finding_ledger", {}))
@@ -3395,23 +3768,32 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
         diagnostics["errors"].append("synthesis must map the candidate to frozen scope id TARGET-001")
     if diagnostics["errors"]:
         raise WorkflowError("; ".join(diagnostics["errors"]))
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"could not read synthesis manifest: {exc}") from exc
+    validate_synthesis_manifest(manifest, state, plan, batches)
     number = state["synthesis_submissions"] + 1
     destination = Path(state["run_directory"]) / "synthesis" / f"round_{number}"
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     plan_copy = destination / "implementation_plan.md"
     batches_copy = destination / "batches.md"
+    manifest_copy = destination / "synthesis_manifest.json"
     # The host is TOLD to write these two names into this directory (SKILL.md, "Host synthesis"),
     # and then submitting them raised SameFileError -- following the documentation was the one
     # thing that could not work. Submitting the frozen copy in place is a no-op, not an error.
-    for source, copy in ((plan, plan_copy), (batches, batches_copy)):
+    for source, copy in ((plan, plan_copy), (batches, batches_copy), (manifest_path, manifest_copy)):
         if source.resolve() != copy.resolve():
             shutil.copyfile(source, copy)
     record_artifact(state, f"candidate-{number}-plan", plan_copy)
     record_artifact(state, f"candidate-{number}-batches", batches_copy)
+    record_artifact(state, f"candidate-{number}-manifest", manifest_copy)
     state["synthesis_submissions"] = number
     state["candidate"] = {
         "round": number, "plan": str(plan_copy), "batch_manifest": str(batches_copy),
+        "synthesis_manifest": str(manifest_copy),
         "plan_sha256": sha256_file(plan_copy), "batch_manifest_sha256": sha256_file(batches_copy),
+        "synthesis_manifest_sha256": sha256_file(manifest_copy),
         "diagnostics": diagnostics,
     }
     state["final_reviews"] = {}
@@ -3459,19 +3841,27 @@ def command_convergence_review(args: argparse.Namespace) -> None:
         "baseline {sha}. This is not a novelty round: reject new objectives. A new finding is admissible only when "
         "it is in scope, materially affects correctness/safety/verification, cites evidence, and states root cause or "
         "honest uncertainty. Check that high-priority findings have dispositions and that priority changes are "
-        "evidence-backed. PASS means no supported P0/P1 defect remains; it does not claim consensus or certainty. "
-        "Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, baseline_sha={sha}."
+        "evidence-backed. Read synthesis_manifest.json and return a candidate-bound review receipt covering every "
+        "named criterion exactly once and every blocking stable finding. PASS means no supported P0/P1 defect remains; "
+        "it does not claim consensus or certainty. "
+        "Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, baseline_sha={sha}, "
+        "scope_digest={scope_digest}, candidate_plan_sha256={plan_digest}, and "
+        "candidate_batch_manifest_sha256={batch_digest}."
         + DELIVERY_CONTRACT
     ).format(
-        slot=slot, provider=provider, target=target, sha=state["baseline_sha"], context="{context}"
+        slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
+        scope_digest=state["scope_digest"], plan_digest=state["candidate"]["plan_sha256"],
+        batch_digest=state["candidate"]["batch_manifest_sha256"], context="{context}"
     )
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
+        "scope_authority.json": Path(state["scope_authority_path"]),
         "causal_analysis.md": CAUSAL_ANALYSIS,
         "finding_ledger.json": Path(state["finding_ledger_path"]),
         "implementation_plan.md": Path(state["candidate"]["plan"]),
         "batches.md": Path(state["candidate"]["batch_manifest"]),
+        "synthesis_manifest.json": Path(state["candidate"]["synthesis_manifest"]),
         "investigation_A.json": Path(state["investigations"]["A"]["path"]),
         "investigation_B.json": Path(state["investigations"]["B"]["path"]),
     }
@@ -3526,18 +3916,25 @@ def command_final_review(args: argparse.Namespace) -> None:
         "whether every exit condition names a finite observation. The plan may choose between drafts only when "
         "the choice is supported by evidence; do not demand excluded work without identifying a request conflict. "
         "PASS is valid only when no supported P0 or P1 finding remains; if you emit any P0/P1 finding, verdict must "
-        "be FAIL or NEEDS_USER_DECISION. "
+        "be FAIL or NEEDS_USER_DECISION. Read synthesis_manifest.json and return a digest-bound criteria receipt; "
+        "each named criterion and every blocking stable finding must be checked exactly once. "
         "Do not edit files. Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, "
-        "baseline_sha={sha}."
+        "baseline_sha={sha}, scope_digest={scope_digest}, candidate_plan_sha256={plan_digest}, and "
+        "candidate_batch_manifest_sha256={batch_digest}."
         + DELIVERY_CONTRACT
-    ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"], context="{context}")
+    ).format(
+        slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
+        scope_digest=state["scope_digest"], plan_digest=state["candidate"]["plan_sha256"],
+        batch_digest=state["candidate"]["batch_manifest_sha256"], context="{context}")
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
+        "scope_authority.json": Path(state["scope_authority_path"]),
         "causal_analysis.md": CAUSAL_ANALYSIS,
         "finding_ledger.json": Path(state["finding_ledger_path"]),
         "implementation_plan.md": Path(state["candidate"]["plan"]),
         "batches.md": Path(state["candidate"]["batch_manifest"]),
+        "synthesis_manifest.json": Path(state["candidate"]["synthesis_manifest"]),
     }
     for review_slot, review in state["cross_reviews"].items():
         context_files[f"cross_review_{review_slot}.json"] = Path(review["path"])
@@ -3588,8 +3985,11 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         "status": "DECISION_PREVIEW", "pending_decision": state["pending_decision"],
         "choice": args.choice, "decision": args.decision, "actor": args.actor,
     }
+    if args.authorize_scope_id:
+        preview["authorized_scope_ids"] = sorted(set(args.authorize_scope_id))
     decision_type = state["pending_decision"]["type"]
     allowed = {
+        "INVESTIGATION_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
         "PLANNING_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
         "CONVERGENCE_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
         "FINAL_PLAN_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
@@ -3615,6 +4015,14 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         raise WorkflowError(f"choice {args.choice} is not allowed for {decision_type}: {','.join(sorted(allowed))}")
     pending = dict(state["pending_decision"])
     pending_key = pending_decision_identity(pending)
+    if decision_type == "INVESTIGATION_BOUNDARY":
+        proposed = set(pending.get("proposed_extension_ids", []))
+        requested = set(args.authorize_scope_id or [])
+        unknown_authorizations = requested - proposed
+        if unknown_authorizations:
+            raise WorkflowError(
+                "authorization cites scope ids outside this decision: "
+                + ",".join(sorted(unknown_authorizations)))
     if args.choice == "GRANT_ONE_SYNTHESIS" and state.get("extra_synthesis_grants", 0) >= 1:
         raise WorkflowError("the one explicit extra synthesis has already been granted")
     if args.choice == "GRANT_ONE_INVOCATION":
@@ -3687,6 +4095,17 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         # claim is no longer intact even if the original model delivered earlier artifacts.
         state["model_diversity"] = False
         state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
+    elif decision_type == "INVESTIGATION_BOUNDARY":
+        question_ids = {item["id"] for item in pending.get("questions", [])}
+        state["resolved_question_ids"] = sorted(
+            set(state.get("resolved_question_ids", [])) | question_ids)
+        proposed = set(pending.get("proposed_extension_ids", []))
+        authorized = set(args.authorize_scope_id or [])
+        state["authorized_scope_ids"] = sorted(
+            set(state.get("authorized_scope_ids", ["TARGET-001"])) | authorized)
+        state["excluded_scope_ids"] = sorted(
+            set(state.get("excluded_scope_ids", [])) | (proposed - authorized))
+        state["status"] = pending.get("resume_status", "EVIDENCE_READY")
     elif decision_type in {"INVOCATION_BUDGET_EXHAUSTED", "PROVIDER_INFRASTRUCTURE_FAILURE"}:
         # Back to where the assignment was, with the count untouched. See the allowed-choices note.
         state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
@@ -3698,6 +4117,8 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = state["pending_decisions"][
             sorted(state["pending_decisions"])[0]]
+    if args.choice != "ABANDON":
+        write_scope_authority(state)
     save_state(state)
     emit({"status": state["status"], "decision_record": str(path),
           "pending_decision": state.get("pending_decision")})
@@ -3718,6 +4139,8 @@ def command_status(args: argparse.Namespace) -> None:
         "assignment_providers": state.get("assignment_providers") or {},
         "slot_provider_overrides": state.get("slot_provider_overrides") or {},
         "automatic_fallbacks": state.get("automatic_fallbacks") or [],
+        "authorized_scope_ids": state.get("authorized_scope_ids", ["TARGET-001"]),
+        "excluded_scope_ids": state.get("excluded_scope_ids", []),
         "independence_notes": state.get("independence_notes") or [],
         "final_reviewer": state["final_reviewer"], "drafts": state["drafts"],
         "cross_reviews": state["cross_reviews"], "synthesis_submissions": state["synthesis_submissions"],
@@ -3753,8 +4176,10 @@ def command_export(args: argparse.Namespace) -> None:
         "peer_reviewer": state.get("peer_reviewer"),
         "selection_checks": state.get("selection_checks", {}),
         "plan": state["final"]["plan"], "batch_manifest": state["final"]["batch_manifest"],
+        "synthesis_manifest": state["final"]["synthesis_manifest"],
         "plan_sha256": state["final"]["plan_sha256"],
         "batch_manifest_sha256": state["final"]["batch_manifest_sha256"],
+        "synthesis_manifest_sha256": state["final"]["synthesis_manifest_sha256"],
         "report": state["final"]["report"],
         "provider_diversity": state["provider_diversity"],
         "model_diversity": state.get("model_diversity", False),
@@ -3763,6 +4188,8 @@ def command_export(args: argparse.Namespace) -> None:
         "assignment_providers": state.get("assignment_providers") or {},
         "slot_provider_overrides": state.get("slot_provider_overrides") or {},
         "automatic_fallbacks": state.get("automatic_fallbacks") or [],
+        "authorized_scope_ids": state.get("authorized_scope_ids", ["TARGET-001"]),
+        "excluded_scope_ids": state.get("excluded_scope_ids", []),
         "independence_notes": state.get("independence_notes") or [],
         "handoff": "Use scripts/workflow.py init only after explicit user approval.",
     })
@@ -3817,6 +4244,20 @@ def command_migrate_engine(args: argparse.Namespace) -> None:
     state["engine_contract"] = current
     state["engine_epoch"] = state.get("engine_epoch", 0) + 1
     state["software_version"] = VERSION
+    state.setdefault("authorized_scope_ids", ["TARGET-001"])
+    state.setdefault("excluded_scope_ids", [])
+    state.setdefault("resolved_question_ids", [])
+    candidate = state.get("candidate") or {}
+    if candidate and not candidate.get("synthesis_manifest") and state["status"] not in TERMINAL_STATUSES:
+        state["final_reviews"] = {}
+        state["convergence_reviews"] = {}
+        state["status"] = "SYNTHESIS_REQUIRED"
+        state.setdefault("engine_migration_notes", []).append({
+            "reason": "candidate predates the required synthesis disposition manifest",
+            "action": "resynthesize the candidate under the current evidence contract",
+            "at": utc_now(),
+        })
+    write_scope_authority(state)
     save_state(state)
     emit({"status": state["status"], "run_id": state["run_id"],
           "engine_contract": current, "decision_record": str(path)})
@@ -3970,6 +4411,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--run-id", required=True)
     submit.add_argument("--plan", required=True)
     submit.add_argument("--batch-manifest", required=True)
+    submit.add_argument("--synthesis-manifest", required=True)
     submit.set_defaults(func=command_submit_synthesis)
 
     check_synthesis = commands.add_parser(
@@ -4008,6 +4450,10 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     adjudicate.add_argument("--actor", required=True)
+    adjudicate.add_argument(
+        "--authorize-scope-id", action="append", default=[],
+        help="INVESTIGATION_BOUNDARY only: explicitly authorize a proposed extension id; "
+             "omitted proposed extensions remain excluded")
     adjudicate.add_argument(
         "--to-provider", choices=list(SUPPORTED_PROVIDERS),
         help="REASSIGN_ASSIGNMENT only: which CLI takes the assignment over "
