@@ -1268,7 +1268,12 @@ class PlanWorkflowTest(unittest.TestCase):
         rejected = self.call(
             "investigate", "--project", str(self.project), "--run-id", initialized["run_id"],
             "--slot", "A", expect=2)
-        self.assertIn("evidence fields must be non-empty", rejected["error"])
+        # The rejection now names EVERY problem at once (one retry can fix them all), so the
+        # assertion is on the property — the empty receipt is rejected and the empty field is
+        # named — rather than on one sentence of the message.
+        self.assertIn("empty field(s)", rejected["error"])
+        # The fixture leaves the locator empty, so that is the field the message must name.
+        self.assertIn("locator", rejected["error"])
 
     def test_blocking_investigation_questions_are_batched_before_drafting(self) -> None:
         self.request.write_text(self.request.read_text() + "\nFAKE_BLOCKING_SCOPE_QUESTION=A\n")

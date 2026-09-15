@@ -1100,9 +1100,18 @@ def validate_plan_scope_ids(scope_ids: Any, state: dict[str, Any], where: str) -
 def validate_evidence_items(
     items: Any, state: dict[str, Any], where: str, *, require_nonempty: bool = True,
 ) -> set[str]:
+    """Check every evidence receipt, and report EVERY problem at once.
+
+    Together, not one at a time: a deterministic rejection is re-asked with its reason attached, so
+    failing on the first defect makes a slot spend one paid retry per defect. The first run of this
+    check against real output found twenty entries carrying all-zero digests and two carrying prose
+    locators — one retry that names all of it is a repair; twenty retries is a loop.
+    """
     if not isinstance(items, list) or (require_nonempty and not items):
         raise WorkflowError(f"{where} must contain evidence")
     ids: list[str] = []
+    problems: list[str] = []
+    baseline = state["baseline_sha"]
     for item in items:
         evidence_id = item.get("id")
         if str(item.get("status") or "") == "UNRESOLVED":
@@ -1110,42 +1119,57 @@ def validate_evidence_items(
             # what is forbidden: both slots answered this required 64-hex field with zeros rather
             # than saying they could not compute it.
             if not all(nonempty(item.get(field)) for field in ("id", "claim")):
-                raise WorkflowError(f"{where} UNRESOLVED evidence needs at least an id and a claim")
+                problems.append(f"{evidence_id!r}: UNRESOLVED evidence still needs an id and a claim")
+                continue
             ids.append(evidence_id)
             continue
-        if not all(nonempty(item.get(field)) for field in (
-                "id", "claim", "locator", "retrieved_at", "version_or_commit", "content_sha256")):
-            raise WorkflowError(f"{where} evidence fields must be non-empty")
-        if set(str(item["content_sha256"])) == {"0"}:
-            raise WorkflowError(
-                f"{where} evidence {evidence_id!r} carries an all-zero placeholder digest: run "
-                f"`sha256sum {item.get('locator') or '<path>'}` inside the frozen worktree and use the real "
-                "value, or mark the evidence UNRESOLVED")
-        if not re.fullmatch(r"[0-9a-f]{64}", item["content_sha256"]):
-            raise WorkflowError(f"{where} evidence {evidence_id!r} has an invalid content digest")
+        missing = [field for field in ("id", "claim", "locator", "retrieved_at", "version_or_commit",
+                                       "content_sha256") if not nonempty(item.get(field))]
+        if missing:
+            problems.append(f"{evidence_id!r}: empty field(s) {', '.join(missing)}")
+            continue
+        digest = str(item["content_sha256"])
+        if set(digest) == {"0"}:
+            problems.append(
+                f"{evidence_id!r}: all-zero placeholder digest — run `sha256sum "
+                f"{str(item.get('locator') or '<path>').split(':')[0]}` from the frozen worktree and "
+                "use the real value, or mark the evidence UNRESOLVED")
+            continue
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            problems.append(f"{evidence_id!r}: content digest is not 64 lowercase hex characters")
+            continue
         try:
-            datetime.fromisoformat(item["retrieved_at"].replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise WorkflowError(f"{where} evidence {evidence_id!r} has an invalid retrieval time") from exc
+            datetime.fromisoformat(str(item["retrieved_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            problems.append(f"{evidence_id!r}: retrieved_at is not an ISO timestamp")
+            continue
         if not valid_scope_id(item.get("scope_id")):
-            raise WorkflowError(f"{where} evidence {evidence_id!r} has an invalid scope id")
-        if item["source_type"] in {"REPOSITORY", "COMMAND"} \
-                and item["version_or_commit"] != state["baseline_sha"]:
-            raise WorkflowError(f"{where} evidence {evidence_id!r} is not bound to the baseline SHA")
+            problems.append(f"{evidence_id!r}: scope_id {item.get('scope_id')!r} is not a scope id")
+            continue
+        if item["source_type"] in {"REPOSITORY", "COMMAND"} and item["version_or_commit"] != baseline:
+            problems.append(f"{evidence_id!r}: version_or_commit must be the baseline SHA {baseline}")
+            continue
         if item["source_type"] == "REPOSITORY":
-            locator = re.fullmatch(r"([^:\n]+?)(?::\d+(?:-\d+)?)?", item["locator"])
-            if locator is None:
-                raise WorkflowError(
-                    f"{where} repository evidence {evidence_id!r} locator must be a relative path "
-                    "with an optional line range")
-            relative = Path(locator.group(1))
+            match = re.fullmatch(r"([^:\n]+?)(?::\d+(?:-\d+)?)?", str(item["locator"]))
+            relative = Path(match.group(1).strip()) if match else None
             worktree = Path(state["worktree"]).resolve()
-            source = (worktree / relative).resolve()
-            if relative.is_absolute() or not source.is_relative_to(worktree) or not source.is_file():
-                raise WorkflowError(f"{where} repository evidence {evidence_id!r} locator is not a baseline file")
-            if sha256_file(source) != item["content_sha256"]:
-                raise WorkflowError(f"{where} repository evidence {evidence_id!r} digest mismatch")
+            source = (worktree / relative).resolve() if relative is not None else None
+            if relative is None or relative.is_absolute() or source is None \
+                    or not source.is_relative_to(worktree) or not source.is_file():
+                problems.append(
+                    f"{evidence_id!r}: locator {str(item['locator'])[:70]!r} is not one file in the "
+                    "frozen worktree — use exactly `<worktree-relative/path>` with an optional "
+                    "`:start-end`, one file per entry, and keep descriptions in the claim")
+                continue
+            if sha256_file(source) != digest:
+                problems.append(f"{evidence_id!r}: digest does not match {relative}")
+                continue
         ids.append(evidence_id)
+    if problems:
+        shown = problems[:10]
+        more = "" if len(problems) == len(shown) else f" (+{len(problems) - len(shown)} more)"
+        raise WorkflowError(
+            f"{where} has {len(problems)} evidence problem(s): " + "; ".join(shown) + more)
     if len(ids) != len(set(ids)):
         raise WorkflowError(f"{where} evidence ids must be unique")
     return set(ids)
@@ -2188,7 +2212,7 @@ def isolated_agent_command(
         boundary_path = invocation_root / "dsh-read-boundary.mjs"
         shutil.copyfile(boundary_source, boundary_path)
         boundary_path.chmod(0o600)
-        patch_path = invocation_root / "dsh-no-shell.patch.yml"
+        patch_path = invocation_root / "dsh-review-tools.patch.yml"
         descriptor = os.open(
             patch_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -3521,8 +3545,11 @@ def command_investigate(args: argparse.Namespace) -> None:
         "anything outside the frozen objective is OUT_OF_SCOPE or a PROPOSED_EXTENSION and must not enter the plan. "
         "Evidence fields are receipts, not labels: use non-empty claims and locators, a 64-character lowercase "
         "content digest, and bind repository/command evidence version_or_commit to the baseline SHA. For repository "
-        "evidence, locator is a repository-relative file path with an optional :start-end line range and the digest "
-        "is for the complete baseline file. A PROVEN "
+        "evidence, the locator is EXACTLY one worktree-relative file path, optionally followed by :start-end — no "
+        "prose, no parenthetical notes and no ';'-joined list of files: give each file its own entry and keep "
+        "descriptions in the claim. The digest is for the complete baseline file. The files in your context directory "
+        "(request.md, scope_contract.json, causal_analysis.md) are the REQUEST authority rather than repository "
+        "evidence — never submit them as evidence entries. A PROVEN "
         "finding needs a concrete causal trace, affected surfaces, and verification. Return unresolved questions "
         "as structured objects; a blocking question may name USER as decision_owner, while a PLANNER-owned "
         "question must be resolved before delivery. Batch all residual user choices instead of asking serially. "
