@@ -813,6 +813,19 @@ def persist_invocation_state(
             latest.setdefault("delivery_faults", {})[assignment] = fault
         elif clear_fault:
             latest.get("delivery_faults", {}).pop(assignment, None)
+        # d2: an agent digest that disagreed with the file is DISCLOSED, and the disclosure has to
+        # survive the merge — this function reloads the state from disk and keeps only named fields,
+        # so a new key that is not named here is silently dropped. Appended one entry at a time
+        # (like automatic_fallbacks) so parallel slots cannot overwrite each other's findings.
+        known_disclosures = {
+            (item.get("evidence_id"), item.get("path"))
+            for item in latest.setdefault("evidence_digest_disclosures", [])
+        }
+        for disclosure in state.get("evidence_digest_disclosures") or []:
+            identity = (disclosure.get("evidence_id"), disclosure.get("path"))
+            if identity not in known_disclosures:
+                latest["evidence_digest_disclosures"].append(disclosure)
+                known_disclosures.add(identity)
         incoming_fallbacks = state.get("automatic_fallbacks") or []
         known_fallbacks = {
             (item.get("trigger_assignment"), item.get("at"))
@@ -1123,21 +1136,17 @@ def validate_evidence_items(
                 continue
             ids.append(evidence_id)
             continue
-        missing = [field for field in ("id", "claim", "locator", "retrieved_at", "version_or_commit",
-                                       "content_sha256") if not nonempty(item.get(field))]
+        missing = [field for field in ("id", "claim", "locator", "retrieved_at", "version_or_commit")
+                   if not nonempty(item.get(field))]
         if missing:
             problems.append(f"{evidence_id!r}: empty field(s) {', '.join(missing)}")
             continue
-        digest = str(item["content_sha256"])
-        if set(digest) == {"0"}:
-            problems.append(
-                f"{evidence_id!r}: all-zero placeholder digest — run `sha256sum "
-                f"{str(item.get('locator') or '<path>').split(':')[0]}` from the frozen worktree and "
-                "use the real value, or mark the evidence UNRESOLVED")
-            continue
-        if not re.fullmatch(r"[0-9a-f]{64}", digest):
-            problems.append(f"{evidence_id!r}: content digest is not 64 lowercase hex characters")
-            continue
+        # d2: the digest is a MACHINE FACT, so the ENGINE owns it. The agent's value is an optional
+        # cross-check: it is verified when present and recorded as a compliance finding when it
+        # differs, never a rejection — a model that cannot run a hash must not be pushed into
+        # fabricating one to pass, and a fabricated value must not smuggle anything in. What the
+        # plan and the reviewer read is always the digest of the baseline bytes.
+        claimed_digest = str(item.get("content_sha256") or "").strip().lower()
         try:
             datetime.fromisoformat(str(item["retrieved_at"]).replace("Z", "+00:00"))
         except ValueError:
@@ -1161,11 +1170,19 @@ def validate_evidence_items(
                     "frozen worktree — use exactly `<worktree-relative/path>` with an optional "
                     "`:start-end`, one file per entry, and keep descriptions in the claim")
                 continue
-            if sha256_file(source) != digest:
-                problems.append(
-                    f"{evidence_id!r}: digest does not match {relative} — it is the digest of the COMPLETE "
-                    f"file, so run `sha256sum {relative}` from the frozen worktree and use its output")
-                continue
+            computed = sha256_file(source)
+            if not claimed_digest:
+                item["content_sha256"] = computed
+            elif claimed_digest != computed:
+                state.setdefault("evidence_digest_disclosures", []).append({
+                    "evidence_id": evidence_id, "path": str(relative),
+                    "claimed": claimed_digest, "engine_digest": computed,
+                    "detail": ("the digest the agent supplied is not the digest of the complete "
+                               "baseline file; the engine's value is used"),
+                })
+                item["content_sha256"] = computed
+            else:
+                item["content_sha256"] = computed
         ids.append(evidence_id)
     if problems:
         shown = problems[:10]
@@ -3536,16 +3553,14 @@ def command_investigate(args: argparse.Namespace) -> None:
         "You are independent evidence investigator {slot}. Read {context}/request.md and "
         "{context}/scope_contract.json, then inspect the complete relevant repository surface at baseline {sha}. "
         "The frozen worktree IS the repository and nothing outside it is part of this baseline: {worktree} "
-        "(read-only; the sandbox denies every other path). Compute the digest of repository evidence with "
-        "`sha256sum <relative/path>` run from that directory and use the 64 lowercase hex characters it prints. "
-        "Compute them all in ONE command — `cd <the frozen worktree> && sha256sum <path> <path> ...` — and paste "
-        "what it prints; the digest is of the COMPLETE file, never of the cited line range and never a sequence "
-        "you construct yourself, because the engine re-computes every digest and rejects a mismatch. If you cannot "
-        "run the command, mark those entries UNRESOLVED instead of guessing. The baseline_sha and "
-        "scope_digest printed in this prompt are NOT evidence digests and must never be copied into "
-        "one: an evidence digest is the output of sha256sum for the file you cite. Every digest is "
-        "re-computed by the engine, so a value you construct — including a sequence that only looks "
-        "unique — is detected and rejected. "
+        "(read-only; the sandbox denies every other path). The ENGINE computes and records the digest of every "
+        "repository file you cite, so you do not have to: cite the path and the engine binds it to the baseline "
+        "bytes. If you want to cross-check one yourself, run `cd <the frozen worktree> && sha256sum <path>`; the "
+        "digest is of the COMPLETE file, never of the cited line range. A value that differs from the file's real "
+        "digest is recorded as a compliance finding against this delivery and the engine's own value is used "
+        "either way — so fabricating one gains nothing and costs you credibility. The baseline_sha and "
+        "scope_digest printed in this prompt are NOT evidence digests: never copy them into that field. Leave the "
+        "field empty when you did not compute it. "
         "Do not draft or edit the solution yet. Read {context}/causal_analysis.md and establish what is true. "
         "Use its proportional production trace and producer-aware evidence model; do not infer system shape from keywords. "
         "Every claim and finding must map to a scope id "
@@ -4289,6 +4304,8 @@ def command_status(args: argparse.Namespace) -> None:
         # GB-3/3-d: the CAUSE of the last rejection travels with the state, so a controller sees why
         # an assignment failed instead of retrying it blindly.
         "delivery_faults": dict(state.get("delivery_faults") or {}),
+        # d2: an agent digest that disagreed with the file is DISCLOSED here rather than rejected.
+        "evidence_digest_disclosures": list(state.get("evidence_digest_disclosures") or []),
         "finding_aliases": state.get("finding_aliases") or {},
         "final": state.get("final"), "run_directory": state["run_directory"], "usage": state["usage"],
         "next_action": next_action(state),

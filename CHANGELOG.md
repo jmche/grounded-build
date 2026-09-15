@@ -29,6 +29,15 @@ All notable changes use semantic versioning.
   recorded — and rewrote the `--peer-reviewer` / `--final-reviewer` error messages to state the rule
   instead of only the missing argument.
 
+- Made the evidence digest an ENGINE fact (adjudicated as d2). The digest of a cited baseline file
+  is computed and recorded by the engine; a digest the agent supplies is an optional cross-check.
+  A value that differs is recorded as `evidence_digest_disclosures` (surfaced in `status`/`next`)
+  instead of rejecting the delivery, and the record always carries the engine's value — so a
+  fabricated digest cannot reach a plan, and a model that cannot run a hash is no longer pushed into
+  inventing one to pass. Live evidence for the change: a slot answered 39 required digest fields with
+  a constructed sequence (`00019f2c…`, `00029f2c…`, … sharing a 60-character suffix), and an earlier
+  attempt copied the prompt's own `scope_digest` into the field.
+
 ## [0.7.2] - 2026-09-15
 
 - Made planning evidence receipts consequential: required evidence, root-cause traces, repository

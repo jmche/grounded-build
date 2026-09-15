@@ -92,6 +92,10 @@ if "independent evidence investigator" in prompt:
     }
     if f"FAKE_EMPTY_EVIDENCE={slot}" in request_text:
         payload["evidence"][0]["locator"] = ""
+    if f"FAKE_WRONG_DIGEST={slot}" in request_text:
+        # What a model does when it cannot (or will not) run sha256sum: it fills the required field
+        # with something that only looks like a digest.
+        payload["evidence"][0]["content_sha256"] = "0" * 64
 elif "independent planning instance" in prompt:
     slot = re.search(r"instance ([AB])", prompt).group(1)
     payload = {
@@ -1274,6 +1278,31 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("empty field(s)", rejected["error"])
         # The fixture leaves the locator empty, so that is the field the message must name.
         self.assertIn("locator", rejected["error"])
+
+    def test_a_wrong_agent_digest_is_disclosed_instead_of_rejecting_the_delivery(self) -> None:
+        """d2: the digest is a machine fact, so the engine owns it.
+
+        The agent's value is an optional cross-check. A model that cannot run a hash must not be
+        pushed into fabricating one to pass, and a fabricated one must not be able to smuggle
+        anything in: the record carries the digest of the baseline bytes either way, and the
+        disagreement is disclosed.
+        """
+        self.request.write_text(self.request.read_text() + "\nFAKE_WRONG_DIGEST=A\n")
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        run_id = initialized["run_id"]
+        # NOTE: no rejection. The delivery is accepted with the engine's digest.
+        self.call("investigate", "--project", str(self.project), "--run-id", run_id, "--slot", "A")
+        state = self.get_state(initialized)
+        disclosures = state.get("evidence_digest_disclosures") or []
+        self.assertEqual(len(disclosures), 1, state.get("evidence_digest_disclosures"))
+        entry = disclosures[0]
+        self.assertEqual(entry["claimed"], "0" * 64)
+        self.assertRegex(entry["engine_digest"], r"[0-9a-f]{64}")
+        self.assertNotEqual(entry["claimed"], entry["engine_digest"])
+        record = json.loads(Path(state["investigations"]["A"]["path"]).read_text(encoding="utf-8"))
+        self.assertEqual(record["evidence"][0]["content_sha256"], entry["engine_digest"])
 
     def test_blocking_investigation_questions_are_batched_before_drafting(self) -> None:
         self.request.write_text(self.request.read_text() + "\nFAKE_BLOCKING_SCOPE_QUESTION=A\n")
