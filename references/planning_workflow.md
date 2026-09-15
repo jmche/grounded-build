@@ -197,9 +197,17 @@ checks stable finding dispositions when run during submission. Every `Bxx:` bloc
 semantic quality; final reviewers still inspect repository evidence.
 
 Submission rejects a missing or invalid synthesis manifest. Final and convergence reviewers receive it and
-return a receipt bound to the exact candidate digests. The receipt covers request coverage, scope control,
+return a receipt bound to the plan, batch manifest, and synthesis manifest digests. Parallel results must
+also match the current submission round. Included work is declared in `plan_scope_ids`; prose may mention
+excluded scope IDs to explain exclusions, and reviewers judge whether prose conforms to the declaration.
+The receipt covers request coverage, scope control,
 evidence/root cause, dependency order, budget bounds, and batch acceptance exactly once, plus every blocking
 stable finding. Only an all-PASS receipt can contribute to `READY`.
+
+Migrating a legacy candidate without a synthesis manifest routes it to `SYNTHESIS_REQUIRED`, including
+previously `READY` runs. Historical final artifacts remain recorded, but current completion requires a new
+manifest and fresh reviews. Migration preserves spent counters and permits one replacement submission
+when the old synthesis budget is exhausted; it does not mint a review PASS.
 
 ## Typed decisions
 

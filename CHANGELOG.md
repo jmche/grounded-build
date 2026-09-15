@@ -13,6 +13,10 @@ All notable changes use semantic versioning.
   finding ledger, and keep PASS consistent with blocking findings and unresolved decisions.
 - Added a digest-bound synthesis manifest with complete finding dispositions and a final-review
   criteria receipt bound to the exact candidate, scope, and blocking ledger.
+- Bound parallel review merging to all three candidate artifacts and the submission round.
+  Explicit exclusion explanations remain valid; included scope is declared structurally and
+  checked semantically by reviewers. Legacy completed plans migrate to re-synthesis and fresh
+  review, retaining historical final artifacts and one bounded migration submission when needed.
 
 ## [0.7.1] - 2026-09-14
 

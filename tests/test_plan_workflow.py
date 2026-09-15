@@ -146,6 +146,7 @@ else:
         findings = [{"id": "bad-severity", "severity": "P0 ", "claim": "unsafe", "evidence": "plan", "required_change": "fix"}]
     plan_digest = re.search(r"candidate_plan_sha256=([0-9a-f]{64})", prompt).group(1)
     batch_digest = re.search(r"candidate_batch_manifest_sha256=([0-9a-f]{64})", prompt).group(1)
+    manifest_digest = re.search(r"candidate_synthesis_manifest_sha256=([0-9a-f]{64})", prompt).group(1)
     ledger_path = context_dir / "finding_ledger.json"
     ledger = json.loads(ledger_path.read_text())["findings"] if ledger_path.is_file() else {}
     blocking = sorted(key for key, record in ledger.items()
@@ -160,6 +161,7 @@ else:
                "baseline_sha": sha, "scope_digest": scope_digest,
                "candidate_plan_sha256": plan_digest,
                "candidate_batch_manifest_sha256": batch_digest,
+               "candidate_synthesis_manifest_sha256": manifest_digest,
                "verdict": verdict, "summary": "final checked", "criteria": criteria,
                "blocking_finding_ids_checked": blocking, "findings": findings}
 def fake_assignment(prompt_text):
@@ -298,7 +300,7 @@ class PlanWorkflowTest(unittest.TestCase):
         plan = directory / "host_plan.md"
         batches = directory / "host_batches.md"
         manifest = directory / "host_synthesis_manifest.json"
-        plan.write_text("# Implementation plan\n\n## Scope\nTARGET-001: Implement the request.\n\n## Verification\nRun a named test.\n", encoding="utf-8")
+        plan.write_text("# Implementation plan\n\n## Scope\nTARGET-001: Implement the request.\nOUT_OF_SCOPE-001 and PROPOSED_EXTENSION-001 are excluded.\n\n## Verification\nRun a named test.\n", encoding="utf-8")
         batches.write_text("# Batches\n\n- B01: request scope; exit when the named test returns zero.\n", encoding="utf-8")
         self.write_synthesis_manifest(initialized, plan, batches, manifest)
         self.call(
@@ -440,7 +442,7 @@ class PlanWorkflowTest(unittest.TestCase):
         draft_a_context = next((Path(initialized["run_directory"]) / "invocations" / "draft-A").glob("attempt_1_*/context"))
         self.assertEqual(
             sorted(item.name for item in draft_a_context.iterdir() if item.name != "schema.json"),
-            ["causal_analysis.md", "investigation.json", "request.md", "scope_contract.json"],
+            ["causal_analysis.md", "investigation.json", "request.md", "scope_authority.json", "scope_contract.json"],
         )
         causal = (draft_a_context / "causal_analysis.md").read_text(encoding="utf-8")
         self.assertIn("canonical authority", causal)
@@ -1024,6 +1026,47 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertFalse((record_path.parent / "home").exists())
         self.assertFalse((record_path.parent / "tmp").exists())
 
+    def test_legacy_ready_migration_recovers_through_review_and_export(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        for slot in ("A", "B"):
+            self.call("investigate", "--project", str(self.project), "--run-id",
+                      initialized["run_id"], "--slot", slot)
+        self.run_through_cross_review(initialized)
+        self.submit_candidate(initialized)
+        self.call("final-review", "--project", str(self.project), "--run-id",
+                  initialized["run_id"], "--reviewer", "F")
+        spec = importlib.util.spec_from_file_location("gb_legacy_ready", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        previous = os.environ.get("GROUNDED_BUILD_PLAN_HOME")
+        os.environ["GROUNDED_BUILD_PLAN_HOME"] = self.env["GROUNDED_BUILD_PLAN_HOME"]
+        try:
+            state = self.get_state(initialized)
+            self.assertEqual(state["status"], "READY")
+            state["engine_contract"] = {"software_version": "older", "files": {}}
+            state["candidate"].pop("synthesis_manifest")
+            state["candidate"].pop("synthesis_manifest_sha256")
+            state["synthesis_submissions"] = 3
+            state["extra_synthesis_grants"] = 1
+            module.save_state(state)
+        finally:
+            if previous is None:
+                os.environ.pop("GROUNDED_BUILD_PLAN_HOME", None)
+            else:
+                os.environ["GROUNDED_BUILD_PLAN_HOME"] = previous
+        migrated = self.call(
+            "migrate-engine", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--reason", "upgrade completed legacy run", "--actor", "tester", "--apply")
+        self.assertEqual(migrated["status"], "SYNTHESIS_REQUIRED")
+        self.assertTrue(self.get_state(initialized)["legacy_finals"])
+        self.submit_candidate(initialized)
+        self.call("final-review", "--project", str(self.project), "--run-id",
+                  initialized["run_id"], "--reviewer", "F")
+        exported = self.call("export", "--project", str(self.project), "--run-id", initialized["run_id"])
+        self.assertEqual(exported["status"], "READY")
+
     def test_engine_drift_requires_an_explicit_audited_migration(self) -> None:
         initialized = self.call(
             "init", "--project", str(self.project), "--request", str(self.request),
@@ -1330,7 +1373,7 @@ class PlanWorkflowTest(unittest.TestCase):
         plan = directory / "replacement_plan.md"
         batches = directory / "replacement_batches.md"
         plan.write_text(
-            "# Replacement plan\n\n## Scope\nTARGET-001: Implement the corrected request.\n",
+            Path(old_state["candidate"]["plan"]).read_text(),
             encoding="utf-8",
         )
         batches.write_text(
@@ -1345,7 +1388,7 @@ class PlanWorkflowTest(unittest.TestCase):
             "--synthesis-manifest", str(manifest),
         )
         current = self.get_state(initialized)
-        self.assertNotEqual(current["candidate"]["plan_sha256"], old_digest)
+        self.assertEqual(current["candidate"]["plan_sha256"], old_digest)
         self.assertEqual(current["convergence_reviews"], {})
 
         spec = importlib.util.spec_from_file_location("gb_stale_candidate", SCRIPT)
@@ -1356,6 +1399,9 @@ class PlanWorkflowTest(unittest.TestCase):
             "B": {
                 "provider": "claude", "verdict": "PASS", "path": "stale.json",
                 "candidate_sha256": old_digest,
+                "candidate_batch_manifest_sha256": old_state["candidate"]["batch_manifest_sha256"],
+                "candidate_synthesis_manifest_sha256": old_state["candidate"]["synthesis_manifest_sha256"],
+                "candidate_round": old_state["candidate"]["round"],
             }
         }
         prior_home = os.environ.get("GROUNDED_BUILD_PLAN_HOME")
@@ -1367,6 +1413,9 @@ class PlanWorkflowTest(unittest.TestCase):
                 "A": {
                     "provider": "claude", "verdict": "PASS", "path": "stale-final.json",
                     "candidate_sha256": old_digest,
+                    "candidate_batch_manifest_sha256": old_state["candidate"]["batch_manifest_sha256"],
+                    "candidate_synthesis_manifest_sha256": old_state["candidate"]["synthesis_manifest_sha256"],
+                    "candidate_round": old_state["candidate"]["round"],
                 }
             }
             with self.assertRaisesRegex(module.WorkflowError, "stale final-review result"):

@@ -236,6 +236,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
         "scope_digest": {"type": "string"},
         "candidate_plan_sha256": {"type": "string"},
         "candidate_batch_manifest_sha256": {"type": "string"},
+        "candidate_synthesis_manifest_sha256": {"type": "string"},
         "verdict": {"type": "string", "enum": ["PASS", "FAIL", "NEEDS_USER_DECISION"]},
         "summary": {"type": "string"},
         "criteria": {"type": "array", "items": {
@@ -265,7 +266,8 @@ REVIEW_SCHEMA: dict[str, Any] = {
         },
     },
     "required": ["provider", "reviewer_slot", "target", "baseline_sha", "scope_digest",
-                 "candidate_plan_sha256", "candidate_batch_manifest_sha256", "verdict",
+                 "candidate_plan_sha256", "candidate_batch_manifest_sha256",
+                 "candidate_synthesis_manifest_sha256", "verdict",
                  "summary", "criteria", "blocking_finding_ids_checked", "findings"],
 }
 
@@ -884,11 +886,15 @@ def save_parallel_stage(state: dict[str, Any], stage: str) -> None:
             "final-review": "final_reviews",
         }.get(stage)
         if candidate_bound_field:
-            current_digest = (latest.get("candidate") or {}).get("plan_sha256")
+            current_candidate = latest.get("candidate") or {}
             incoming = state.get(candidate_bound_field, {})
             stale_slots = sorted(
                 slot for slot, record in incoming.items()
-                if record.get("candidate_sha256") != current_digest
+                if any(record.get(key) != current_candidate.get(field) for key, field in (
+                    ("candidate_sha256", "plan_sha256"),
+                    ("candidate_batch_manifest_sha256", "batch_manifest_sha256"),
+                    ("candidate_synthesis_manifest_sha256", "synthesis_manifest_sha256"),
+                    ("candidate_round", "round")))
             )
             if stale_slots:
                 raise WorkflowError(
@@ -950,7 +956,7 @@ def save_parallel_stage(state: dict[str, Any], stage: str) -> None:
                 if all(verdict == "PASS" for verdict in verdicts):
                     latest["status"] = "FINAL_REVIEW_REQUIRED"
                 elif latest["synthesis_submissions"] < (
-                        MAX_SYNTHESIS_SUBMISSIONS + latest.get("extra_synthesis_grants", 0)):
+                        synthesis_submission_limit(latest)):
                     latest["status"] = "SYNTHESIS_REQUIRED"
                 else:
                     latest["status"] = "NEEDS_USER_DECISION"
@@ -965,7 +971,7 @@ def save_parallel_stage(state: dict[str, Any], stage: str) -> None:
                 if all(verdict == "PASS" for verdict in verdicts):
                     finalize_ready_candidate(latest)
                 elif latest["synthesis_submissions"] < (
-                        MAX_SYNTHESIS_SUBMISSIONS + latest.get("extra_synthesis_grants", 0)):
+                        synthesis_submission_limit(latest)):
                     latest["status"] = "SYNTHESIS_REQUIRED"
                 else:
                     latest["status"] = "NEEDS_USER_DECISION"
@@ -1089,15 +1095,6 @@ def validate_plan_scope_ids(scope_ids: Any, state: dict[str, Any], where: str) -
             raise WorkflowError(f"{where} cannot include OUT_OF_SCOPE work: {scope_id}")
         if scope_class == "PROPOSED_EXTENSION" and scope_id not in authorized_extensions:
             raise WorkflowError(f"{where} includes an extension without typed user authorization: {scope_id}")
-
-
-def validate_declared_scope_references(text_value: str, declared: list[str], where: str) -> None:
-    referenced = set(re.findall(
-        r"\b(?:TARGET|REQUIRED_SUPPORT|EVIDENCE_ONLY|PROPOSED_EXTENSION|OUT_OF_SCOPE)-\d{3,}\b",
-        text_value))
-    undeclared = referenced - set(declared)
-    if undeclared:
-        raise WorkflowError(f"{where} text cites undeclared scope ids: {sorted(undeclared)}")
 
 
 def validate_evidence_items(
@@ -2809,7 +2806,6 @@ def validate_draft(payload: dict[str, Any], state: dict[str, Any], slot: str) ->
     if not nonempty(payload.get("summary")) or not nonempty(payload.get("plan_markdown")):
         raise WorkflowError("draft plan is empty")
     validate_plan_scope_ids(payload["plan_scope_ids"], state, "draft")
-    validate_declared_scope_references(payload["plan_markdown"], payload["plan_scope_ids"], "draft")
     investigation = json.loads(Path(state["investigations"][slot]["path"]).read_text(encoding="utf-8"))
     new_evidence = payload.get("new_evidence")
     new_ids = validate_evidence_items(
@@ -2876,8 +2872,6 @@ def validate_integration(
     if not nonempty(payload.get("summary")) or not nonempty(payload.get("plan_markdown")):
         raise WorkflowError("integrated draft plan is empty")
     validate_plan_scope_ids(payload["plan_scope_ids"], state, "integrated draft")
-    validate_declared_scope_references(
-        payload["plan_markdown"], payload["plan_scope_ids"], "integrated draft")
     if payload["verdict"] != "PASS" and not payload["findings"]:
         raise WorkflowError("a non-PASS integrated review requires findings")
     dispositions = payload["accepted_finding_ids"] + payload["rejected_finding_ids"]
@@ -2961,7 +2955,8 @@ def validate_review(
     candidate = state.get("candidate") or {}
     if payload["scope_digest"] != state["scope_digest"] \
             or payload["candidate_plan_sha256"] != candidate.get("plan_sha256") \
-            or payload["candidate_batch_manifest_sha256"] != candidate.get("batch_manifest_sha256"):
+            or payload["candidate_batch_manifest_sha256"] != candidate.get("batch_manifest_sha256") \
+            or payload["candidate_synthesis_manifest_sha256"] != candidate.get("synthesis_manifest_sha256"):
         raise WorkflowError("review receipt is not bound to the candidate and scope")
     if not nonempty(payload.get("summary")):
         raise WorkflowError("review summary must be non-empty")
@@ -3220,9 +3215,6 @@ def validate_synthesis_manifest(
             or manifest["batch_manifest_sha256"] != sha256_file(batches):
         raise WorkflowError("synthesis manifest digest does not bind the submitted documents")
     validate_plan_scope_ids(manifest["plan_scope_ids"], state, "synthesis manifest")
-    validate_declared_scope_references(
-        plan.read_text(encoding="utf-8") + "\n" + batches.read_text(encoding="utf-8"),
-        manifest["plan_scope_ids"], "synthesis")
     known_evidence = state_evidence_ids(state)
     validate_questions(
         manifest["unresolved_questions"], known_evidence, "synthesis manifest",
@@ -3536,6 +3528,7 @@ def command_draft(args: argparse.Namespace) -> None:
          "scope_contract.json": Path(state["scope_contract"]),
          "causal_analysis.md": CAUSAL_ANALYSIS,
          "investigation.json": Path(state["investigations"][slot]["path"]),
+         "scope_authority.json": Path(state["scope_authority_path"]),
          **{
              f"decision_{index:03d}.json": decision
              for index, decision in enumerate(
@@ -3745,12 +3738,17 @@ def command_synthesis_context(args: argparse.Namespace) -> None:
     })
 
 
+def synthesis_submission_limit(state: dict[str, Any]) -> int:
+    return max(MAX_SYNTHESIS_SUBMISSIONS + state.get("extra_synthesis_grants", 0),
+               state.get("migration_synthesis_limit", 0))
+
+
 def command_submit_synthesis(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     state = load_state(project, args.run_id)
     if state["status"] != "SYNTHESIS_REQUIRED":
         raise WorkflowError(f"submit-synthesis is not allowed from {state['status']}")
-    synthesis_limit = MAX_SYNTHESIS_SUBMISSIONS + state.get("extra_synthesis_grants", 0)
+    synthesis_limit = synthesis_submission_limit(state)
     if state["synthesis_submissions"] >= synthesis_limit:
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {"type": "SYNTHESIS_BUDGET_EXHAUSTED", "created_at": utc_now()}
@@ -3779,7 +3777,7 @@ def command_submit_synthesis(args: argparse.Namespace) -> None:
     plan_copy = destination / "implementation_plan.md"
     batches_copy = destination / "batches.md"
     manifest_copy = destination / "synthesis_manifest.json"
-    # The host is TOLD to write these two names into this directory (SKILL.md, "Host synthesis"),
+    # The host is TOLD to write these three names into this directory (SKILL.md, "Host synthesis"),
     # and then submitting them raised SameFileError -- following the documentation was the one
     # thing that could not work. Submitting the frozen copy in place is a no-op, not an error.
     for source, copy in ((plan, plan_copy), (batches, batches_copy), (manifest_path, manifest_copy)):
@@ -3846,12 +3844,14 @@ def command_convergence_review(args: argparse.Namespace) -> None:
         "it does not claim consensus or certainty. "
         "Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, baseline_sha={sha}, "
         "scope_digest={scope_digest}, candidate_plan_sha256={plan_digest}, and "
-        "candidate_batch_manifest_sha256={batch_digest}."
+        "candidate_batch_manifest_sha256={batch_digest}, and "
+        "candidate_synthesis_manifest_sha256={manifest_digest}."
         + DELIVERY_CONTRACT
     ).format(
         slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
         scope_digest=state["scope_digest"], plan_digest=state["candidate"]["plan_sha256"],
-        batch_digest=state["candidate"]["batch_manifest_sha256"], context="{context}"
+        batch_digest=state["candidate"]["batch_manifest_sha256"],
+        manifest_digest=state["candidate"]["synthesis_manifest_sha256"], context="{context}"
     )
     context_files = {
         "request.md": Path(state["request_snapshot"]),
@@ -3881,6 +3881,9 @@ def command_convergence_review(args: argparse.Namespace) -> None:
     state["convergence_reviews"][slot] = {
         "provider": provider, "verdict": payload["verdict"], "path": str(path),
         "candidate_sha256": state["candidate"]["plan_sha256"],
+        "candidate_batch_manifest_sha256": state["candidate"]["batch_manifest_sha256"],
+        "candidate_synthesis_manifest_sha256": state["candidate"]["synthesis_manifest_sha256"],
+        "candidate_round": state["candidate"]["round"],
     }
     if payload["verdict"] == "NEEDS_USER_DECISION":
         state["status"] = "NEEDS_USER_DECISION"
@@ -3920,12 +3923,14 @@ def command_final_review(args: argparse.Namespace) -> None:
         "each named criterion and every blocking stable finding must be checked exactly once. "
         "Do not edit files. Return schema JSON with provider={provider}, reviewer_slot={slot}, target={target}, "
         "baseline_sha={sha}, scope_digest={scope_digest}, candidate_plan_sha256={plan_digest}, and "
-        "candidate_batch_manifest_sha256={batch_digest}."
+        "candidate_batch_manifest_sha256={batch_digest}, and "
+        "candidate_synthesis_manifest_sha256={manifest_digest}."
         + DELIVERY_CONTRACT
     ).format(
         slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
         scope_digest=state["scope_digest"], plan_digest=state["candidate"]["plan_sha256"],
-        batch_digest=state["candidate"]["batch_manifest_sha256"], context="{context}")
+        batch_digest=state["candidate"]["batch_manifest_sha256"],
+        manifest_digest=state["candidate"]["synthesis_manifest_sha256"], context="{context}")
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
@@ -3957,6 +3962,9 @@ def command_final_review(args: argparse.Namespace) -> None:
         "verdict": payload["verdict"],
         "path": str(path),
         "candidate_sha256": state["candidate"]["plan_sha256"],
+        "candidate_batch_manifest_sha256": state["candidate"]["batch_manifest_sha256"],
+        "candidate_synthesis_manifest_sha256": state["candidate"]["synthesis_manifest_sha256"],
+        "candidate_round": state["candidate"]["round"],
     }
     if payload["verdict"] == "NEEDS_USER_DECISION":
         state["status"] = "NEEDS_USER_DECISION"
@@ -3988,6 +3996,9 @@ def command_adjudicate(args: argparse.Namespace) -> None:
     if args.authorize_scope_id:
         preview["authorized_scope_ids"] = sorted(set(args.authorize_scope_id))
     decision_type = state["pending_decision"]["type"]
+    if args.authorize_scope_id and (
+            decision_type != "INVESTIGATION_BOUNDARY" or args.choice != "RESOLVE_AND_CONTINUE"):
+        raise WorkflowError("scope authorization requires resolving an investigation boundary")
     allowed = {
         "INVESTIGATION_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
         "PLANNING_BOUNDARY": {"RESOLVE_AND_CONTINUE", "ABANDON"},
@@ -4248,10 +4259,15 @@ def command_migrate_engine(args: argparse.Namespace) -> None:
     state.setdefault("excluded_scope_ids", [])
     state.setdefault("resolved_question_ids", [])
     candidate = state.get("candidate") or {}
-    if candidate and not candidate.get("synthesis_manifest") and state["status"] not in TERMINAL_STATUSES:
+    if candidate and not candidate.get("synthesis_manifest") and state["status"] != "ABANDONED":
+        if state.get("final"):
+            state.setdefault("legacy_finals", []).append(state.pop("final"))
         state["final_reviews"] = {}
         state["convergence_reviews"] = {}
         state["status"] = "SYNTHESIS_REQUIRED"
+        state["pending_decision"] = None
+        state["migration_synthesis_limit"] = max(
+            synthesis_submission_limit(state), state["synthesis_submissions"] + 1)
         state.setdefault("engine_migration_notes", []).append({
             "reason": "candidate predates the required synthesis disposition manifest",
             "action": "resynthesize the candidate under the current evidence contract",
