@@ -69,6 +69,21 @@ CODEX_POLICY_OVERRIDES = (
 )
 
 EVIDENCE_STATUSES = ["VERIFIED", "STRONGLY_INFERRED", "WEAKLY_INFERRED", "UNRESOLVED", "REFUTED"]
+
+#: The wire vocabularies, restated IN PROSE for the prompt. A raw JSON Schema is easy to misread:
+#: a live slot put `root_cause_status`'s value PROVEN into `evidence_status`, and the schema's own
+#: complaint ("value is not in enum") did not say which values were allowed. Braces are deliberately
+#: avoided here — the prompt is formatted twice, so a literal brace would survive the first pass and
+#: crash the second.
+VOCABULARY_NOTE = (
+    "FIXED VOCABULARIES — similar field names do NOT share values. evidence.status and "
+    "finding.evidence_status both use exactly one of: VERIFIED, STRONGLY_INFERRED, WEAKLY_INFERRED, "
+    "UNRESOLVED, REFUTED (PROVEN is NOT one of them). finding.root_cause_status uses exactly one of: "
+    "PROVEN, HYPOTHESIS, UNRESOLVED. finding.lane uses exactly one of: STOP_THE_LINE, MUST_RESOLVE, "
+    "INVESTIGATE_IF_BUDGET, RECORD_ONLY. finding.urgency uses exactly one of: U0, U1, U2, U3. "
+    "finding.severity uses exactly one of: P0, P1, P2. Copy these strings; do not translate, "
+    "abbreviate or restyle them. "
+)
 PRIORITY_LANES = ["STOP_THE_LINE", "MUST_RESOLVE", "INVESTIGATE_IF_BUDGET", "RECORD_ONLY"]
 REVIEW_CRITERIA = [
     "REQUEST_COVERAGE", "SCOPE_CONTROL", "EVIDENCE_AND_ROOT_CAUSE",
@@ -346,7 +361,12 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
         raise WorkflowError(f"provider result schema mismatch at {path}: expected {expected}")
     if "enum" in schema and not any(
             type(value) is type(candidate) and value == candidate for candidate in schema["enum"]):
-        raise WorkflowError(f"provider result schema mismatch at {path}: value is not in enum")
+        # Name the allowed values: "value is not in enum" made the caller re-read a JSON Schema to
+        # find out what WAS allowed, and the live failure was a confusion between two enums in the
+        # same schema (root_cause_status PROVEN put into evidence_status).
+        raise WorkflowError(
+            f"provider result schema mismatch at {path}: {value!r} is not one of "
+            + ", ".join(repr(candidate) for candidate in schema["enum"]))
     if expected == "object":
         required = schema.get("required", [])
         missing = [name for name in required if name not in value]
@@ -3561,6 +3581,7 @@ def command_investigate(args: argparse.Namespace) -> None:
         "either way — so fabricating one gains nothing and costs you credibility. The baseline_sha and "
         "scope_digest printed in this prompt are NOT evidence digests: never copy them into that field. Leave the "
         "field empty when you did not compute it. "
+        "{vocabulary}"
         "Do not draft or edit the solution yet. Read {context}/causal_analysis.md and establish what is true. "
         "Use its proportional production trace and producer-aware evidence model; do not infer system shape from keywords. "
         "Every claim and finding must map to a scope id "
@@ -3585,7 +3606,7 @@ def command_investigate(args: argparse.Namespace) -> None:
         + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, sha=state["baseline_sha"],
              scope_digest=state["scope_digest"], web_rule=web_rule, context="{context}",
-             worktree=str(state["worktree"]))
+             worktree=str(state["worktree"]), vocabulary=VOCABULARY_NOTE)
     payload = invoke(
         state, f"investigate-{slot}", provider, slot,
         {"request.md": Path(state["request_snapshot"]),
@@ -3696,11 +3717,14 @@ def command_cross_review(args: argparse.Namespace) -> None:
         "is divergent: add missing in-scope causal, failure-path, alternative, and verification coverage, never a new "
         "objective. Every frozen ledger key must appear exactly once in accepted_finding_ids or "
         "rejected_finding_ids. Declare plan_scope_ids, and return NEEDS_USER_DECISION whenever a blocking user "
-        "question remains. Do not edit files. Return only schema JSON with provider={provider}, slot={slot}, "
+        "question remains. Do not edit files. "
+        "{vocabulary}"
+        "Return only schema JSON with provider={provider}, slot={slot}, "
         "reviewer_slot={slot}, target={target}, round=2, baseline_sha={sha}, scope_digest={scope_digest}."
         + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
-             scope_digest=state["scope_digest"], context="{context}")
+             scope_digest=state["scope_digest"], context="{context}",
+             vocabulary=VOCABULARY_NOTE)
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),
@@ -3770,11 +3794,14 @@ def command_diverge(args: argparse.Namespace) -> None:
         "finding in full solution form. Propose evidence-backed finding_aliases when multiple stable keys are observations "
         "of one defect; preserve separate keys when equivalence is not established. Every frozen key needs exactly "
         "one accepted/rejected disposition. Declare plan_scope_ids and do not PASS with a blocking question or P0/P1 "
-        "review finding. Return schema JSON with "
+        "review finding. "
+        "{vocabulary}"
+        "Return schema JSON with "
         "provider={provider}, slot={slot}, reviewer_slot={slot}, target={target}, round=3, baseline_sha={sha}, "
         "scope_digest={scope_digest}." + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, target=target, sha=state["baseline_sha"],
-             scope_digest=state["scope_digest"], context="{context}")
+             scope_digest=state["scope_digest"], context="{context}",
+             vocabulary=VOCABULARY_NOTE)
     context_files = {
         "request.md": Path(state["request_snapshot"]),
         "scope_contract.json": Path(state["scope_contract"]),

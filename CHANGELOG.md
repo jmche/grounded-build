@@ -38,6 +38,12 @@ All notable changes use semantic versioning.
   a constructed sequence (`00019f2c…`, `00029f2c…`, … sharing a 60-character suffix), and an earlier
   attempt copied the prompt's own `scope_digest` into the field.
 
+- Stated the wire vocabularies in PROSE in the investigation and draft prompts. A live slot put
+  `root_cause_status`'s value `PROVEN` into `evidence_status` — two enums in one schema, similar
+  names, different sets — and the schema's own complaint (`value is not in enum`) never said which
+  values were allowed. The complaint now names them, and the prompt says plainly that similar field
+  names do not share values.
+
 ## [0.7.2] - 2026-09-15
 
 - Made planning evidence receipts consequential: required evidence, root-cause traces, repository

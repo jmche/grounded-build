@@ -1279,6 +1279,27 @@ class PlanWorkflowTest(unittest.TestCase):
         # The fixture leaves the locator empty, so that is the field the message must name.
         self.assertIn("locator", rejected["error"])
 
+    def test_the_wire_vocabularies_reach_the_prompt_in_prose(self) -> None:
+        """The JSON Schema alone was not enough.
+
+        A live slot put `root_cause_status`'s PROVEN into `evidence_status`, and the schema's own
+        complaint ("value is not in enum") never said which values were allowed. The vocabularies are
+        now stated in prose in the prompt, and this proves they reach the agent.
+        """
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        self.call("investigate", "--project", str(self.project), "--run-id", initialized["run_id"],
+                  "--slot", "A")
+        state = self.get_state(initialized)
+        prompts = sorted(Path(state["run_directory"]).glob("invocations/investigate-A/*/prompt.md"))
+        self.assertTrue(prompts, "no rendered prompt to inspect")
+        text = prompts[-1].read_text(encoding="utf-8")
+        self.assertIn("FIXED VOCABULARIES", text)
+        self.assertIn("PROVEN is NOT one of them", text)
+        for value in ("STRONGLY_INFERRED", "WEAKLY_INFERRED", "REFUTED", "STOP_THE_LINE", "U0", "P2"):
+            self.assertIn(value, text)
+
     def test_a_wrong_agent_digest_is_disclosed_instead_of_rejecting_the_delivery(self) -> None:
         """d2: the digest is a machine fact, so the engine owns it.
 
