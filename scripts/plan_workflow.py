@@ -1369,7 +1369,14 @@ def validate_finding_content(finding: dict[str, Any], known_evidence: set[str], 
     if not all(nonempty(finding.get(field)) for field in ("id", "problem", "recommended_solution")):
         raise WorkflowError(f"{where} finding identity, problem, and solution must be non-empty")
     if not finding.get("evidence_ids") or not set(finding["evidence_ids"]).issubset(known_evidence):
-        raise WorkflowError(f"{where} finding {finding.get('id')} requires known evidence")
+        # Say what is known and what to do: the complaint used to leave the caller guessing whether
+        # the ids were misspelled, empty, or simply outside the workflow.
+        given = list(finding.get("evidence_ids") or [])
+        sample = sorted(known_evidence)[:6]
+        raise WorkflowError(
+            f"{where} finding {finding.get('id')} requires known evidence: it cites {given or 'nothing'}, "
+            f"while the workflow knows {len(known_evidence)} ids (for example {', '.join(sample)}); cite at "
+            "least one of them, from either slot's investigation")
     if not finding.get("causal_chain") or not all(nonempty(item) for item in finding["causal_chain"]):
         raise WorkflowError(f"{where} finding {finding.get('id')} requires a non-empty causal trace")
     if not finding.get("affected_surfaces") or not finding.get("verification"):
