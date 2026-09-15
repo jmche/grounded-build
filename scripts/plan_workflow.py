@@ -1162,7 +1162,9 @@ def validate_evidence_items(
                     "`:start-end`, one file per entry, and keep descriptions in the claim")
                 continue
             if sha256_file(source) != digest:
-                problems.append(f"{evidence_id!r}: digest does not match {relative}")
+                problems.append(
+                    f"{evidence_id!r}: digest does not match {relative} — it is the digest of the COMPLETE "
+                    f"file, so run `sha256sum {relative}` from the frozen worktree and use its output")
                 continue
         ids.append(evidence_id)
     if problems:
@@ -3535,8 +3537,15 @@ def command_investigate(args: argparse.Namespace) -> None:
         "{context}/scope_contract.json, then inspect the complete relevant repository surface at baseline {sha}. "
         "The frozen worktree IS the repository and nothing outside it is part of this baseline: {worktree} "
         "(read-only; the sandbox denies every other path). Compute the digest of repository evidence with "
-        "`sha256sum <relative/path>` run from that directory and use the 64 lowercase hex characters it prints — "
-        "never a placeholder. "
+        "`sha256sum <relative/path>` run from that directory and use the 64 lowercase hex characters it prints. "
+        "Compute them all in ONE command — `cd <the frozen worktree> && sha256sum <path> <path> ...` — and paste "
+        "what it prints; the digest is of the COMPLETE file, never of the cited line range and never a sequence "
+        "you construct yourself, because the engine re-computes every digest and rejects a mismatch. If you cannot "
+        "run the command, mark those entries UNRESOLVED instead of guessing. The baseline_sha and "
+        "scope_digest printed in this prompt are NOT evidence digests and must never be copied into "
+        "one: an evidence digest is the output of sha256sum for the file you cite. Every digest is "
+        "re-computed by the engine, so a value you construct — including a sequence that only looks "
+        "unique — is detected and rejected. "
         "Do not draft or edit the solution yet. Read {context}/causal_analysis.md and establish what is true. "
         "Use its proportional production trace and producer-aware evidence model; do not infer system shape from keywords. "
         "Every claim and finding must map to a scope id "
@@ -3549,7 +3558,8 @@ def command_investigate(args: argparse.Namespace) -> None:
         "prose, no parenthetical notes and no ';'-joined list of files: give each file its own entry and keep "
         "descriptions in the claim. The digest is for the complete baseline file. The files in your context directory "
         "(request.md, scope_contract.json, causal_analysis.md) are the REQUEST authority rather than repository "
-        "evidence — never submit them as evidence entries. A PROVEN "
+        "evidence — never submit them as evidence entries. The output is strict JSON: double quotes only, no "
+        "trailing commas, no Python literals such as 'x' inside an array. A PROVEN "
         "finding needs a concrete causal trace, affected surfaces, and verification. Return unresolved questions "
         "as structured objects; a blocking question may name USER as decision_owner, while a PLANNER-owned "
         "question must be resolved before delivery. Batch all residual user choices instead of asking serially. "
