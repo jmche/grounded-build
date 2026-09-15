@@ -3196,7 +3196,12 @@ def validate_review(
     if payload["verdict"] == "FAIL" and "FAIL" not in criterion_statuses:
         raise WorkflowError("FAIL review requires at least one failed criterion")
     if payload["verdict"] == "NEEDS_USER_DECISION" and "NEEDS_USER_DECISION" not in criterion_statuses:
-        raise WorkflowError("NEEDS_USER_DECISION review requires a matching criterion")
+        # Say what is required and what was found: the reviewer reached a user boundary but left every
+        # criterion at PASS/FAIL, so the receipt did not carry the boundary it declared.
+        raise WorkflowError(
+            "a NEEDS_USER_DECISION verdict requires at least one criterion whose status is "
+            "NEEDS_USER_DECISION: set the criterion that binds the user boundary to that status, or "
+            f"change the verdict (criteria seen: {sorted(criterion_statuses)})")
     required_blocking = {
         key for key, record in state.get("finding_ledger", {}).items()
         if (record.get("canonical") or {}).get("severity") in {"P0", "P1"}
