@@ -44,6 +44,14 @@ All notable changes use semantic versioning.
   values were allowed. The complaint now names them, and the prompt says plainly that similar field
   names do not share values.
 
+- Stopped spending paid retries on wire-shape details that carry no risk. Two live deliveries were
+  rejected for facts the engine already holds or that nothing reads: a slot added an undefined field
+  (`causal_chain_note`), and a slot used evidence ids without its slot prefix. Undefined fields are
+  now IGNORED and recorded (`schema_disclosures`), with the values captured; a missing slot prefix is
+  STAMPED by the engine with every reference rewritten in the same pass and recorded
+  (`id_normalizations`). Both are surfaced in `status`/`next`. The strict behaviour is unchanged for
+  callers that do not collect disclosures — a host or a person can simply fix the shape.
+
 ## [0.7.2] - 2026-09-15
 
 - Made planning evidence receipts consequential: required evidence, root-cause traces, repository

@@ -83,6 +83,10 @@ VOCABULARY_NOTE = (
     "INVESTIGATE_IF_BUDGET, RECORD_ONLY. finding.urgency uses exactly one of: U0, U1, U2, U3. "
     "finding.severity uses exactly one of: P0, P1, P2. Copy these strings; do not translate, "
     "abbreviate or restyle them. "
+    "WIRE SHAPE. Prefix every evidence id and question id with your slot (for example B-E1); the "
+    "engine stamps the prefix if you forget it and records that it did. Return ONLY the fields the "
+    "schema defines: an extra explanatory field is ignored and recorded, never accepted as part of "
+    "the contract. "
 )
 PRIORITY_LANES = ["STOP_THE_LINE", "MUST_RESOLVE", "INVESTIGATE_IF_BUDGET", "RECORD_ONLY"]
 REVIEW_CRITERIA = [
@@ -343,7 +347,8 @@ class NoFinalAnswer(WorkflowError):
     """
 
 
-def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
+def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$",
+                         disclosures: list[str] | None = None) -> None:
     """Validate the structural JSON-schema subset used by provider contracts."""
     expected = schema.get("type")
     matches = {
@@ -377,12 +382,24 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
         if schema.get("additionalProperties") is False:
             extras = sorted(set(value) - set(properties))
             if extras:
-                raise WorkflowError(
-                    f"provider result schema mismatch at {path}: unexpected {','.join(extras)}")
+                # A field the contract does not define is IGNORED, and said out loud. Nothing reads
+                # it, so it cannot smuggle anything in, and rejecting a delivery over an explanatory
+                # field spends a paid retry on a detail that carries no risk — the whack-a-mole this
+                # repair exists to stop (a live slot added `causal_chain_note`).
+                if disclosures is None:
+                    # No collector: keep the strict behaviour. The tolerance belongs to the ADAPTER
+                    # path, where a retry costs money and the extra field is pure noise; a host or a
+                    # person submitting a payload can simply fix the shape.
+                    raise WorkflowError(
+                        f"provider result schema mismatch at {path}: unexpected {','.join(extras)}")
+                detail = "; ".join(f"{name}={str(value[name])[:120]!r}" for name in extras)
+                disclosures.append(
+                    f"{path}: the delivery carried undefined field(s) {','.join(extras)} (ignored): "
+                    f"{detail}")
         for name, item in value.items():
             child_schema = properties.get(name)
             if child_schema is not None:
-                validate_json_schema(item, child_schema, f"{path}.{name}")
+                validate_json_schema(item, child_schema, f"{path}.{name}", disclosures)
     elif expected == "array" and "items" in schema:
         for index, item in enumerate(value):
             validate_json_schema(item, schema["items"], f"{path}[{index}]")
@@ -846,6 +863,16 @@ def persist_invocation_state(
             if identity not in known_disclosures:
                 latest["evidence_digest_disclosures"].append(disclosure)
                 known_disclosures.add(identity)
+        for field in ("schema_disclosures", "id_normalizations"):
+            incoming = state.get(field) or []
+            if not incoming:
+                continue
+            known = {json.dumps(item, sort_keys=True) for item in latest.setdefault(field, [])}
+            for item in incoming:
+                identity = json.dumps(item, sort_keys=True)
+                if identity not in known:
+                    latest[field].append(item)
+                    known.add(identity)
         incoming_fallbacks = state.get("automatic_fallbacks") or []
         known_fallbacks = {
             (item.get("trigger_assignment"), item.get("at"))
@@ -1128,6 +1155,48 @@ def validate_plan_scope_ids(scope_ids: Any, state: dict[str, Any], where: str) -
             raise WorkflowError(f"{where} cannot include OUT_OF_SCOPE work: {scope_id}")
         if scope_class == "PROPOSED_EXTENSION" and scope_id not in authorized_extensions:
             raise WorkflowError(f"{where} includes an extension without typed user authorization: {scope_id}")
+
+
+def normalize_slot_prefixed_ids(payload: dict[str, Any], slot: str,
+                                state: dict[str, Any] | None = None) -> dict[str, str]:
+    """Give this payload's ids the slot prefix they need, in one pass, and say so.
+
+    Which slot produced a payload is a fact the ENGINE holds, so a missing prefix is not worth a
+    paid retry — and the property the prefix protects (a draft may only cite its OWN investigation)
+    is preserved, indeed guaranteed, when the engine stamps it. Every reference is rewritten in the
+    same pass, so a renamed id cannot dangle.
+    """
+    rename: dict[str, str] = {}
+    for key in ("evidence", "new_evidence"):
+        for item in payload.get(key) or []:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                old = item["id"]
+                if not old.startswith(f"{slot}-"):
+                    rename[old] = f"{slot}-{old}"
+    for question in payload.get("unresolved_questions") or []:
+        if isinstance(question, dict) and isinstance(question.get("id"), str):
+            old = question["id"]
+            if not old.startswith(f"{slot}-"):
+                rename.setdefault(old, f"{slot}-{old}")
+    if not rename:
+        return {}
+
+    def rewrite(value: Any) -> Any:
+        if isinstance(value, str):
+            return rename.get(value, value)
+        if isinstance(value, list):
+            return [rewrite(entry) for entry in value]
+        if isinstance(value, dict):
+            return {key: rewrite(entry) for key, entry in value.items()}
+        return value
+
+    rewritten = rewrite(payload)
+    payload.clear()
+    payload.update(rewritten)
+    if state is not None:
+        state.setdefault("id_normalizations", []).extend(
+            {"from": old, "to": new} for old, new in sorted(rename.items()))
+    return rename
 
 
 def validate_evidence_items(
@@ -2811,7 +2880,12 @@ def invoke(
         _payload_path = root / "payload.json"
         atomic_json(_payload_path, payload)
         record_artifact(state, f"{artifact_prefix}-payload", _payload_path)
-        validate_json_schema(payload, schema)
+        _schema_disclosures: list[str] = []
+        validate_json_schema(payload, schema, disclosures=_schema_disclosures)
+        state.setdefault("schema_disclosures", [])
+        for note in _schema_disclosures:
+            if note not in state["schema_disclosures"]:
+                state["schema_disclosures"].append(note)
         if validator is not None:
             validator(payload)
     except NoFinalAnswer as exc:
@@ -2905,8 +2979,8 @@ def validate_draft(payload: dict[str, Any], state: dict[str, Any], slot: str) ->
     new_evidence = payload.get("new_evidence")
     new_ids = validate_evidence_items(
         new_evidence, state, "draft new_evidence", require_nonempty=False)
-    if any(not evidence_id.startswith(f"{slot}-") for evidence_id in new_ids):
-        raise WorkflowError("draft new evidence ids must be prefixed by their slot")
+    _rename = normalize_slot_prefixed_ids(payload, slot, state)
+    new_ids = {_rename.get(evidence_id, evidence_id) for evidence_id in new_ids}
     known_evidence = {item["id"] for item in investigation["evidence"]} | new_ids
     if not set(payload["evidence_ids"]).issubset(known_evidence):
         raise WorkflowError("draft cites evidence outside its independent investigation")
@@ -2935,8 +3009,8 @@ def validate_investigation(payload: dict[str, Any], state: dict[str, Any], slot:
     if not nonempty(payload.get("summary")):
         raise WorkflowError("investigation summary must be non-empty")
     known = validate_evidence_items(payload.get("evidence"), state, "investigation")
-    if any(not evidence_id.startswith(f"{slot}-") for evidence_id in known):
-        raise WorkflowError("investigation evidence ids must be prefixed by their slot")
+    rename = normalize_slot_prefixed_ids(payload, slot, state)
+    known = {rename.get(evidence_id, evidence_id) for evidence_id in known}
     finding_ids = [item.get("id") for item in payload.get("findings", []) if isinstance(item, dict)]
     if len(finding_ids) != len(set(finding_ids)):
         raise WorkflowError("investigation finding ids must be unique")
@@ -2944,8 +3018,7 @@ def validate_investigation(payload: dict[str, Any], state: dict[str, Any], slot:
         validate_finding_content(finding, known, "investigation")
     validate_questions(
         payload["unresolved_questions"], known, "investigation", allow_blocking_user=True)
-    if any(not question["id"].startswith(f"{slot}-") for question in payload["unresolved_questions"]):
-        raise WorkflowError("investigation question ids must be prefixed by their slot")
+    # (question ids were stamped by normalize_slot_prefixed_ids above)
 
 
 def validate_integration(
@@ -4333,6 +4406,9 @@ def command_status(args: argparse.Namespace) -> None:
         "delivery_faults": dict(state.get("delivery_faults") or {}),
         # d2: an agent digest that disagreed with the file is DISCLOSED here rather than rejected.
         "evidence_digest_disclosures": list(state.get("evidence_digest_disclosures") or []),
+        # Non-fatal wire-shape repairs: undefined fields ignored, ids stamped with their slot.
+        "schema_disclosures": list(state.get("schema_disclosures") or []),
+        "id_normalizations": list(state.get("id_normalizations") or []),
         "finding_aliases": state.get("finding_aliases") or {},
         "final": state.get("final"), "run_directory": state["run_directory"], "usage": state["usage"],
         "next_action": next_action(state),

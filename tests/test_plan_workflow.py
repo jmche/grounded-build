@@ -1279,6 +1279,51 @@ class PlanWorkflowTest(unittest.TestCase):
         # The fixture leaves the locator empty, so that is the field the message must name.
         self.assertIn("locator", rejected["error"])
 
+    def test_undefined_fields_are_disclosed_for_an_adapter_delivery(self) -> None:
+        """A field the contract does not define is ignored and SAID OUT LOUD, not a paid retry.
+
+        A live slot added `causal_chain_note` and the delivery was rejected for it. Nothing reads an
+        undefined field, so it cannot smuggle anything in; the strict behaviour is kept for callers
+        that do not collect disclosures (a host or a person can simply fix the shape).
+        """
+        spec = importlib.util.spec_from_file_location("gb_wire_shape_test", SCRIPT)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        schema = {"type": "object", "additionalProperties": False,
+                  "properties": {"a": {"type": "string"}}, "required": ["a"]}
+        notes: list[str] = []
+        module.validate_json_schema({"a": "x", "causal_chain_note": "why"}, schema,
+                                    disclosures=notes)      # no raise
+        self.assertEqual(len(notes), 1)
+        self.assertIn("causal_chain_note", notes[0])
+        with self.assertRaisesRegex(module.WorkflowError, "unexpected causal_chain_note"):
+            module.validate_json_schema({"a": "x", "causal_chain_note": "why"}, schema)
+
+    def test_a_missing_slot_prefix_is_stamped_and_references_follow(self) -> None:
+        """Which slot produced a payload is a fact the ENGINE holds.
+
+        A codex slot used `E-000` and the delivery was rejected for the missing prefix. Stamping it
+        preserves the property the prefix protects (a draft may only cite its OWN investigation) and
+        every reference is rewritten in the same pass, so a renamed id cannot dangle.
+        """
+        spec = importlib.util.spec_from_file_location("gb_slot_id_test", SCRIPT)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        state: dict = {}
+        payload = {
+            "evidence": [{"id": "E-000", "claim": "c"}],
+            "findings": [{"id": "B-finding", "evidence_ids": ["E-000"]}],
+            "unresolved_questions": [{"id": "Q1", "evidence_ids": ["E-000"]}],
+        }
+        rename = module.normalize_slot_prefixed_ids(payload, "B", state)
+        self.assertEqual(rename, {"E-000": "B-E-000", "Q1": "B-Q1"})
+        self.assertEqual(payload["evidence"][0]["id"], "B-E-000")
+        self.assertEqual(payload["findings"][0]["evidence_ids"], ["B-E-000"])
+        self.assertEqual(payload["unresolved_questions"][0]["id"], "B-Q1")
+        self.assertIn({"from": "E-000", "to": "B-E-000"}, state["id_normalizations"])
+
     def test_the_wire_vocabularies_reach_the_prompt_in_prose(self) -> None:
         """The JSON Schema alone was not enough.
 
