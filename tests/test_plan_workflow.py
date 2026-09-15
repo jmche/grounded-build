@@ -1062,12 +1062,16 @@ class PlanWorkflowTest(unittest.TestCase):
             "migrate-engine", "--project", str(self.project), "--run-id", initialized["run_id"],
             "--reason", "upgrade partial investigation", "--actor", "tester", "--apply")
         self.assertEqual(migrated["status"], "INITIALIZED")
-        archive = Path(initialized["run_directory"]) / "decisions" / "legacy_planning_1.json"
+        archive = Path(initialized["run_directory"]) / "audit" / "legacy_planning_1.json"
         self.assertIn("Which compatibility policy applies?", archive.read_text())
         for slot in ("A", "B"):
             self.call("investigate", "--project", str(self.project), "--run-id",
                       initialized["run_id"], "--slot", slot)
         self.run_through_cross_review(initialized)
+        draft_context = next((Path(initialized["run_directory"]) / "invocations" / "draft-B")
+                             .glob("attempt_*/context"))
+        for context_file in draft_context.iterdir():
+            self.assertNotIn("Which compatibility policy applies?", context_file.read_text())
         self.submit_candidate(initialized)
         self.call("final-review", "--project", str(self.project), "--run-id",
                   initialized["run_id"], "--reviewer", "F")
@@ -1400,6 +1404,10 @@ class PlanWorkflowTest(unittest.TestCase):
             "--decision", "Preserve compatibility", "--actor", "tester", "--apply")
         self.assertEqual(resumed["status"], "DIVERGING")
         self.call("diverge", "--project", str(self.project), "--run-id", run_id, "--slot", "B")
+        peer_context = next((Path(initialized["run_directory"]) / "invocations" / "diverge-B")
+                            .glob("attempt_*/context"))
+        self.assertTrue(any("Preserve compatibility" in path.read_text()
+                            for path in peer_context.glob("decision_*.json")))
         self.submit_candidate(initialized)
         for slot in ("A", "B"):
             self.call("convergence-review", "--project", str(self.project), "--run-id", run_id, "--reviewer", slot)

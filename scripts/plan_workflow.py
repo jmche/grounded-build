@@ -4290,7 +4290,7 @@ def command_migrate_engine(args: argparse.Namespace) -> None:
         if legacy_investigations:
             fields = ("investigations", "drafts", "draft_rounds", "cross_reviews",
                       "round_barriers", "finding_ledger", "finding_aliases")
-            archive = Path(state["run_directory"]) / "decisions" / f"legacy_planning_{state['engine_epoch']}.json"
+            archive = Path(state["run_directory"]) / "audit" / f"legacy_planning_{state['engine_epoch']}.json"
             atomic_json(archive, {
                 "reason": "legacy investigation declarations require fresh producer output",
                 "state": {field: state.get(field) for field in fields},
