@@ -1308,7 +1308,14 @@ def validate_questions(
         if not set(question.get("evidence_ids", [])).issubset(known_evidence):
             raise WorkflowError(f"{where} unresolved question cites unknown evidence")
         if question.get("blocking") and question.get("decision_owner") == "PLANNER":
-            raise WorkflowError(f"{where} cannot hand an unresolved blocking planner question downstream")
+            # A rule the prompt states and a live slot still broke, so the complaint says what to DO:
+            # the investigator owns this question and must answer it from the repository, or escalate
+            # it as USER-owned if only the user can settle it (USER-owned blocking questions are what
+            # the workflow escalates to the operator).
+            raise WorkflowError(
+                f"{where} question {question.get('id')!r} is blocking AND owned by PLANNER: a planner "
+                "cannot be asked downstream, so answer it from the repository and drop `blocking`, or "
+                "set decision_owner to USER if only the user can settle it")
         if question.get("blocking") and not allow_blocking_user:
             raise WorkflowError(f"{where} cannot proceed with a blocking user question")
         if question.get("decision_owner") == "USER" and not question.get("options"):
