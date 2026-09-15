@@ -2,6 +2,33 @@
 
 All notable changes use semantic versioning.
 
+## [0.7.3] - 2026-09-15
+
+- Kept `bash` enabled in the DSH review sandbox. The evidence contract requires a content digest of
+  the complete baseline file, and a slot that may not run a command cannot produce one: both slots
+  answered that required field with all-zero placeholders and were rejected. The capability probe
+  now composes its disable entry from `tool-pwsh` instead.
+- Replaced the blanket "do not use external network sources" instruction with a REGISTRATION
+  requirement. With `authoritative-web`, external material is allowed and must appear as its own
+  evidence entry (OFFICIAL_DOCS/OFFICIAL_GITHUB with URL, retrieval time, version/tag/commit and
+  digest); a `local-only` run keeps its claims in the frozen worktree and marks anything drawn from
+  outside it UNRESOLVED instead of presenting it as a repository fact.
+- Accepted honest `UNRESOLVED` evidence without a digest, and rejected all-zero placeholder digests
+  with the exact command to run (`sha256sum <path>` inside the frozen worktree).
+- Named the frozen worktree path and the digest command in the investigation prompt, so a slot does
+  not have to discover where the baseline is mounted.
+- Persisted the delivered payload (`payload.json`) and the adapter's own raw output BEFORE any
+  contract check. A rejected delivery used to keep only `stdout.log`, which is the one case a
+  diagnosis most needs.
+- Restricted `REASSIGN_ASSIGNMENT` to adapters the run itself recorded. The candidate list was "any
+  installed provider", so a rate-limited peer could be moved onto a provider the run never selected.
+- Surfaced `delivery_faults` in the `status` and `next` payloads, so the cause of a rejection
+  travels with the run state instead of only living in the invocation record.
+- Clarified the adapter authority rule in `SKILL.md` — the run's recorded selection is the
+  authority, a blocked default is never authorization, and a fallback target is the adapter the run
+  recorded — and rewrote the `--peer-reviewer` / `--final-reviewer` error messages to state the rule
+  instead of only the missing argument.
+
 ## [0.7.2] - 2026-09-15
 
 - Made planning evidence receipts consequential: required evidence, root-cause traces, repository

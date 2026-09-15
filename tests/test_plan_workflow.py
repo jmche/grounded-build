@@ -1599,8 +1599,12 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("--patch", dsh_command)
         patch_path = Path(dsh_command[dsh_command.index("--patch") + 1])
         patch_text = patch_path.read_text(encoding="utf-8")
+        # GB-1/N1: bash stays ENABLED, because the evidence contract requires a content digest and
+        # only a command can compute one. Credential denial therefore no longer rests on bash being
+        # disabled — it rests on what is mounted and on what the boundary will read, which is what
+        # this test now checks.
         disabled = (
-            "tool-bash", "tool-pwsh", "jobs", "tool-jobs", "tool-skill", "tool-todo",
+            "tool-pwsh", "jobs", "tool-jobs", "tool-skill", "tool-todo",
             "tool-goal", "web", "web-search-deepseek", "tool-web", "code-runtime", "subagent",
             "subagent-spawn-in-process", "subagent-fork-in-process", "tool-subagent-control",
             "tool-subagent-list-agents", "tool-subagent", "tool-subagent-fork",
@@ -1609,8 +1613,20 @@ class PlanWorkflowTest(unittest.TestCase):
         )
         for row in disabled:
             self.assertIn(f"id: {row}\n  disabled: true", patch_text)
+        for row in disabled:
+            self.assertIn(f"id: {row}\n  disabled: true", patch_text)
+        self.assertNotIn("id: tool-bash\n  disabled: true", patch_text)
         self.assertIn("id: grounded-build-read-boundary", patch_text)
         self.assertIn("dsh-read-boundary.mjs", patch_text)
+        # The mounts are what keep credentials out of reach: the operator's home is never bound.
+        home = str(Path.home())
+        pairs = [[dsh_command[i + 1], dsh_command[i + 2]]
+                 for i, token in enumerate(dsh_command[:-2]) if token in ("--bind", "--ro-bind")]
+        self.assertFalse([pair for pair in pairs if pair[0] == home or pair[0].startswith(home + "/.claude")],
+                         f"an operator-home path is mounted into the review sandbox: {pairs}")
+        # ...and the boundary confines tool reads to the baseline plus the invocation context.
+        self.assertIn("allowedRoots:", patch_text)
+        self.assertIn("allowWeb: false", patch_text)
         self.assertNotIn("id: tool-fs\n", patch_text)
         self.assertNotIn("id: tool-fs-search\n", patch_text)
         dsh_root = str(Path(dsh_preview["invocation"]).parent)

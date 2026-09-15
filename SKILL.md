@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.7.2
+  version: 0.7.3
   compatibility: Linux, Git, Python 3.11+, bubblewrap and socat (both sandbox packages; the provider CLI sandbox is fail-closed), and at least one Claude, Codex, dsh, or protocol-compatible other CLI adapter
 ---
 
@@ -39,9 +39,19 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
 - Order work by scope gate, user priority, severity, urgency, blockers/dependencies, causal leverage,
   evidence strength, then effort. Do not promote or demote a finding without new evidence.
 - Authentication, overload, rate limit, timeout, adapter startup, or tool-host failure is infrastructure, not a quality FAIL and not a consumed quality attempt.
-- When an auto-selected external B slot or implementation reviewer reports a rate limit, persistently
-  move that role to the available frozen host and retry the same work. Never override an explicit
-  user selection; if the host is unavailable, preserve the existing typed recovery path.
+- Which adapter runs which slot is decided once, at initialization, and written into this run's own
+  selection record. That record is the authority: no model, command, fallback, or "available"
+  provider may invoke an adapter that is not in it.
+- When a recorded adapter cannot deliver — rate limit, outage, startup failure, or a contract it
+  cannot satisfy — the only permitted responses are: retry that same adapter; hand the slot to the
+  peer/host adapter THIS RUN recorded; or stop and report to the user. The target of a fallback is
+  the adapter this run already recorded, never "whichever adapter happens to be available".
+- Being blocked is never authorization. "The default is unavailable" does not mean "pick another
+  provider", and "the host is available" does not mean "any provider may be used". When the recorded
+  adapters cannot do the work, the correct action is to stop and say so. Worked example: the peer
+  adapter is rate-limited and the recorded host is `dsh` — retry it, fall back to `dsh`, or stop and
+  report; running that slot on an adapter this run never recorded, because it happened to be
+  available, is a violation.
 - Stop at every typed user decision and at implementation approval. Never infer authority from plan approval.
 - Implementation review keeps P0/P1/P2 in consequence order. P2 is constructive and nonblocking;
   pure preference is not a ledger finding. When a nonterminal typed decision is applied only after

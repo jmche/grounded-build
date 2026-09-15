@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex", "dsh", "other")
 OTHER_BRIDGE_PROTOCOL = "grounded-build-other-v1"
@@ -1105,9 +1105,22 @@ def validate_evidence_items(
     ids: list[str] = []
     for item in items:
         evidence_id = item.get("id")
+        if str(item.get("status") or "") == "UNRESOLVED":
+            # An honest "I could not establish this" may carry no digest at all. Inventing one is
+            # what is forbidden: both slots answered this required 64-hex field with zeros rather
+            # than saying they could not compute it.
+            if not all(nonempty(item.get(field)) for field in ("id", "claim")):
+                raise WorkflowError(f"{where} UNRESOLVED evidence needs at least an id and a claim")
+            ids.append(evidence_id)
+            continue
         if not all(nonempty(item.get(field)) for field in (
                 "id", "claim", "locator", "retrieved_at", "version_or_commit", "content_sha256")):
             raise WorkflowError(f"{where} evidence fields must be non-empty")
+        if set(str(item["content_sha256"])) == {"0"}:
+            raise WorkflowError(
+                f"{where} evidence {evidence_id!r} carries an all-zero placeholder digest: run "
+                f"`sha256sum {item.get('locator') or '<path>'}` inside the frozen worktree and use the real "
+                "value, or mark the evidence UNRESOLVED")
         if not re.fullmatch(r"[0-9a-f]{64}", item["content_sha256"]):
             raise WorkflowError(f"{where} evidence {evidence_id!r} has an invalid content digest")
         try:
@@ -1503,8 +1516,11 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
                 dsh_home = root / "dsh-home"
                 dsh_home.mkdir(mode=0o700)
                 patch = root / "capability.patch.yml"
+                # The probe composes a disable entry to prove patch composition works, and uses
+                # tool-pwsh rather than tool-bash: a dsh slot keeps bash so it can run the commands
+                # the evidence contract requires (e.g. sha256sum for a digest).
                 patch.write_text(
-                    "- id: tool-bash\n  disabled: true\n"
+                    "- id: tool-pwsh\n  disabled: true\n"
                     "- insert:\n"
                     "    - id: grounded-build-capability-marker\n"
                     "      name: cordis:group\n"
@@ -1529,7 +1545,7 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
                 loaded = (
                     composed.returncode == 0
                     and "grounded-build-capability-marker" in composed.stdout
-                    and "id: tool-bash" in composed.stdout
+                    and "id: tool-pwsh" in composed.stdout
                     and "disabled: true" in composed.stdout
                 )
                 capability["patch_composition_probe"] = {
@@ -1559,7 +1575,9 @@ def resolve_host_topology(
 ) -> dict[str, str]:
     present = {name for name in SUPPORTED_PROVIDERS if available(name)}
     if peer_reviewer != "auto" and (backend != "auto" or not host_adapter):
-        raise WorkflowError("--peer-reviewer requires --backend auto and --host-adapter")
+        raise WorkflowError(
+            "--peer-reviewer overrides the peer that --backend auto selects, so it requires --backend auto together with "
+            "--host-adapter; with an explicit --backend that adapter is the host and no peer override applies")
     if backend == "auto":
         if host_adapter:
             if host_adapter not in present:
@@ -1596,7 +1614,9 @@ def resolve_final_reviewer(
             raise WorkflowError(f"final reviewer is unavailable: {selected}")
         return selected
     if not host_adapter:
-        raise WorkflowError("--final-reviewer auto requires --host-adapter")
+        raise WorkflowError(
+            "--final-reviewer auto needs to know the host adapter: pass --host-adapter, or name an explicit "
+            "adapter with --backend (which then serves as the host)")
     if not available(host_adapter):
         raise WorkflowError(f"host adapter is unavailable: {host_adapter}")
     return host_adapter
@@ -2183,7 +2203,11 @@ def isolated_agent_command(
                 "        allowedRoots:\n"
                 f"          - {json.dumps(str(worktree))}\n"
                 f"          - {json.dumps(str(context))}\n"
-                "- id: tool-bash\n  disabled: true\n"
+                # GB-1/N1: bash stays ENABLED. The contract requires a content digest for every
+                # repository evidence entry, and a slot that may not run a command cannot produce
+                # one — both slots answered with all-zero placeholders instead. Capability is not
+                # the enemy; unregistered provenance is, and the prompt now requires registration
+                # rather than forbidding the network.
                 "- id: tool-pwsh\n  disabled: true\n"
                 "- id: jobs\n  disabled: true\n"
                 "- id: tool-jobs\n  disabled: true\n"
@@ -2716,6 +2740,14 @@ def invoke(
         if infrastructure_error:
             raise infrastructure_error
         payload = extract_payload(provider, result, raw)
+        # GB-4: keep what the model actually returned BEFORE any contract check. A rejected delivery
+        # used to leave only stdout.log — the one case a diagnosis most needs was the one case with
+        # no artifact.
+        if raw.is_file():
+            record_artifact(state, f"{artifact_prefix}-raw", raw)
+        _payload_path = root / "payload.json"
+        atomic_json(_payload_path, payload)
+        record_artifact(state, f"{artifact_prefix}-payload", _payload_path)
         validate_json_schema(payload, schema)
         if validator is not None:
             validator(payload)
@@ -3246,6 +3278,24 @@ def validate_synthesis_manifest(
             raise WorkflowError(f"rejected finding {item['finding_id']} requires contrary evidence")
 
 
+def recorded_adapters(state: dict[str, Any]) -> list[str]:
+    """The adapters THIS RUN recorded at initialization, in a stable order.
+
+    The run's own selection is the authority for which adapter may run a slot. A rate-limited slot
+    may be handed to another adapter the run recorded; it may never be handed to one the run never
+    recorded, however available that one happens to be — "available" is not a licence.
+    """
+    recorded: list[str] = []
+    candidates: list[Any] = [state.get("host_adapter"), state.get("peer_reviewer"),
+                             state.get("preferred_final_reviewer")]
+    candidates += sorted((state.get("planners") or {}).values())
+    candidates += sorted((state.get("selection_checks") or {}).keys())
+    for name in candidates:
+        if isinstance(name, str) and name in SUPPORTED_PROVIDERS and name not in recorded:
+            recorded.append(name)
+    return recorded
+
+
 def command_preflight(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     runtime = agent_runtime(args)
@@ -3445,15 +3495,24 @@ def command_investigate(args: argparse.Namespace) -> None:
         raise WorkflowError(f"slot {slot} already completed investigation")
     provider = assignment_provider(state, f"investigate-{slot}", state["planners"][slot])
     web_rule = (
-        "When repository evidence is insufficient, you MAY use only the upstream project's official "
-        "documentation or official GitHub repository. Record the exact URL, retrieval time, version/tag/commit "
-        "and a content digest. Search snippets and third-party summaries are discovery leads, never evidence."
+        "When repository evidence is insufficient, you MAY consult the upstream project's official "
+        "documentation or official GitHub repository, and you MAY reach them with a shell (curl/wget) or the web "
+        "tools — nothing here forbids using the network. What it does forbid is UNREGISTERED evidence: material "
+        "you obtain from outside the frozen worktree must appear as its own evidence entry with source_type "
+        "OFFICIAL_DOCS or OFFICIAL_GITHUB and the exact URL, retrieval time, version/tag/commit and content "
+        "digest of what you read. Search snippets and third-party summaries are discovery leads, never evidence."
         if state["research_policy"] == "authoritative-web" else
-        "Do not use external network sources in this run; mark claims UNRESOLVED when the repository cannot establish them."
+        "This run is DECLARED local-only: establish every claim from the frozen worktree at the baseline SHA. You may still "
+        "run commands inside it, but if you draw on anything outside it, say so in the claim and mark that "
+        "evidence UNRESOLVED instead of presenting it as a repository fact."
     )
     prompt = (
         "You are independent evidence investigator {slot}. Read {context}/request.md and "
         "{context}/scope_contract.json, then inspect the complete relevant repository surface at baseline {sha}. "
+        "The frozen worktree IS the repository and nothing outside it is part of this baseline: {worktree} "
+        "(read-only; the sandbox denies every other path). Compute the digest of repository evidence with "
+        "`sha256sum <relative/path>` run from that directory and use the 64 lowercase hex characters it prints — "
+        "never a placeholder. "
         "Do not draft or edit the solution yet. Read {context}/causal_analysis.md and establish what is true. "
         "Use its proportional production trace and producer-aware evidence model; do not infer system shape from keywords. "
         "Every claim and finding must map to a scope id "
@@ -3473,7 +3532,8 @@ def command_investigate(args: argparse.Namespace) -> None:
         "provider={provider}, slot={slot}, baseline_sha={sha}, scope_digest={scope_digest}."
         + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, sha=state["baseline_sha"],
-             scope_digest=state["scope_digest"], web_rule=web_rule, context="{context}")
+             scope_digest=state["scope_digest"], web_rule=web_rule, context="{context}",
+             worktree=str(state["worktree"]))
     payload = invoke(
         state, f"investigate-{slot}", provider, slot,
         {"request.md": Path(state["request_snapshot"]),
@@ -4057,11 +4117,16 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         if not assignment:
             raise WorkflowError("reassignment decision is missing its assignment")
         current = pending.get("provider")
-        alternatives = [name for name in SUPPORTED_PROVIDERS
-                        if name != current and available(name)]
+        # GB-2/GB-7: only adapters THIS RUN recorded may take over. The list used to be "any
+        # installed provider", which is how a rate-limited peer could be moved onto a provider the
+        # run never selected.
+        recorded = recorded_adapters(state)
+        alternatives = [name for name in recorded if name != current and available(name)]
         if not alternatives:
             raise WorkflowError(
-                f"no other provider is installed to take over {assignment} from {current}")
+                f"no adapter this run recorded can take over {assignment} from {current} "
+                f"(recorded: {', '.join(recorded) or 'none'}); handing a slot to an adapter this run never "
+                "recorded is not permitted — stop and report to the user")
         replacement = args.to_provider or alternatives[0]
         if replacement == current:
             raise WorkflowError("reassigning an assignment to the provider that already holds it "
@@ -4184,6 +4249,9 @@ def command_status(args: argparse.Namespace) -> None:
         "active_invocations": active_invocation_records(state),
         "resource_usage": state.get("resource_usage") or {},
         "infrastructure_usage": state.get("infrastructure_usage") or {},
+        # GB-3/3-d: the CAUSE of the last rejection travels with the state, so a controller sees why
+        # an assignment failed instead of retrying it blindly.
+        "delivery_faults": dict(state.get("delivery_faults") or {}),
         "finding_aliases": state.get("finding_aliases") or {},
         "final": state.get("final"), "run_directory": state["run_directory"], "usage": state["usage"],
         "next_action": next_action(state),
