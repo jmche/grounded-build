@@ -1279,6 +1279,38 @@ class PlanWorkflowTest(unittest.TestCase):
         # The fixture leaves the locator empty, so that is the field the message must name.
         self.assertIn("locator", rejected["error"])
 
+    def test_a_multi_file_locator_binds_the_first_and_discloses_the_rest(self) -> None:
+        """Models cite the way people do; the engine resolves what it can instead of retrying.
+
+        A live draft wrote `scripts/a.py:1-5; scripts/b.py:390-490; …` and the whole delivery was
+        rejected. The first resolvable file anchors the digest, the rest are disclosed so a reader
+        still sees everything the claim rests on, and an entry naming nothing resolvable is still a
+        rejection — it would have no verifiable anchor at all.
+        """
+        spec = importlib.util.spec_from_file_location("gb_locator_test", SCRIPT)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as scratch:
+            worktree = Path(scratch)
+            (worktree / "a.py").write_text("alpha\n", encoding="utf-8")
+            (worktree / "b.py").write_text("beta\n", encoding="utf-8")
+            state = {"baseline_sha": "a" * 40, "worktree": str(worktree)}
+            item = {"id": "A-E1", "scope_id": "TARGET-001", "claim": "c", "status": "VERIFIED",
+                    "source_type": "REPOSITORY", "locator": "a.py:1-2; b.py:3-4; missing.md",
+                    "retrieved_at": "2026-01-01T00:00:00Z", "version_or_commit": "a" * 40,
+                    "content_sha256": ""}
+            module.validate_evidence_items([item], state, "draft")
+            self.assertEqual(item["content_sha256"],
+                             hashlib.sha256((worktree / "a.py").read_bytes()).hexdigest())
+            disclosure = state["locator_disclosures"][0]
+            self.assertEqual(disclosure["digest_bound"], "a.py")
+            self.assertEqual(disclosure["also_cited"], ["b.py"])
+
+            unresolvable = dict(item, id="A-E2", locator="nowhere.md; also_missing.py")
+            with self.assertRaisesRegex(module.WorkflowError, "names no file that exists"):
+                module.validate_evidence_items([unresolvable], state, "draft")
+
     def test_undefined_fields_are_disclosed_for_an_adapter_delivery(self) -> None:
         """A field the contract does not define is ignored and SAID OUT LOUD, not a paid retry.
 

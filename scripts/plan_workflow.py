@@ -863,7 +863,7 @@ def persist_invocation_state(
             if identity not in known_disclosures:
                 latest["evidence_digest_disclosures"].append(disclosure)
                 known_disclosures.add(identity)
-        for field in ("schema_disclosures", "id_normalizations"):
+        for field in ("schema_disclosures", "id_normalizations", "locator_disclosures"):
             incoming = state.get(field) or []
             if not incoming:
                 continue
@@ -1157,6 +1157,37 @@ def validate_plan_scope_ids(scope_ids: Any, state: dict[str, Any], where: str) -
             raise WorkflowError(f"{where} includes an extension without typed user authorization: {scope_id}")
 
 
+def resolve_locator_files(worktree: Path, locator: Any) -> list[tuple[str, Path]]:
+    """Every file a locator names, in order, that exists in the frozen worktree.
+
+    Models cite the way people do — `scripts/a.py:1-5; scripts/b.py:390-490; da-x/notes.md` — while the
+    contract asks for one file per entry. Refusing the whole delivery over that spends paid retries on
+    formatting, so the ENGINE resolves what it can: the first resolvable file anchors the digest, and
+    the rest are disclosed. An entry that names nothing resolvable is still a rejection, because then
+    it has no verifiable anchor at all.
+    """
+    found: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[;,]|\band\b", str(locator or "")):
+        segment = raw.strip()
+        if not segment:
+            continue
+        segment = re.sub(r":\d+(?:-\d+)?\s*$", "", segment).strip()
+        segment = segment.split(" (")[0].strip().strip("`'\"")
+        if not segment or segment.startswith("-"):
+            continue
+        candidate = Path(segment)
+        if candidate.is_absolute():
+            continue
+        resolved = (worktree / candidate).resolve()
+        text = str(candidate)
+        if text in seen or not resolved.is_relative_to(worktree) or not resolved.is_file():
+            continue
+        seen.add(text)
+        found.append((text, resolved))
+    return found
+
+
 def normalize_slot_prefixed_ids(payload: dict[str, Any], slot: str,
                                 state: dict[str, Any] | None = None) -> dict[str, str]:
     """Give this payload's ids the slot prefix they need, in one pass, and say so.
@@ -1248,17 +1279,24 @@ def validate_evidence_items(
             problems.append(f"{evidence_id!r}: version_or_commit must be the baseline SHA {baseline}")
             continue
         if item["source_type"] == "REPOSITORY":
-            match = re.fullmatch(r"([^:\n]+?)(?::\d+(?:-\d+)?)?", str(item["locator"]))
-            relative = Path(match.group(1).strip()) if match else None
             worktree = Path(state["worktree"]).resolve()
-            source = (worktree / relative).resolve() if relative is not None else None
-            if relative is None or relative.is_absolute() or source is None \
-                    or not source.is_relative_to(worktree) or not source.is_file():
+            resolved_files = resolve_locator_files(worktree, item["locator"])
+            if not resolved_files:
                 problems.append(
-                    f"{evidence_id!r}: locator {str(item['locator'])[:70]!r} is not one file in the "
-                    "frozen worktree — use exactly `<worktree-relative/path>` with an optional "
-                    "`:start-end`, one file per entry, and keep descriptions in the claim")
+                    f"{evidence_id!r}: locator {str(item['locator'])[:70]!r} names no file that exists in "
+                    "the frozen worktree — use a worktree-relative path with an optional `:start-end`")
                 continue
+            relative, source = resolved_files[0]
+            if len(resolved_files) > 1:
+                # The extra files are kept, not dropped: they are part of what the claim rests on, and
+                # a reader must be able to see that only the first one carries the verified digest.
+                state.setdefault("locator_disclosures", []).append({
+                    "evidence_id": evidence_id,
+                    "digest_bound": relative,
+                    "also_cited": [text for text, _ in resolved_files[1:]],
+                    "detail": ("the locator named several files; the digest is bound to the first, and "
+                               "the others are cited without a verified digest"),
+                })
             computed = sha256_file(source)
             if not claimed_digest:
                 item["content_sha256"] = computed
@@ -4416,6 +4454,7 @@ def command_status(args: argparse.Namespace) -> None:
         # Non-fatal wire-shape repairs: undefined fields ignored, ids stamped with their slot.
         "schema_disclosures": list(state.get("schema_disclosures") or []),
         "id_normalizations": list(state.get("id_normalizations") or []),
+        "locator_disclosures": list(state.get("locator_disclosures") or []),
         "finding_aliases": state.get("finding_aliases") or {},
         "final": state.get("final"), "run_directory": state["run_directory"], "usage": state["usage"],
         "next_action": next_action(state),

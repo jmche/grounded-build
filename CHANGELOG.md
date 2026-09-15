@@ -52,6 +52,13 @@ All notable changes use semantic versioning.
   (`id_normalizations`). Both are surfaced in `status`/`next`. The strict behaviour is unchanged for
   callers that do not collect disclosures — a host or a person can simply fix the shape.
 
+- Resolved the locators models actually write. A live draft cited
+  `scripts/a.py:1-5; scripts/b.py:390-490; …` and the delivery was rejected for not being "one file
+  per entry". The engine now resolves every file a locator names: the first existing one anchors the
+  digest, the rest are recorded in `locator_disclosures` (with the digest-bound path) so a reader
+  still sees everything the claim rests on. An entry naming nothing resolvable is still rejected —
+  it would have no verifiable anchor at all.
+
 ## [0.7.2] - 2026-09-15
 
 - Made planning evidence receipts consequential: required evidence, root-cause traces, repository
