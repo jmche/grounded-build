@@ -208,6 +208,9 @@ Migrating a legacy candidate without a synthesis manifest routes it to `SYNTHESI
 previously `READY` runs. Historical final artifacts remain recorded, but current completion requires a new
 manifest and fresh reviews. Migration preserves spent counters and permits one replacement submission
 when the old synthesis budget is exhausted; it does not mint a review PASS.
+Partial legacy runs with incompatible investigation declarations archive their evidence and restart
+investigation under the current output schema. Deep-round blocking questions use the same typed user
+boundary as cross-review; an unfinished peer resumes with the recorded decision in its context.
 
 ## Typed decisions
 

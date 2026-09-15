@@ -17,6 +17,9 @@ All notable changes use semantic versioning.
   Explicit exclusion explanations remain valid; included scope is declared structurally and
   checked semantically by reviewers. Legacy completed plans migrate to re-synthesis and fresh
   review, retaining historical final artifacts and one bounded migration submission when needed.
+- Archived incompatible partial legacy investigations before requesting fresh structured outputs.
+  Deep-round blocking questions now pause for a recorded user decision and resume the unfinished
+  round with that decision in context.
 
 ## [0.7.1] - 2026-09-14
 

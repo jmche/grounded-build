@@ -112,7 +112,8 @@ elif "independent reviewer and integrator slot" in prompt or "independent deep-p
         slot = re.search(r"deep-planning slot ([AB])", prompt).group(1)
         round_number = 3
         target = "draft-02-both"
-    if f"FAKE_CROSS_DECISION={slot}" in request_text:
+    if f"FAKE_CROSS_DECISION={slot}" in request_text or (
+            round_number == 3 and f"FAKE_DEEP_DECISION={slot}" in request_text):
         verdict = "NEEDS_USER_DECISION"
         findings = [{"id": "P1-scope", "severity": "P1", "claim": "scope unclear", "evidence": "request", "required_change": "choose scope"}]
     else:
@@ -130,6 +131,12 @@ elif "independent reviewer and integrator slot" in prompt or "independent deep-p
                "accepted_finding_ids": ledger_keys, "rejected_finding_ids": [], "new_findings": [],
                "finding_aliases": [],
                "unresolved_questions": []}
+    if round_number == 3 and f"FAKE_DEEP_DECISION={slot}" in request_text:
+        payload["unresolved_questions"] = [{
+            "id": f"{slot}-Q-deep", "scope_id": "TARGET-001", "question": "Choose compatibility policy",
+            "decision_owner": "USER", "blocking": True, "rationale": "Product choice needed",
+            "options": ["preserve", "replace"], "evidence_ids": [f"{slot}-E1"],
+        }]
 else:
     slot = re.search(r"reviewer \(([ABF])\)", prompt).group(1)
     target = re.search(r"target=(candidate-round-\d+)", prompt).group(1)
@@ -1026,6 +1033,47 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertFalse((record_path.parent / "home").exists())
         self.assertFalse((record_path.parent / "tmp").exists())
 
+    def test_partial_legacy_investigation_is_reproduced_after_migration(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        self.call("investigate", "--project", str(self.project), "--run-id",
+                  initialized["run_id"], "--slot", "A")
+        spec = importlib.util.spec_from_file_location("gb_legacy_partial", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        previous = os.environ.get("GROUNDED_BUILD_PLAN_HOME")
+        os.environ["GROUNDED_BUILD_PLAN_HOME"] = self.env["GROUNDED_BUILD_PLAN_HOME"]
+        try:
+            state = self.get_state(initialized)
+            path = Path(state["investigations"]["A"]["path"])
+            payload = json.loads(path.read_text())
+            payload["unresolved_questions"] = ["Which compatibility policy applies?"]
+            path.write_text(json.dumps(payload))
+            module.record_artifact(state, "investigation-A", path)
+            state["engine_contract"] = {"software_version": "older", "files": {}}
+            module.save_state(state)
+        finally:
+            if previous is None:
+                os.environ.pop("GROUNDED_BUILD_PLAN_HOME", None)
+            else:
+                os.environ["GROUNDED_BUILD_PLAN_HOME"] = previous
+        migrated = self.call(
+            "migrate-engine", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--reason", "upgrade partial investigation", "--actor", "tester", "--apply")
+        self.assertEqual(migrated["status"], "INITIALIZED")
+        archive = Path(initialized["run_directory"]) / "decisions" / "legacy_planning_1.json"
+        self.assertIn("Which compatibility policy applies?", archive.read_text())
+        for slot in ("A", "B"):
+            self.call("investigate", "--project", str(self.project), "--run-id",
+                      initialized["run_id"], "--slot", slot)
+        self.run_through_cross_review(initialized)
+        self.submit_candidate(initialized)
+        self.call("final-review", "--project", str(self.project), "--run-id",
+                  initialized["run_id"], "--reviewer", "F")
+        self.assertEqual(self.call("export", "--project", str(self.project), "--run-id",
+                                   initialized["run_id"])["status"], "READY")
+
     def test_legacy_ready_migration_recovers_through_review_and_export(self) -> None:
         initialized = self.call(
             "init", "--project", str(self.project), "--request", str(self.request),
@@ -1333,6 +1381,30 @@ class PlanWorkflowTest(unittest.TestCase):
             result = self.call("final-review", "--project", str(self.project),
                                "--run-id", run_id, "--reviewer", slot)
         self.assertEqual(result["status"], "READY")
+
+    def test_deep_blocking_question_requires_adjudication_before_synthesis(self) -> None:
+        self.request.write_text(self.request.read_text() + "\nFAKE_DEEP_DECISION=A\n")
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude", "--planning-depth", "deep")
+        run_id = initialized["run_id"]
+        for slot in ("A", "B"):
+            self.call("investigate", "--project", str(self.project), "--run-id", run_id, "--slot", slot)
+        self.run_through_cross_review(initialized)
+        blocked = self.call("diverge", "--project", str(self.project), "--run-id", run_id, "--slot", "A")
+        self.assertEqual(blocked["status"], "NEEDS_USER_DECISION")
+        self.assertTrue(self.get_state(initialized)["pending_decision"]["questions"])
+        resumed = self.call(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", self.pending_decision_id(initialized), "--choice", "RESOLVE_AND_CONTINUE",
+            "--decision", "Preserve compatibility", "--actor", "tester", "--apply")
+        self.assertEqual(resumed["status"], "DIVERGING")
+        self.call("diverge", "--project", str(self.project), "--run-id", run_id, "--slot", "B")
+        self.submit_candidate(initialized)
+        for slot in ("A", "B"):
+            self.call("convergence-review", "--project", str(self.project), "--run-id", run_id, "--reviewer", slot)
+        self.call("final-review", "--project", str(self.project), "--run-id", run_id, "--reviewer", "F")
+        self.assertEqual(self.call("export", "--project", str(self.project), "--run-id", run_id)["status"], "READY")
 
     def test_convergence_boundary_can_resume_and_rejects_stale_candidate_results(self) -> None:
         self.request.write_text(

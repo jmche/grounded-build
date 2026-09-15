@@ -3625,6 +3625,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
         state["status"] = "NEEDS_USER_DECISION"
         state["pending_decision"] = {
             "type": "PLANNING_BOUNDARY", "source": f"cross-{slot}", "created_at": utc_now(),
+            "questions": payload["unresolved_questions"], "stage": "cross-review",
         }
     elif set(state["cross_reviews"]) == {"A", "B"}:
         state["status"] = "DIVERGENCE_REQUIRED" if state["planning_depth"] == "deep" else "SYNTHESIS_REQUIRED"
@@ -3673,6 +3674,8 @@ def command_diverge(args: argparse.Namespace) -> None:
         "draft_02_A.md": Path(state["draft_rounds"]["2"]["A"]["markdown"]),
         "draft_02_B.md": Path(state["draft_rounds"]["2"]["B"]["markdown"]),
     }
+    for index, decision in enumerate(sorted((Path(state["run_directory"]) / "decisions").glob("*.json")), 1):
+        context_files[f"decision_{index:03d}.json"] = decision
     payload = invoke(state, f"diverge-{slot}", provider, slot, context_files,
                      integration_schema(state, barrier_keys), prompt, args.timeout, args.dry_run,
                      validator=lambda value: validate_integration(value, state, slot, 3, barrier_keys))
@@ -3688,7 +3691,14 @@ def command_diverge(args: argparse.Namespace) -> None:
     record_findings(state, payload["new_findings"], f"draft-03-{slot}")
     record_finding_aliases(state, payload["finding_aliases"], f"draft-03-{slot}")
     state["draft_rounds"]["3"][slot] = {"provider": provider, "path": str(path), "markdown": str(markdown)}
-    state["status"] = "SYNTHESIS_REQUIRED" if set(state["draft_rounds"]["3"]) == {"A", "B"} else "DIVERGING"
+    if payload["verdict"] == "NEEDS_USER_DECISION":
+        state["status"] = "NEEDS_USER_DECISION"
+        state["pending_decision"] = {
+            "type": "PLANNING_BOUNDARY", "source": f"diverge-{slot}", "stage": "diverge",
+            "questions": payload["unresolved_questions"], "created_at": utc_now(),
+        }
+    else:
+        state["status"] = "SYNTHESIS_REQUIRED" if set(state["draft_rounds"]["3"]) == {"A", "B"} else "DIVERGING"
     save_parallel_stage(state, "diverge")
     emit({"status": state["status"], "run_id": state["run_id"], "slot": slot, "draft": str(markdown)})
 
@@ -4120,8 +4130,18 @@ def command_adjudicate(args: argparse.Namespace) -> None:
     elif decision_type in {"INVOCATION_BUDGET_EXHAUSTED", "PROVIDER_INFRASTRUCTURE_FAILURE"}:
         # Back to where the assignment was, with the count untouched. See the allowed-choices note.
         state["status"] = record["pending_decision"].get("resume_status", "SYNTHESIS_REQUIRED")
-    elif decision_type == "PLANNING_BOUNDARY" and set(state["cross_reviews"]) != {"A", "B"}:
-        state["status"] = "CROSS_REVIEWING"
+    elif decision_type == "PLANNING_BOUNDARY":
+        if pending.get("stage") == "diverge":
+            state["status"] = (
+                "SYNTHESIS_REQUIRED" if set(state["draft_rounds"]["3"]) == {"A", "B"}
+                else "DIVERGING")
+        elif set(state["cross_reviews"]) != {"A", "B"}:
+            state["status"] = "CROSS_REVIEWING"
+        elif state["planning_depth"] == "deep":
+            state["status"] = "DIVERGENCE_REQUIRED"
+            freeze_round_barrier(state, "diverge")
+        else:
+            state["status"] = "SYNTHESIS_REQUIRED"
     else:
         state["status"] = "SYNTHESIS_REQUIRED"
     if args.choice != "ABANDON" and state.get("pending_decisions"):
@@ -4259,6 +4279,42 @@ def command_migrate_engine(args: argparse.Namespace) -> None:
     state.setdefault("excluded_scope_ids", [])
     state.setdefault("resolved_question_ids", [])
     candidate = state.get("candidate") or {}
+    if not candidate and state["status"] != "ABANDONED":
+        legacy_investigations = {}
+        for slot, investigation in state.get("investigations", {}).items():
+            payload = json.loads(Path(investigation["path"]).read_text(encoding="utf-8"))
+            try:
+                validate_json_schema(payload, INVESTIGATION_SCHEMA)
+            except WorkflowError:
+                legacy_investigations[slot] = payload
+        if legacy_investigations:
+            fields = ("investigations", "drafts", "draft_rounds", "cross_reviews",
+                      "round_barriers", "finding_ledger", "finding_aliases")
+            archive = Path(state["run_directory"]) / "decisions" / f"legacy_planning_{state['engine_epoch']}.json"
+            atomic_json(archive, {
+                "reason": "legacy investigation declarations require fresh producer output",
+                "state": {field: state.get(field) for field in fields},
+                "artifacts": {
+                    key: Path(item["path"]).read_text(encoding="utf-8")
+                    for key, item in state.get("artifacts", {}).items()
+                    if Path(item["path"]).is_file()
+                },
+            })
+            record_artifact(state, f"legacy-planning-{state['engine_epoch']}", archive)
+            root = Path(state["run_directory"])
+            state["artifacts"] = {
+                key: item for key, item in state["artifacts"].items()
+                if not any(Path(item["path"]).is_relative_to(root / directory)
+                           for directory in ("investigations", "drafts", "cross_reviews", "input/barriers"))
+            }
+            for field in fields:
+                state[field] = {}
+            state["draft_rounds"] = {"1": {}, "2": {}, "3": {}}
+            state["pending_decision"] = None
+            state["pending_decisions"] = {}
+            state["status"] = "INITIALIZED"
+            atomic_json(Path(state["finding_ledger_path"]), {"findings": {}})
+            record_artifact(state, "finding-ledger", Path(state["finding_ledger_path"]))
     if candidate and not candidate.get("synthesis_manifest") and state["status"] != "ABANDONED":
         if state.get("final"):
             state.setdefault("legacy_finals", []).append(state.pop("final"))
