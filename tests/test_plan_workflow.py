@@ -314,6 +314,14 @@ class PlanWorkflowTest(unittest.TestCase):
         manifest = json.loads((context / "attachments.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["attachments"][0]["sha256"], state["attachments"][0]["sha256"])
 
+    def test_preflight_discloses_external_request_paths_without_blocking(self) -> None:
+        self.request.write_text(self.request.read_text() + "\nAudit /outside/final-plan.md.\n")
+        result = self.call(
+            "preflight", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude")
+        self.assertEqual(result["status"], "PREFLIGHT_OK")
+        self.assertTrue(any("outside readable roots" in item for item in result["input_warnings"]))
+
     def test_material_unreadable_question_reports_attachment_recovery(self) -> None:
         spec = importlib.util.spec_from_file_location("gb_attachment_contract", SCRIPT)
         module = importlib.util.module_from_spec(spec)

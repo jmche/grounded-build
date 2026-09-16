@@ -130,7 +130,8 @@ python3 <skill-root>/scripts/plan_workflow.py init \
   [Codex selection options from preflight]
 ```
 
-`--base-ref` defaults to `HEAD`. Planning freezes that ref's committed SHA in its own detached
+`preflight` may receive `--request <request.md>` to report the same advisory path warnings before
+initialization. `--base-ref` defaults to `HEAD`. Planning freezes that ref's committed SHA in its own detached
 worktree; staged, modified, and untracked files in the source checkout neither block initialization
 nor enter the planning snapshot. Pass an explicit ref whenever the checked-out branch is not the
 intended planning authority.

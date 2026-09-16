@@ -3551,6 +3551,12 @@ def command_preflight(args: argparse.Namespace) -> None:
             if args.host_adapter else None
         )
     selected_adapters = set(topology.values()) | ({preferred_final} if preferred_final else set())
+    input_warnings: list[str] = []
+    if args.request:
+        request = Path(args.request).expanduser().resolve()
+        if not request.is_file():
+            raise WorkflowError(f"request file does not exist: {request}")
+        input_warnings = request_path_warnings(request, project)
     baseline = git(project, "rev-parse", "--verify", f"{args.base_ref}^{{commit}}")
     payload = {
         "status": "PREFLIGHT_OK",
@@ -3567,6 +3573,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         "model_diversity": model_diversity(topology, runtime),
         "agent_runtime": {name: runtime[name] for name in sorted(selected_adapters)},
         "runtime_warnings": runtime_warnings({name: runtime[name] for name in selected_adapters}),
+        "input_warnings": input_warnings,
         "capabilities": {
             "bubblewrap": shutil.which("bwrap") is not None,
             "git": executable_version("git"),
@@ -4803,6 +4810,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     preflight = commands.add_parser("preflight")
     preflight.add_argument("--project", required=True)
+    preflight.add_argument(
+        "--request",
+        help="optional request file for advisory detection of absolute paths that init will need attached",
+    )
     preflight.add_argument(
         "--base-ref", default="HEAD",
         help="Git ref whose committed SHA will be frozen; source worktree changes are excluded",

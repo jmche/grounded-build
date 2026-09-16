@@ -127,7 +127,8 @@ options, and evidence ids. A blocking planner-owned question is invalid because 
 owns that work. Blocking user-owned questions stop before draft and are presented as one batch. Drafts
 and synthesis may carry only non-blocking residual uncertainty.
 
-`init --attach <path>` may be repeated for external review material. The engine freezes each regular
+`preflight --request <request.md>` and `init` disclose absolute request paths outside the readable
+roots as advisory warnings. `init --attach <path>` may be repeated for external review material. The engine freezes each regular
 file, records its SHA-256 and byte count, and mounts it as a common read-only `context/attachments/...`
 file in every stage. `attachments.json` is the authoritative mapping. Absolute paths in the request
 outside the project and frozen worktree are disclosed as advisory warnings; they are not treated as
