@@ -446,6 +446,21 @@ def describe_unparseable(provider: str, source: str, exc: json.JSONDecodeError) 
     )
 
 
+def load_delivery_json(source: str) -> Any:
+    """Decode provider JSON, tolerating only raw control characters inside strings.
+
+    Some adapters emit an otherwise unambiguous JSON object with a literal newline in a string.
+    The raw response remains recorded for audit; accepting this transport defect avoids spending a
+    quality attempt on a representation error while all other JSON failures remain strict.
+    """
+    try:
+        return json.loads(source)
+    except json.JSONDecodeError as exc:
+        if exc.msg != "Invalid control character at":
+            raise
+        return json.loads(source, strict=False)
+
+
 def no_answer_detail(result: subprocess.CompletedProcess[str]) -> str:
     """Quote the CLI's own account of the missing answer, when it gave one."""
     for marker in ("no last agent message", "stream disconnected", "context window"):
@@ -2098,7 +2113,14 @@ def request_path_warnings(
 ) -> list[str]:
     """Advisory disclosure for absolute paths outside the agent-readable roots."""
     text = request.read_text(encoding="utf-8")
-    paths = sorted(set(re.findall(r"(?<![A-Za-z0-9_])/(?:[^\s`\"'<>]|\\ )+", text)))
+    # Require ASCII path-shaped components after the leading slash. A broad "slash until
+    # whitespace" expression mistakes non-path prose fragments for filesystem paths.
+    # Keep the common single-root forms while requiring at least two components for arbitrary roots.
+    path_token = r"(?:[A-Za-z0-9._~-]+/)+(?:[A-Za-z0-9._~,@%+:-]+)?"
+    known_root = r"(?:home|tmp|var|etc|opt|usr|mnt|workspace|workspaces|root|run|srv|dev|proc|sys|outside)"
+    paths = sorted(set(re.findall(
+        rf"(?<![A-Za-z0-9_])/(?:{known_root}(?:/[A-Za-z0-9._~,@%+:-]+)+|{path_token})",
+        text)))
     roots = [worktree.resolve()]
     attached = {path.resolve() for path in (attached_paths or set())}
     warnings: list[str] = []
@@ -2612,7 +2634,7 @@ def extract_dsh_object(provider: str, source: str) -> dict[str, Any]:
         candidates.append(text[start:end + 1])
     for candidate in candidates:
         try:
-            payload = json.loads(candidate)
+            payload = load_delivery_json(candidate)
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict):
@@ -2635,7 +2657,7 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
     if provider == "dsh":
         return extract_dsh_object(provider, source)
     try:
-        wrapper = json.loads(source)
+        wrapper = load_delivery_json(source)
     except json.JSONDecodeError as exc:
         raise NoFinalAnswer(describe_unparseable(provider, source, exc)) from exc
     if provider in {"codex", "other"}:
@@ -2657,7 +2679,7 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
         payload = wrapper.get("structured_output")
         if not isinstance(payload, dict) and isinstance(wrapper.get("result"), str):
             try:
-                payload = json.loads(wrapper["result"])
+                payload = load_delivery_json(wrapper["result"])
             except json.JSONDecodeError as exc:
                 raise WorkflowError(f"claude result was not structured JSON: {exc}") from exc
     if not isinstance(payload, dict):

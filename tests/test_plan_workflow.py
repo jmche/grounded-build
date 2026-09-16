@@ -324,6 +324,23 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(result["status"], "PREFLIGHT_OK")
         self.assertTrue(any("outside readable roots" in item for item in result["input_warnings"]))
 
+    def test_request_path_warnings_ignore_slash_fragments_in_prose(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_path_warning_contract", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        request = self.temp / "prose.md"
+        request.write_text("Use the terms /\u7247\u6bb5 and /\u72b6\u6001 in the explanation.\n", encoding="utf-8")
+        warnings = module.request_path_warnings(request, self.temp / "worktree")
+        self.assertEqual(warnings, [])
+
+    def test_delivery_json_accepts_only_raw_control_character_representation_errors(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_delivery_json_contract", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.load_delivery_json('{"summary":"line1\nline2"}') ["summary"], "line1\nline2")
+        with self.assertRaises(json.JSONDecodeError):
+            module.load_delivery_json('{"summary":}')
+
     def test_material_unreadable_question_reports_attachment_recovery(self) -> None:
         spec = importlib.util.spec_from_file_location("gb_attachment_contract", SCRIPT)
         module = importlib.util.module_from_spec(spec)
