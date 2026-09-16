@@ -2,6 +2,11 @@
 
 All notable changes use semantic versioning.
 
+## [0.7.7] - 2026-09-17
+
+- Restored strict-compatible Implement reviewer delivery: closed finding objects use a minimal
+  semantic `details` field, and lifecycle arrays remain explicit in the provider schema.
+
 ## [0.7.6] - 2026-09-16
 
 - Added audited Implement `migrate-engine` recovery for post-update engine drift. Active

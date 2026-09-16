@@ -2320,6 +2320,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "batch": "B1", "verdict": "FAIL", "summary": "blocking defect",
             "findings": [{
                 "id": "F1", "fingerprint": "f1", "severity": "P1", "novelty": "INITIAL_REVIEW",
+                "details": "the blocking behavior is reproducible",
             }],
         }
         disclosures = WORKFLOW_MODULE.normalize_review_payload(payload)
@@ -2338,6 +2339,15 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertNotIn("reviewer", review["properties"])
         self.assertNotIn("reviewed_sha", review["required"])
         self.assertIn("findings", review["properties"])
+        finding_schema = review["properties"]["findings"]["items"]
+        self.assertFalse(finding_schema["additionalProperties"])
+        self.assertEqual(
+            finding_schema["required"], ["id", "fingerprint", "severity", "novelty", "details"]
+        )
+        self.assertIn("criterion_results", review["required"])
+        self.assertIn("verification_requests", review["required"])
+        self.assertIn("resolved_finding_ids", review["required"])
+        self.assertEqual(WORKFLOW_MODULE.unsupported_schema_keywords(review), [])
         contract = WORKFLOW_MODULE.producer_delivery_schema(
             WORKFLOW_MODULE.CONTRACT_SCHEMA, {"reviewer", "baseline_sha"},
         )

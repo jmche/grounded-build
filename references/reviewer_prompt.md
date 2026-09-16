@@ -46,13 +46,12 @@ inflate uncertainty into P1.
 
 Give every defect a semantic `fingerprint` that remains stable across file movement or rewording, for example `budget-routing:infra-error-charged-to-quality`. Reuse the existing finding ID and fingerprint when the same defect remains. Never present a rephrased prior issue as a new finding.
 
-The machine envelope is intentionally small. Every finding must provide only `id`, `fingerprint`,
-`severity`, and `novelty` for lifecycle routing. The explanatory fields (`location`, `trigger`,
-`consequence`, `required_outcome`, and the other finding prose) are semantic content and may be
-omitted when they are not applicable; do not fabricate them merely to satisfy formatting. The
-controller preserves the finding and supplies empty compatibility values for omitted prose. Likewise,
-empty `resolved_finding_ids`, `verification_requests`, or `criterion_results` may be omitted when
-there are none. Never omit a required criterion result for a non-`NEEDS_VERIFICATION` verdict.
+The machine envelope is intentionally small. Every finding must provide `id`, `fingerprint`,
+`severity`, `novelty`, and one `details` string containing its semantic explanation. The controller
+maps that explanation into the audit ledger and supplies empty compatibility values for legacy prose
+fields; do not invent separate prose fields merely to satisfy formatting. Always return the top-level
+arrays `resolved_finding_ids`, `verification_requests`, and `criterion_results`; use `[]` when empty.
+Never omit a required criterion result for a non-`NEEDS_VERIFICATION` verdict.
 
 That stability covers one instance that moved or was reworded. Another instance of the same class at a different site is a NEW finding with its own fingerprint, even when the underlying cause is identical: reuse the old ID only when you are re-reporting the same instance. Reusing one ID for a widening class of sites hides late discoveries from the round rules that would otherwise defer them.
 

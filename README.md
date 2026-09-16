@@ -251,7 +251,7 @@ deployments.
 
 ## Public beta status
 
-Version `v0.7.6` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
+Version `v0.7.7` is a public beta. Its state machines, sandbox boundaries, deterministic tests, and
 release gate are production-oriented, but broader provider and repository coverage is still needed
 before a general-availability claim.
 

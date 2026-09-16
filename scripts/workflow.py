@@ -219,16 +219,23 @@ def producer_delivery_schema(
     if isinstance(findings, dict):
         item = findings.get("items")
         if isinstance(item, dict):
-            # The reviewer still supplies lifecycle facts, while explanatory prose is
-            # optional and may use provider-specific keys without invalidating delivery.
-            item["additionalProperties"] = True
-            item_properties = item.get("properties", {})
-            for field in REVIEW_FINDING_TEXT_FIELDS:
-                item_properties.pop(field, None)
-            item["required"] = [
-                field for field in item.get("required", [])
-                if field not in REVIEW_FINDING_TEXT_FIELDS
-            ]
+            # Strict Codex schemas require an explicit closed object. Keep the machine
+            # lifecycle envelope small and carry reviewer prose in one semantic field.
+            item["additionalProperties"] = False
+            item["properties"] = {
+                "id": {"type": "string"},
+                "fingerprint": {"type": "string"},
+                "severity": {"type": "string", "enum": ["P0", "P1", "P2"]},
+                "novelty": {
+                    "type": "string",
+                    "enum": [
+                        "INITIAL_REVIEW", "INTRODUCED_BY_FIX", "PREVIOUSLY_MASKED",
+                        "PRE_EXISTING", "UNRELATED",
+                    ],
+                },
+                "details": {"type": "string"},
+            }
+            item["required"] = ["id", "fingerprint", "severity", "novelty", "details"]
     return result
 
 
@@ -2482,6 +2489,9 @@ def normalize_review_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for index, finding in enumerate(payload.get("findings", [])):
         if not isinstance(finding, dict):
             continue
+        details = finding.get("details")
+        if isinstance(details, str):
+            finding.setdefault("consequence", details)
         for field in REVIEW_FINDING_TEXT_FIELDS:
             if field not in finding:
                 finding[field] = ""
@@ -4368,7 +4378,6 @@ def command_review(args: argparse.Namespace) -> None:
     producer_schema = producer_delivery_schema(
         REVIEW_SCHEMA,
         {"reviewer", "reviewed_sha", "base_sha", "batch"},
-        {"resolved_finding_ids", "verification_requests", "criterion_results"},
     )
     atomic_json(schema_path, producer_schema)
     prompt = build_prompt(
