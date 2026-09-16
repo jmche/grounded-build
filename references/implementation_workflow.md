@@ -338,6 +338,13 @@ Interpret statuses as follows:
 
 Every real reviewer call is stored under a unique `round_N/invocation_N/` directory. A malformed result or process failure leaves a terminal invocation record but does not create a quality review. Invocation budgets stop repeated infrastructure failures from consuming unbounded external-agent budget.
 
+The reviewer delivery envelope is deliberately small. The workflow owns routing identity, commit
+SHAs, legal verdicts, finding IDs, fingerprints, severities, and executable criterion evidence.
+Finding explanation fields are semantic reviewer content: providers may omit inapplicable prose or
+include additional explanatory keys, and the controller preserves the finding while supplying only
+empty compatibility values needed by the lifecycle ledger. Missing lifecycle facts are still a
+delivery error; semantic prose is not promoted into a new mechanical gate.
+
 If an auto-selected external reviewer reports a machine-classified rate limit, the engine records
 `REVIEWER_AUTO_FALLBACK`, persistently switches to the frozen host runtime, and returns
 `retry_required: true`. Repeat the same contract-review or batch-review command; the failed

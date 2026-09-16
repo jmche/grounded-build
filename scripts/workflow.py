@@ -91,16 +91,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     "id": {"type": "string"},
                     "fingerprint": {"type": "string"},
                     "severity": {"type": "string", "enum": ["P0", "P1", "P2"]},
-                    "novelty": {
-                        "type": "string",
-                        "enum": [
-                            "INITIAL_REVIEW",
-                            "INTRODUCED_BY_FIX",
-                            "PREVIOUSLY_MASKED",
-                            "PRE_EXISTING",
-                            "UNRELATED",
-                        ],
-                    },
+                    "novelty": {"type": "string", "enum": ["INITIAL_REVIEW", "INTRODUCED_BY_FIX", "PREVIOUSLY_MASKED", "PRE_EXISTING", "UNRELATED"]},
                     "why_not_detectable_earlier": {"type": "string"},
                     "introduced_by_sha": {"type": "string"},
                     "severity_change_justification": {"type": "string"},
@@ -110,17 +101,9 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     "required_outcome": {"type": "string"},
                 },
                 "required": [
-                    "id",
-                    "fingerprint",
-                    "severity",
-                    "novelty",
-                    "why_not_detectable_earlier",
-                    "introduced_by_sha",
-                    "severity_change_justification",
-                    "location",
-                    "trigger",
-                    "consequence",
-                    "required_outcome",
+                    "id", "fingerprint", "severity", "novelty", "why_not_detectable_earlier",
+                    "introduced_by_sha", "severity_change_justification", "location", "trigger",
+                    "consequence", "required_outcome",
                 ],
             },
         },
@@ -159,16 +142,8 @@ REVIEW_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [
-        "reviewer",
-        "reviewed_sha",
-        "base_sha",
-        "batch",
-        "verdict",
-        "summary",
-        "findings",
-        "resolved_finding_ids",
-        "verification_requests",
-        "criterion_results",
+        "reviewer", "reviewed_sha", "base_sha", "batch", "verdict", "summary", "findings",
+        "resolved_finding_ids", "verification_requests", "criterion_results",
     ],
 }
 
@@ -225,7 +200,7 @@ CONTRACT_SCHEMA: dict[str, Any] = {
 
 
 def producer_delivery_schema(
-    schema: dict[str, Any], machine_fields: set[str],
+    schema: dict[str, Any], machine_fields: set[str], optional_fields: set[str] | None = None,
 ) -> dict[str, Any]:
     """Remove engine-owned envelope fields from the provider-facing schema.
 
@@ -236,9 +211,24 @@ def producer_delivery_schema(
     """
     result = copy.deepcopy(schema)
     properties = result.get("properties", {})
-    for field in machine_fields:
+    removed = machine_fields | (optional_fields or set())
+    for field in removed:
         properties.pop(field, None)
-    result["required"] = [field for field in result.get("required", []) if field not in machine_fields]
+    result["required"] = [field for field in result.get("required", []) if field not in removed]
+    findings = properties.get("findings")
+    if isinstance(findings, dict):
+        item = findings.get("items")
+        if isinstance(item, dict):
+            # The reviewer still supplies lifecycle facts, while explanatory prose is
+            # optional and may use provider-specific keys without invalidating delivery.
+            item["additionalProperties"] = True
+            item_properties = item.get("properties", {})
+            for field in REVIEW_FINDING_TEXT_FIELDS:
+                item_properties.pop(field, None)
+            item["required"] = [
+                field for field in item.get("required", [])
+                if field not in REVIEW_FINDING_TEXT_FIELDS
+            ]
     return result
 
 
@@ -2459,6 +2449,38 @@ def bind_contract_identity(
     return disclosures
 
 
+REVIEW_FINDING_TEXT_FIELDS = (
+    "why_not_detectable_earlier",
+    "introduced_by_sha",
+    "severity_change_justification",
+    "location",
+    "trigger",
+    "consequence",
+    "required_outcome",
+)
+
+
+def normalize_review_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep optional semantic prose from invalidating a usable review."""
+    disclosures: list[dict[str, Any]] = []
+    for field in ("resolved_finding_ids", "verification_requests", "criterion_results"):
+        if field not in payload:
+            payload[field] = []
+            disclosures.append({"type": "OPTIONAL_REVIEW_FIELD_DEFAULTED", "field": field})
+    for index, finding in enumerate(payload.get("findings", [])):
+        if not isinstance(finding, dict):
+            continue
+        for field in REVIEW_FINDING_TEXT_FIELDS:
+            if field not in finding:
+                finding[field] = ""
+                disclosures.append({
+                    "type": "OPTIONAL_FINDING_FIELD_DEFAULTED",
+                    "finding_index": index,
+                    "field": field,
+                })
+    return disclosures
+
+
 @functools.lru_cache(maxsize=1)
 def planning_isolation_module() -> Any:
     """Load the shared provider sandbox implementation from the installed planning engine."""
@@ -2900,11 +2922,7 @@ def validate_review_payload(
     if payload.get("verdict") not in {"PASS", "FAIL", "NEEDS_USER_DECISION", "NEEDS_VERIFICATION"}:
         raise WorkflowError(f"invalid review verdict: {payload.get('verdict')!r}")
     findings = payload.get("findings")
-    required = {
-        "id", "fingerprint", "severity", "novelty", "why_not_detectable_earlier",
-        "introduced_by_sha", "severity_change_justification", "location", "trigger",
-        "consequence", "required_outcome",
-    }
+    required = {"id", "fingerprint", "severity", "novelty"}
     if not isinstance(findings, list):
         raise WorkflowError("review findings must be a list")
     for index, finding in enumerate(findings):
@@ -4330,7 +4348,9 @@ def command_review(args: argparse.Namespace) -> None:
     supplied_diff_bytes = context_diff.stat().st_size
     schema_path = context_dir / "review_schema.json"
     producer_schema = producer_delivery_schema(
-        REVIEW_SCHEMA, {"reviewer", "reviewed_sha", "base_sha", "batch"},
+        REVIEW_SCHEMA,
+        {"reviewer", "reviewed_sha", "base_sha", "batch"},
+        {"resolved_finding_ids", "verification_requests", "criterion_results"},
     )
     atomic_json(schema_path, producer_schema)
     prompt = build_prompt(
@@ -4487,6 +4507,7 @@ def command_review(args: argparse.Namespace) -> None:
         delivery_disclosures = bind_review_identity(
             payload, reviewer=state["reviewer"], batch=args.batch, base=base, head=head,
         )
+        delivery_disclosures.extend(normalize_review_payload(payload))
         if delivery_disclosures:
             invocation["delivery_disclosures"] = delivery_disclosures
         validate_review_payload(payload, state["reviewer"], args.batch, base, head, state)

@@ -2,6 +2,12 @@
 
 All notable changes use semantic versioning.
 
+## [0.7.5] - 2026-09-16
+
+- Reduced Implement reviewer delivery to a small lifecycle envelope. Optional semantic finding
+  prose and empty collections are normalized at the workflow boundary instead of invalidating a
+  usable review for mechanical omissions.
+
 ## [0.7.4] - 2026-09-16
 
 - Added repeated `init --attach <path>` for frozen, SHA-256-bound external review material. Attachments

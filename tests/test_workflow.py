@@ -2248,6 +2248,22 @@ class WorkflowIntegrationTests(unittest.TestCase):
         with self.assertRaises(WORKFLOW_MODULE.WorkflowError):
             WORKFLOW_MODULE.extract_review("dsh", '{"summary":}', self.root / "missing.json")
 
+    def test_review_semantic_prose_is_normalized_at_the_authority_boundary(self) -> None:
+        payload = {
+            "reviewer": "codex", "reviewed_sha": "b" * 40, "base_sha": "a" * 40,
+            "batch": "B1", "verdict": "FAIL", "summary": "blocking defect",
+            "findings": [{
+                "id": "F1", "fingerprint": "f1", "severity": "P1", "novelty": "INITIAL_REVIEW",
+            }],
+        }
+        disclosures = WORKFLOW_MODULE.normalize_review_payload(payload)
+        WORKFLOW_MODULE.validate_review_payload(
+            payload, "codex", "B1", "a" * 40, "b" * 40,
+        )
+        self.assertEqual(payload["findings"][0]["novelty"], "INITIAL_REVIEW")
+        self.assertEqual(payload["verification_requests"], [])
+        self.assertTrue(disclosures)
+
     def test_provider_schema_excludes_engine_owned_identity(self) -> None:
         review = WORKFLOW_MODULE.producer_delivery_schema(
             WORKFLOW_MODULE.REVIEW_SCHEMA,

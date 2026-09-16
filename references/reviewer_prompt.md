@@ -46,6 +46,14 @@ inflate uncertainty into P1.
 
 Give every defect a semantic `fingerprint` that remains stable across file movement or rewording, for example `budget-routing:infra-error-charged-to-quality`. Reuse the existing finding ID and fingerprint when the same defect remains. Never present a rephrased prior issue as a new finding.
 
+The machine envelope is intentionally small. Every finding must provide only `id`, `fingerprint`,
+`severity`, and `novelty` for lifecycle routing. The explanatory fields (`location`, `trigger`,
+`consequence`, `required_outcome`, and the other finding prose) are semantic content and may be
+omitted when they are not applicable; do not fabricate them merely to satisfy formatting. The
+controller preserves the finding and supplies empty compatibility values for omitted prose. Likewise,
+empty `resolved_finding_ids`, `verification_requests`, or `criterion_results` may be omitted when
+there are none. Never omit a required criterion result for a non-`NEEDS_VERIFICATION` verdict.
+
 That stability covers one instance that moved or was reworded. Another instance of the same class at a different site is a NEW finding with its own fingerprint, even when the underlying cause is identical: reuse the old ID only when you are re-reporting the same instance. Reusing one ID for a widening class of sites hides late discoveries from the round rules that would otherwise defer them.
 
 `required_outcome` is the close condition the implementer is entitled to work against, so it is frozen when first stated. Restating it, or naming a different file, is recorded as an obligation revision. A second revision stops the batch for a typed user decision instead of continuing an unbounded round loop. If the real obligation is wider than you first stated, say so once as a new finding rather than by enlarging an existing one.
