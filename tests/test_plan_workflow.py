@@ -104,7 +104,8 @@ elif "independent planning instance" in prompt:
         "evidence_ids": [f"{slot}-E1"], "new_evidence": [],
         "plan_scope_ids": ["TARGET-001"],
         "summary": f"independent {slot}; canary_visible={canary_visible}; git_ok={git_ok}",
-        "repository_facts": [{"id": f"{slot}-F1", "claim": "README exists", "evidence": "README.md:1", "confidence": "VERIFIED"}],
+        "repository_facts": [{"id": f"{slot}-F1", "claim": "README exists", "evidence": "README.md:1",
+                               "evidence_ids": [f"{slot}-E1"], "confidence": "VERIFIED"}],
         "plan_markdown": f"# Plan {slot}\n\n## Scope\nRepository-grounded proposal from {slot}.\n\n## Batches\n- B01: verify with a named command.\n",
         "unresolved_questions": [],
     }
@@ -1505,8 +1506,8 @@ class PlanWorkflowTest(unittest.TestCase):
         prompts = sorted(Path(state["run_directory"]).glob("invocations/draft-A/*/prompt.md"))
         self.assertTrue(prompts, "no rendered draft prompt to inspect")
         text = prompts[-1].read_text(encoding="utf-8")
-        self.assertIn("Every new_evidence item follows the complete evidence receipt contract", text)
-        self.assertIn(f"version_or_commit to the exact frozen baseline SHA {state['baseline_sha']}", text)
+        self.assertIn("EVIDENCE CONTRACT. Every evidence receipt", text)
+        self.assertIn(f"version_or_commit must be the exact frozen baseline SHA {state['baseline_sha']}", text)
 
     def test_a_wrong_agent_digest_is_disclosed_instead_of_rejecting_the_delivery(self) -> None:
         """d2: the digest is a machine fact, so the engine owns it.

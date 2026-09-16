@@ -192,9 +192,10 @@ DRAFT_SCHEMA: dict[str, Any] = {
                     "id": {"type": "string"},
                     "claim": {"type": "string"},
                     "evidence": {"type": "string"},
+                    "evidence_ids": {"type": "array", "items": {"type": "string"}},
                     "confidence": {"type": "string", "enum": ["VERIFIED", "INFERRED", "UNRESOLVED"]},
                 },
-                "required": ["id", "claim", "evidence", "confidence"],
+                "required": ["id", "claim", "evidence", "evidence_ids", "confidence"],
             },
         },
         "plan_markdown": {"type": "string"},
@@ -2821,6 +2822,20 @@ DELIVERY_CONTRACT = (
 )
 
 
+def evidence_prompt_contract(baseline_sha: str) -> str:
+    """One producer-facing evidence contract shared by every planning stage."""
+    return (
+        "EVIDENCE CONTRACT. Every evidence receipt and every new_evidence receipt must have a "
+        "non-empty claim, locator, retrieval timestamp, version binding, and lowercase SHA-256. "
+        f"For REPOSITORY or COMMAND, version_or_commit must be the exact frozen baseline SHA {baseline_sha}; "
+        "never use HEAD, a working-tree commit, or a model/current-date value. For ATTACHMENT, use the exact "
+        "context_name from attachments.json as locator and copy that attachment's sha256 into version_or_commit; "
+        "do not cite context/attachments as a repository path. The engine binds content_sha256 to the frozen "
+        "bytes. Every repository_fact must cite one or more known evidence_ids; its evidence text is explanatory, "
+        "not a substitute for those ids."
+    )
+
+
 def delivery_corrective(state: dict[str, Any], assignment: str) -> str:
     """What to tell a retry that the first attempt could not have known.
 
@@ -3154,6 +3169,8 @@ def validate_draft(payload: dict[str, Any], state: dict[str, Any], slot: str) ->
     for fact in facts:
         if not all(nonempty(fact.get(field)) for field in ("id", "claim", "evidence")):
             raise WorkflowError("draft repository facts must be non-empty")
+        if not fact.get("evidence_ids") or not set(fact["evidence_ids"]).issubset(known_evidence):
+            raise WorkflowError("draft repository facts must cite known evidence_ids")
     validate_questions(payload["unresolved_questions"], known_evidence, "draft", allow_blocking_user=False)
 
 
@@ -3878,10 +3895,7 @@ def command_investigate(args: argparse.Namespace) -> None:
         "matching exactly TARGET-001, REQUIRED_SUPPORT-NNN, EVIDENCE_ONLY-NNN, PROPOSED_EXTENSION-NNN, or OUT_OF_SCOPE-NNN "
         "(NNN is at least three digits; a bare class name is invalid). "
         "anything outside the frozen objective is OUT_OF_SCOPE or a PROPOSED_EXTENSION and must not enter the plan. "
-        "Evidence fields are receipts, not labels: use non-empty claims and locators, a 64-character lowercase "
-        "content digest, and bind repository/command evidence version_or_commit to the baseline SHA. For an "
-        "ATTACHMENT, use the exact context_name from attachments.json as locator and copy that attachment's sha256 "
-        "into version_or_commit; the engine binds content_sha256 to the frozen attachment bytes. For repository "
+        "{evidence_contract} For repository "
         "evidence, the locator is EXACTLY one worktree-relative file path, optionally followed by :start-end — no "
         "prose, no parenthetical notes and no ';'-joined list of files: give each file its own entry and keep "
         "descriptions in the claim. The digest is for the complete baseline file. The files in your context directory "
@@ -3903,6 +3917,7 @@ def command_investigate(args: argparse.Namespace) -> None:
         + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, sha=state["baseline_sha"],
              scope_digest=state["scope_digest"], web_rule=web_rule, context="{context}",
+             evidence_contract=evidence_prompt_contract(state["baseline_sha"]),
              worktree=str(state["worktree"]), vocabulary=VOCABULARY_NOTE)
     payload = invoke(
         state, f"investigate-{slot}", provider, slot,
@@ -3943,12 +3958,7 @@ def command_draft(args: argparse.Namespace) -> None:
         "You cannot see the other planner's work. "
         "Re-check repository facts before planning. If that check discovers evidence absent from investigation.json, "
         "record it in new_evidence with a valid suffixed scope id and cite it from evidence_ids; never cite an unrecorded "
-        "observation. Every new_evidence item follows the complete evidence receipt contract: for source_type "
-        "REPOSITORY or COMMAND, set version_or_commit to the exact frozen baseline SHA {sha} (never HEAD, a "
-        "working-tree commit, or a model/current-date value); the engine verifies the bytes against that baseline. "
-        "For source_type ATTACHMENT, use the exact context_name from attachments.json as locator and copy that "
-        "attachment's sha256 into version_or_commit; do not cite context/attachments as a repository path. "
-        "Use the same locator, retrieval timestamp, and complete-file SHA-256 rules as investigation evidence. "
+        "observation. {evidence_contract} "
         "Read any typed decisions supplied in the context. Use evidence ids and preserve uncertainty. "
         "Declare plan_scope_ids; OUT_OF_SCOPE is forbidden and PROPOSED_EXTENSION is allowed only when the state "
         "records explicit user authorization. No blocking unresolved question may remain in a draft. Produce a detailed "
@@ -3958,7 +3968,8 @@ def command_draft(args: argparse.Namespace) -> None:
         "baseline_sha={sha}, and scope_digest={scope_digest}."
         + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, sha=state["baseline_sha"],
-             scope_digest=state["scope_digest"], context="{context}")
+             scope_digest=state["scope_digest"], context="{context}",
+             evidence_contract=evidence_prompt_contract(state["baseline_sha"]))
     payload = invoke(
         state, f"draft-{slot}", provider, slot,
         {"request.md": Path(state["request_snapshot"]),
