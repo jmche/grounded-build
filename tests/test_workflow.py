@@ -2229,6 +2229,25 @@ class WorkflowIntegrationTests(unittest.TestCase):
         }]
         WORKFLOW_MODULE.validate_review_payload(payload, "codex", "B1", "a" * 40, "b" * 40)
 
+    def test_implementation_review_identity_is_engine_bound(self) -> None:
+        payload = {"reviewer": "dsh", "batch": "wrong", "base_sha": "x", "reviewed_sha": "y"}
+        disclosures = WORKFLOW_MODULE.bind_review_identity(
+            payload, reviewer="codex", batch="B1", base="a" * 40, head="b" * 40,
+        )
+        self.assertEqual(payload["reviewer"], "codex")
+        self.assertEqual(payload["batch"], "B1")
+        self.assertEqual(payload["base_sha"], "a" * 40)
+        self.assertEqual(payload["reviewed_sha"], "b" * 40)
+        self.assertEqual({item["field"] for item in disclosures},
+                         {"reviewer", "batch", "base_sha", "reviewed_sha"})
+
+    def test_implementation_json_parser_tolerates_only_raw_control_characters(self) -> None:
+        raw = '{"summary":"line1\nline2"}'
+        payload = WORKFLOW_MODULE.extract_review("dsh", raw, self.root / "missing.json")
+        self.assertEqual(payload["summary"], "line1\nline2")
+        with self.assertRaises(WORKFLOW_MODULE.WorkflowError):
+            WORKFLOW_MODULE.extract_review("dsh", '{"summary":}', self.root / "missing.json")
+
     def test_legacy_run_requires_explicit_migration(self) -> None:
         initialized = self.initialize("codex")
         state_path = Path(str(initialized["run_directory"])) / "workflow.json"

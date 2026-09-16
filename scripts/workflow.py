@@ -2367,7 +2367,13 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
             try:
                 payload = json.loads(candidate)
             except json.JSONDecodeError:
-                continue
+                try:
+                    # A literal control character inside a quoted field is a mechanical
+                    # serialization slip, not a semantic review failure.  Keep the fallback
+                    # narrow: all other JSON errors remain actionable delivery failures.
+                    payload = json.loads(candidate, strict=False)
+                except json.JSONDecodeError:
+                    continue
             if isinstance(payload, dict):
                 return payload
         raise WorkflowError("dsh output did not contain a structured review result")
@@ -2376,12 +2382,18 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
         try:
             payload = json.loads(source)
         except json.JSONDecodeError as exc:
-            raise WorkflowError(f"{reviewer} returned invalid structured output: {exc}") from exc
+            try:
+                payload = json.loads(source, strict=False)
+            except json.JSONDecodeError:
+                raise WorkflowError(f"{reviewer} returned invalid structured output: {exc}") from exc
         return payload
     try:
         wrapper = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise WorkflowError(f"Claude returned invalid JSON wrapper: {exc}") from exc
+        try:
+            wrapper = json.loads(stdout, strict=False)
+        except json.JSONDecodeError:
+            raise WorkflowError(f"Claude returned invalid JSON wrapper: {exc}") from exc
     structured = wrapper.get("structured_output")
     if isinstance(structured, dict):
         return structured
@@ -2390,10 +2402,43 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
         try:
             payload = json.loads(result)
         except json.JSONDecodeError as exc:
-            raise WorkflowError(f"Claude result was not structured JSON: {exc}") from exc
+            try:
+                payload = json.loads(result, strict=False)
+            except json.JSONDecodeError:
+                raise WorkflowError(f"Claude result was not structured JSON: {exc}") from exc
         if isinstance(payload, dict):
             return payload
     raise WorkflowError("Claude output did not contain a structured review result")
+
+
+def bind_review_identity(
+    payload: dict[str, Any], *, reviewer: str, batch: str, base: str, head: str,
+) -> list[dict[str, Any]]:
+    """Bind routing and SHA facts owned by the workflow, not by the reviewer."""
+    expected = {
+        "reviewer": reviewer, "batch": batch, "base_sha": base, "reviewed_sha": head,
+    }
+    disclosures: list[dict[str, Any]] = []
+    for field, value in expected.items():
+        if field in payload and payload[field] != value:
+            disclosures.append({"type": "MACHINE_IDENTITY_REBOUND", "field": field,
+                                "claimed": payload[field], "engine": value})
+        payload[field] = value
+    return disclosures
+
+
+def bind_contract_identity(
+    payload: dict[str, Any], *, reviewer: str, baseline_sha: str,
+) -> list[dict[str, Any]]:
+    """Bind the contract review's provider and baseline at the engine boundary."""
+    expected = {"reviewer": reviewer, "baseline_sha": baseline_sha}
+    disclosures: list[dict[str, Any]] = []
+    for field, value in expected.items():
+        if field in payload and payload[field] != value:
+            disclosures.append({"type": "MACHINE_IDENTITY_REBOUND", "field": field,
+                                "claimed": payload[field], "engine": value})
+        payload[field] = value
+    return disclosures
 
 
 @functools.lru_cache(maxsize=1)
@@ -2733,6 +2778,11 @@ def command_contract_review(args: argparse.Namespace) -> None:
         }, 4)
     try:
         payload = extract_review(state["reviewer"], result.stdout, raw_path)
+        delivery_disclosures = bind_contract_identity(
+            payload, reviewer=state["reviewer"], baseline_sha=state["baseline_sha"],
+        )
+        if delivery_disclosures:
+            invocation["delivery_disclosures"] = delivery_disclosures
         validate_contract_payload(payload, state)
     except WorkflowError as exc:
         invocation.update({"status": "CONTRACT_ERROR", "error": str(exc), "completed_at": utc_now()})
@@ -4409,6 +4459,11 @@ def command_review(args: argparse.Namespace) -> None:
     try:
         assert result is not None
         payload = extract_review(state["reviewer"], result.stdout, raw_path)
+        delivery_disclosures = bind_review_identity(
+            payload, reviewer=state["reviewer"], batch=args.batch, base=base, head=head,
+        )
+        if delivery_disclosures:
+            invocation["delivery_disclosures"] = delivery_disclosures
         validate_review_payload(payload, state["reviewer"], args.batch, base, head, state)
         payload["findings"] = sorted(
             payload["findings"],
