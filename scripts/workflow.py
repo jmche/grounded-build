@@ -224,6 +224,24 @@ CONTRACT_SCHEMA: dict[str, Any] = {
 }
 
 
+def producer_delivery_schema(
+    schema: dict[str, Any], machine_fields: set[str],
+) -> dict[str, Any]:
+    """Remove engine-owned envelope fields from the provider-facing schema.
+
+    The internal schema remains complete for validation and audit.  Providers only need to
+    produce semantic review content; the workflow adds routing and SHA facts after receipt.
+    This avoids strict structured-output backends rejecting an otherwise useful review because
+    an engine-owned field was omitted or echoed incorrectly.
+    """
+    result = copy.deepcopy(schema)
+    properties = result.get("properties", {})
+    for field in machine_fields:
+        properties.pop(field, None)
+    result["required"] = [field for field in result.get("required", []) if field not in machine_fields]
+    return result
+
+
 class WorkflowError(RuntimeError):
     """A state, Git, or infrastructure error—not a code-quality verdict."""
 
@@ -2703,10 +2721,13 @@ def command_contract_review(args: argparse.Namespace) -> None:
         contract_schema["properties"][section]["items"]["properties"]["batch"] = {
             "type": "string", "enum": list(state["batches"]),
         }
-    atomic_json(schema_path, contract_schema)
+    producer_contract_schema = producer_delivery_schema(
+        contract_schema, {"reviewer", "baseline_sha"},
+    )
+    atomic_json(schema_path, producer_contract_schema)
     command = reviewer_command(
         state["reviewer"], reviewer_path, context, schema_path, raw_path, prompt,
-        contract_schema, state.get("reviewer_runtime"))
+        producer_contract_schema, state.get("reviewer_runtime"))
     command, review_env = isolated_reviewer_command(
         command, state["reviewer"], state.get("reviewer_runtime"),
         root, reviewer_path, context,
@@ -4308,7 +4329,10 @@ def command_review(args: argparse.Namespace) -> None:
     )
     supplied_diff_bytes = context_diff.stat().st_size
     schema_path = context_dir / "review_schema.json"
-    atomic_json(schema_path, REVIEW_SCHEMA)
+    producer_schema = producer_delivery_schema(
+        REVIEW_SCHEMA, {"reviewer", "reviewed_sha", "base_sha", "batch"},
+    )
+    atomic_json(schema_path, producer_schema)
     prompt = build_prompt(
         state, args.batch, round_number, base, head,
         diff_base, review_mode, review_mode_reason,
@@ -4320,7 +4344,8 @@ def command_review(args: argparse.Namespace) -> None:
     prompt_path.chmod(0o600)
     command = reviewer_command(
         state["reviewer"], reviewer_path, context_dir,
-        schema_path, raw_path, prompt, runtime=state.get("reviewer_runtime"),
+        schema_path, raw_path, prompt, schema=producer_schema,
+        runtime=state.get("reviewer_runtime"),
     )
     command, review_env = isolated_reviewer_command(
         command, state["reviewer"], state.get("reviewer_runtime"),

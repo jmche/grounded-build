@@ -2248,6 +2248,20 @@ class WorkflowIntegrationTests(unittest.TestCase):
         with self.assertRaises(WORKFLOW_MODULE.WorkflowError):
             WORKFLOW_MODULE.extract_review("dsh", '{"summary":}', self.root / "missing.json")
 
+    def test_provider_schema_excludes_engine_owned_identity(self) -> None:
+        review = WORKFLOW_MODULE.producer_delivery_schema(
+            WORKFLOW_MODULE.REVIEW_SCHEMA,
+            {"reviewer", "reviewed_sha", "base_sha", "batch"},
+        )
+        self.assertNotIn("reviewer", review["properties"])
+        self.assertNotIn("reviewed_sha", review["required"])
+        self.assertIn("findings", review["properties"])
+        contract = WORKFLOW_MODULE.producer_delivery_schema(
+            WORKFLOW_MODULE.CONTRACT_SCHEMA, {"reviewer", "baseline_sha"},
+        )
+        self.assertNotIn("baseline_sha", contract["properties"])
+        self.assertIn("criteria", contract["properties"])
+
     def test_legacy_run_requires_explicit_migration(self) -> None:
         initialized = self.initialize("codex")
         state_path = Path(str(initialized["run_directory"])) / "workflow.json"
