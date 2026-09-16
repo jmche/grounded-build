@@ -1423,7 +1423,7 @@ class PlanWorkflowTest(unittest.TestCase):
             self.assertEqual(disclosure["also_cited"], ["b.py"])
 
             unresolvable = dict(item, id="A-E2", locator="nowhere.md; also_missing.py")
-            with self.assertRaisesRegex(module.WorkflowError, "names no file that exists"):
+            with self.assertRaisesRegex(module.WorkflowError, "source_type=ATTACHMENT.*attachments.json"):
                 module.validate_evidence_items([unresolvable], state, "draft")
 
     def test_undefined_fields_are_disclosed_for_an_adapter_delivery(self) -> None:

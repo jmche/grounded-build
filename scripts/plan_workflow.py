@@ -1341,7 +1341,10 @@ def validate_evidence_items(
             if not resolved_files:
                 problems.append(
                     f"{evidence_id!r}: locator {str(item['locator'])[:70]!r} names no file that exists in "
-                    "the frozen worktree — use a worktree-relative path with an optional `:start-end`")
+                    "the frozen worktree. If this is attached material, classify it as "
+                    "source_type=ATTACHMENT and use the exact context_name from attachments.json "
+                    "with version_or_commit set to that attachment's sha256; otherwise use a "
+                    "worktree-relative path with an optional `:start-end`")
                 continue
             relative, source = resolved_files[0]
             if len(resolved_files) > 1:
