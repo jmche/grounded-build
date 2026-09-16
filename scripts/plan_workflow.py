@@ -2877,6 +2877,23 @@ def delivery_corrective(state: dict[str, Any], assignment: str) -> str:
     )
 
 
+SAFE_EMPTY_COLLECTIONS = {
+    "new_evidence", "new_findings", "finding_aliases", "findings", "unresolved_questions",
+}
+
+
+def normalize_delivery_collections(payload: dict[str, Any], schema: dict[str, Any]) -> list[str]:
+    """Fill only semantically empty collection fields; never invent decisions or findings."""
+    disclosures: list[str] = []
+    required = set(schema.get("required", []))
+    properties = set(schema.get("properties", {}))
+    for field in sorted(SAFE_EMPTY_COLLECTIONS & properties - required):
+        if field not in payload:
+            payload[field] = []
+            disclosures.append(f"delivery omitted optional empty collection {field}; engine supplied []")
+    return disclosures
+
+
 def invoke(
     state: dict[str, Any], assignment: str, provider: str, slot: str, context_files: dict[str, Path],
     schema: dict[str, Any], prompt: str, timeout: int, dry_run: bool,
@@ -3068,6 +3085,8 @@ def invoke(
             raise infrastructure_error
         delivery_disclosures: list[dict[str, Any]] = []
         payload = extract_payload(provider, result, raw, delivery_disclosures)
+        for note in normalize_delivery_collections(payload, schema):
+            delivery_disclosures.append({"type": "OPTIONAL_COLLECTION_DEFAULTED", "detail": note})
         if delivery_disclosures:
             state.setdefault("delivery_disclosures", []).extend(delivery_disclosures)
             invocation_record["delivery_disclosures"] = delivery_disclosures

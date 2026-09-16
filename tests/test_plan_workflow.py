@@ -347,6 +347,18 @@ class PlanWorkflowTest(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             module.load_delivery_json('{"summary":}')
 
+    def test_delivery_defaults_only_safe_empty_collections(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_delivery_defaults", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        payload = {"summary": "kept"}
+        disclosures = module.normalize_delivery_collections(
+            payload, {"properties": {"new_evidence": {}, "finding_aliases": {}, "accepted_finding_ids": {}}})
+        self.assertEqual(payload["new_evidence"], [])
+        self.assertEqual(payload["finding_aliases"], [])
+        self.assertNotIn("accepted_finding_ids", payload)
+        self.assertTrue(any("new_evidence" in item for item in disclosures))
+
     def test_material_unreadable_question_reports_attachment_recovery(self) -> None:
         spec = importlib.util.spec_from_file_location("gb_attachment_contract", SCRIPT)
         module = importlib.util.module_from_spec(spec)
