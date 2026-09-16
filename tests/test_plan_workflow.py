@@ -334,7 +334,22 @@ class PlanWorkflowTest(unittest.TestCase):
             "question_kind": "MATERIAL_UNREADABLE", "rationale": "file is unavailable",
             "options": [], "evidence_ids": [],
         }
-        with self.assertRaisesRegex(module.WorkflowError, "--attach <path>"):
+        with self.assertRaisesRegex(module.WorkflowError, "--attach <path>.*DECISION_REQUIRED"):
+            module.validate_questions([question], set(), "investigation", allow_blocking_user=True)
+
+    def test_misclassified_material_question_explains_reclassification(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_question_contract", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        question = {
+            "id": "B-Q1", "scope_id": "TARGET-001",
+            "question": "Can the deployed host expose streamed progress?",
+            "decision_owner": "PLANNER", "blocking": True,
+            "question_kind": "MATERIAL_UNREADABLE",
+            "rationale": "the host capability is not established", "options": [],
+            "evidence_ids": [],
+        }
+        with self.assertRaisesRegex(module.WorkflowError, "host capability.*DECISION_REQUIRED"):
             module.validate_questions([question], set(), "investigation", allow_blocking_user=True)
 
     def test_init_rejects_symlink_attachment_before_creating_a_run(self) -> None:

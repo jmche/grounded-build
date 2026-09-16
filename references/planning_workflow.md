@@ -132,9 +132,12 @@ roots as advisory warnings. `init --attach <path>` may be repeated for external 
 file, records its SHA-256 and byte count, and mounts it as a common read-only `context/attachments/...`
 file in every stage. `attachments.json` is the authoritative mapping. Absolute paths in the request
 outside the project and frozen worktree are disclosed as advisory warnings; they are not treated as
-delivered evidence. A producer that cannot read required material reports a blocking
-`question_kind=MATERIAL_UNREADABLE` question. The controller supplies the file with `--attach` and
-reruns the affected input; it never turns that failure into a non-blocking question.
+delivered evidence. A producer that cannot read a specific required file or context artifact reports
+a blocking `question_kind=MATERIAL_UNREADABLE` question. The controller supplies the file with
+`--attach` and reruns the affected input; it never turns that failure into a non-blocking question.
+A host capability, policy, or verification choice is `DECISION_REQUIRED` (or `UNKNOWN` when the
+producer cannot classify it) and must be escalated as a blocking `USER` question when it cannot be
+settled from the frozen inputs.
 
 Every planning stage receives `causal_analysis.md`. Use its universal production trace for material
 defects and responsibility disputes, then adapt evidence to deterministic, generative, external,

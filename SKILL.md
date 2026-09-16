@@ -140,8 +140,11 @@ Repeat `--attach <path>` on `init` for external review material. Each regular fi
 SHA-256 digest and mounted read-only under `context/attachments/` for every planning stage; agents
 must use the names in `attachments.json`, never the original host path. Initialization reports
 absolute request paths outside the readable project/worktree roots as advisory warnings. If a
-producer cannot read required material, it must report a blocking `MATERIAL_UNREADABLE` question;
-the controller should rerun with `--attach <path>`, and must not weaken the blocking rule.
+producer cannot read a specific required file or context artifact, it must report a blocking
+`MATERIAL_UNREADABLE` question; the controller should rerun with `--attach <path>`, and must not
+weaken the blocking rule. A host capability, policy, or verification choice is instead
+`DECISION_REQUIRED` (or `UNKNOWN` when classification is genuinely uncertain) and must be a
+blocking `USER` question when it cannot be settled from the frozen inputs.
 
 Record `run_id`, `base_ref`, `baseline_sha`, the excluded source-worktree changes,
 `agent_runtime`, and the returned `next_action`.

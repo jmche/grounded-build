@@ -106,7 +106,11 @@ QUESTION_SCHEMA: dict[str, Any] = {
         "options": {"type": "array", "items": {"type": "string"}},
         "evidence_ids": {"type": "array", "items": {"type": "string"}},
         "question_kind": {"type": "string", "enum": [
-            "DECISION_REQUIRED", "MATERIAL_UNREADABLE", "UNKNOWN"]},
+            "DECISION_REQUIRED", "MATERIAL_UNREADABLE", "UNKNOWN"],
+            "description": ("DECISION_REQUIRED means a user/host policy, capability, or "
+                            "verification choice is needed; MATERIAL_UNREADABLE means a "
+                            "specific required file or context artifact cannot be read; "
+                            "UNKNOWN means the distinction cannot be established." )},
     },
     "required": ["id", "scope_id", "question", "decision_owner", "blocking",
                  "rationale", "options", "evidence_ids", "question_kind"],
@@ -1351,9 +1355,11 @@ def validate_questions(
                 and question.get("question_kind") == "MATERIAL_UNREADABLE"):
             raise WorkflowError(
                 f"{where} question {question.get('id')!r} reports unreadable material: "
-                f"{question.get('question')!r}. The referenced material is not in the frozen "
-                "worktree or attached context; rerun with --attach <path> and do not silently "
-                "downgrade this blocking contract failure")
+                f"{question.get('question')!r}. If a specific required file or context artifact "
+                "is genuinely unavailable, rerun with --attach <path>. If this is instead a "
+                "host capability, policy, or verification choice, reclassify it as "
+                "question_kind=DECISION_REQUIRED (or UNKNOWN) and set decision_owner=USER; "
+                "do not silently downgrade or invent an attachment")
         if question.get("blocking") and question.get("decision_owner") == "PLANNER":
             # A rule the prompt states and a live slot still broke, so the complaint says what to DO:
             # the investigator owns this question and must answer it from the repository, or escalate
@@ -3820,7 +3826,11 @@ def command_investigate(args: argparse.Namespace) -> None:
         "evidence — never submit them as evidence entries. The output is strict JSON: double quotes only, no "
         "trailing commas, no Python literals such as 'x' inside an array. A PROVEN "
         "finding needs a concrete causal trace, affected surfaces, and verification. Return unresolved questions "
-        "as structured objects with question_kind=DECISION_REQUIRED, MATERIAL_UNREADABLE, or UNKNOWN; "
+        "as structured objects with question_kind=DECISION_REQUIRED, MATERIAL_UNREADABLE, or UNKNOWN. "
+        "Use DECISION_REQUIRED for a user/host capability, policy, or verification choice (for example, "
+        "whether a deployed host can expose streamed progress); use MATERIAL_UNREADABLE only when a "
+        "specific required file or context artifact cannot be read and --attach could supply it; use "
+        "UNKNOWN when you cannot establish which case applies. "
         "a blocking question may name USER as decision_owner, while a PLANNER-owned "
         "question must be resolved before delivery. Batch all residual user choices instead of asking serially. "
         "Trace symptoms to root cause where evidence permits; label hypotheses honestly. Rank first by scope gate, then "
