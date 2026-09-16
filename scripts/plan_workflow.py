@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import difflib
 import fcntl
 import functools
 import hashlib
@@ -383,8 +384,15 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$",
         required = schema.get("required", [])
         missing = [name for name in required if name not in value]
         if missing:
+            extras = sorted(set(value) - set(schema.get("properties", {})))
+            hints = []
+            for name in missing:
+                match = difflib.get_close_matches(name, extras, n=1, cutoff=0.6)
+                if match:
+                    hints.append(f"{name} (received similar field {match[0]!r})")
             raise WorkflowError(
-                f"provider result schema mismatch at {path}: missing {','.join(missing)}")
+                f"provider result schema mismatch at {path}: missing {','.join(hints or missing)}"
+                + (f"; unexpected {','.join(extras)}" if extras else ""))
         properties = schema.get("properties", {})
         if schema.get("additionalProperties") is False:
             extras = sorted(set(value) - set(properties))

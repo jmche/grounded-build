@@ -1465,6 +1465,17 @@ class PlanWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(module.WorkflowError, "unexpected causal_chain_note"):
             module.validate_json_schema({"a": "x", "causal_chain_note": "why"}, schema)
 
+    def test_schema_missing_field_reports_similar_typo_and_unexpected_fields(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_schema_diagnostics", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        schema = {"type": "object", "additionalProperties": False,
+                  "properties": {"alias_finding_ids": {"type": "array"}, "summary": {"type": "string"}},
+                  "required": ["alias_finding_ids", "summary"]}
+        with self.assertRaisesRegex(module.WorkflowError, "missing alias_finding_ids .*alias_finding_idse"):
+            module.validate_json_schema(
+                {"alias_finding_idse": [], "summary": "ok", "unexpected": True}, schema)
+
     def test_a_missing_slot_prefix_is_stamped_and_references_follow(self) -> None:
         """Which slot produced a payload is a fact the ENGINE holds.
 
