@@ -335,6 +335,18 @@ class PlanWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(module.WorkflowError, "--attach <path>"):
             module.validate_questions([question], set(), "investigation", allow_blocking_user=True)
 
+    def test_init_rejects_symlink_attachment_before_creating_a_run(self) -> None:
+        target = self.temp / "material.md"
+        target.write_text("material\n", encoding="utf-8")
+        link = self.temp / "material-link.md"
+        link.symlink_to(target)
+        result = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--attach", str(link), expect=2)
+        self.assertIn("symlink", result["error"])
+        state_root = Path(self.env["GROUNDED_BUILD_PLAN_HOME"])
+        self.assertFalse(list(state_root.rglob("workflow.json")))
+
     def get_state(self, initialized: dict) -> dict:
         return json.loads((Path(initialized["run_directory"]) / "workflow.json").read_text(encoding="utf-8"))
 

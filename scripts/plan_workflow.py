@@ -105,6 +105,8 @@ QUESTION_SCHEMA: dict[str, Any] = {
         "rationale": {"type": "string"},
         "options": {"type": "array", "items": {"type": "string"}},
         "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "question_kind": {"type": "string", "enum": [
+            "DECISION_REQUIRED", "MATERIAL_UNREADABLE", "UNKNOWN"]},
     },
     "required": ["id", "scope_id", "question", "decision_owner", "blocking",
                  "rationale", "options", "evidence_ids"],
@@ -3606,10 +3608,15 @@ def command_init(args: argparse.Namespace) -> None:
     request = Path(args.request).expanduser().resolve()
     if not request.is_file():
         raise WorkflowError(f"request file does not exist: {request}")
-    attachment_sources = [Path(raw).expanduser().resolve() for raw in (args.attach or [])]
-    for source in attachment_sources:
-        if source.is_symlink() or not source.is_file():
+    attachment_sources: list[Path] = []
+    for raw in args.attach or []:
+        source_input = Path(raw).expanduser()
+        if source_input.is_symlink():
+            raise WorkflowError(f"attachment must be a regular file, not a directory or symlink: {source_input}")
+        source = source_input.resolve()
+        if not source.is_file():
             raise WorkflowError(f"attachment must be a regular file, not a directory or symlink: {source}")
+        attachment_sources.append(source)
     runtime = agent_runtime(args)
     topology, frozen_peer, final_reviewer, selection_checks = resolve_verified_host_selection(
         args, project, runtime,
