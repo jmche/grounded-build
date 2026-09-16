@@ -447,7 +447,7 @@ def describe_unparseable(provider: str, source: str, exc: json.JSONDecodeError) 
     )
 
 
-def load_delivery_json(source: str) -> Any:
+def load_delivery_json(source: str, disclosures: list[dict[str, Any]] | None = None) -> Any:
     """Decode provider JSON, tolerating only raw control characters inside strings.
 
     Some adapters emit an otherwise unambiguous JSON object with a literal newline in a string.
@@ -459,6 +459,11 @@ def load_delivery_json(source: str) -> Any:
     except json.JSONDecodeError as exc:
         if exc.msg != "Invalid control character at":
             raise
+        if disclosures is not None:
+            disclosures.append({
+                "type": "RAW_CONTROL_CHARACTER_NORMALIZED",
+                "detail": "provider JSON contained a raw control character inside a string; strict=False parsing was used",
+            })
         return json.loads(source, strict=False)
 
 
@@ -895,6 +900,17 @@ def persist_invocation_state(
                 if identity not in known:
                     latest[field].append(item)
                     known.add(identity)
+        incoming_delivery = state.get("delivery_disclosures") or []
+        if incoming_delivery:
+            known_delivery = {
+                json.dumps(item, sort_keys=True)
+                for item in latest.setdefault("delivery_disclosures", [])
+            }
+            for item in incoming_delivery:
+                identity = json.dumps(item, sort_keys=True)
+                if identity not in known_delivery:
+                    latest["delivery_disclosures"].append(item)
+                    known_delivery.add(identity)
         incoming_fallbacks = state.get("automatic_fallbacks") or []
         known_fallbacks = {
             (item.get("trigger_assignment"), item.get("at"))
@@ -2620,7 +2636,9 @@ def agent_environment() -> dict[str, str]:
     return {key: os.environ[key] for key in allowed if key in os.environ}
 
 
-def extract_dsh_object(provider: str, source: str) -> dict[str, Any]:
+def extract_dsh_object(
+    provider: str, source: str, disclosures: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Parse the free-text final message of a dsh-headless run into its schema object.
 
     dsh has no structured-output flag (approach (a): prompt + host-side parse), so the final
@@ -2638,7 +2656,7 @@ def extract_dsh_object(provider: str, source: str) -> dict[str, Any]:
         candidates.append(text[start:end + 1])
     for candidate in candidates:
         try:
-            payload = load_delivery_json(candidate)
+            payload = load_delivery_json(candidate, disclosures)
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict):
@@ -2649,7 +2667,10 @@ def extract_dsh_object(provider: str, source: str) -> dict[str, Any]:
     )
 
 
-def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw: Path) -> dict[str, Any]:
+def extract_payload(
+    provider: str, result: subprocess.CompletedProcess[str], raw: Path,
+    disclosures: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     source = (
         raw.read_text(encoding="utf-8")
         if provider in {"codex", "other"} and raw.is_file()
@@ -2659,9 +2680,9 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
         raise NoFinalAnswer(f"{provider} ended its turn without a final message"
                             f"{no_answer_detail(result)}")
     if provider == "dsh":
-        return extract_dsh_object(provider, source)
+        return extract_dsh_object(provider, source, disclosures)
     try:
-        wrapper = load_delivery_json(source)
+        wrapper = load_delivery_json(source, disclosures)
     except json.JSONDecodeError as exc:
         raise NoFinalAnswer(describe_unparseable(provider, source, exc)) from exc
     if provider in {"codex", "other"}:
@@ -2683,7 +2704,7 @@ def extract_payload(provider: str, result: subprocess.CompletedProcess[str], raw
         payload = wrapper.get("structured_output")
         if not isinstance(payload, dict) and isinstance(wrapper.get("result"), str):
             try:
-                payload = load_delivery_json(wrapper["result"])
+                payload = load_delivery_json(wrapper["result"], disclosures)
             except json.JSONDecodeError as exc:
                 raise WorkflowError(f"claude result was not structured JSON: {exc}") from exc
     if not isinstance(payload, dict):
@@ -3045,7 +3066,11 @@ def invoke(
     try:
         if infrastructure_error:
             raise infrastructure_error
-        payload = extract_payload(provider, result, raw)
+        delivery_disclosures: list[dict[str, Any]] = []
+        payload = extract_payload(provider, result, raw, delivery_disclosures)
+        if delivery_disclosures:
+            state.setdefault("delivery_disclosures", []).extend(delivery_disclosures)
+            invocation_record["delivery_disclosures"] = delivery_disclosures
         # GB-4: keep what the model actually returned BEFORE any contract check. A rejected delivery
         # used to leave only stdout.log — the one case a diagnosis most needs was the one case with
         # no artifact.
@@ -4668,6 +4693,7 @@ def command_status(args: argparse.Namespace) -> None:
         # GB-3/3-d: the CAUSE of the last rejection travels with the state, so a controller sees why
         # an assignment failed instead of retrying it blindly.
         "delivery_faults": dict(state.get("delivery_faults") or {}),
+        "delivery_disclosures": list(state.get("delivery_disclosures") or []),
         # d2: an agent digest that disagreed with the file is DISCLOSED here rather than rejected.
         "evidence_digest_disclosures": list(state.get("evidence_digest_disclosures") or []),
         # Non-fatal wire-shape repairs: undefined fields ignored, ids stamped with their slot.

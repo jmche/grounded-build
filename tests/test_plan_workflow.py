@@ -338,7 +338,12 @@ class PlanWorkflowTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("gb_delivery_json_contract", SCRIPT)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self.assertEqual(module.load_delivery_json('{"summary":"line1\nline2"}') ["summary"], "line1\nline2")
+        disclosures = []
+        self.assertEqual(
+            module.load_delivery_json('{"summary":"line1\nline2"}', disclosures)["summary"],
+            "line1\nline2",
+        )
+        self.assertEqual(disclosures[0]["type"], "RAW_CONTROL_CHARACTER_NORMALIZED")
         with self.assertRaises(json.JSONDecodeError):
             module.load_delivery_json('{"summary":}')
 
