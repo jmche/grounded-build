@@ -122,8 +122,8 @@ Repository locators are baseline-relative file paths with an optional line range
 checked against the complete frozen file. Command and external-source digests remain producer receipts
 because replaying commands or network retrieval inside a deterministic validator would change authority.
 
-Residual questions are structured with scope id, decision owner, blocking flag, rationale, explicit
-options, and evidence ids. A blocking planner-owned question is invalid because the investigator still
+Residual questions are structured with scope id, decision owner, blocking flag, question kind, rationale,
+explicit options, and evidence ids. A blocking planner-owned question is invalid because the investigator still
 owns that work. Blocking user-owned questions stop before draft and are presented as one batch. Drafts
 and synthesis may carry only non-blocking residual uncertainty.
 

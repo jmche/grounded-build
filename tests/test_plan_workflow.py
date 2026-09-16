@@ -73,6 +73,7 @@ if "independent evidence investigator" in prompt:
         "question": "Should the adjacent capability enter the plan?", "decision_owner": "USER",
         "blocking": True, "rationale": "It changes the authorized objective",
         "options": ["authorize", "exclude"], "evidence_ids": [f"{slot}-E1"],
+        "question_kind": "DECISION_REQUIRED",
     }] if f"FAKE_BLOCKING_SCOPE_QUESTION={slot}" in request_text else [])
     payload = {
         "provider": provider, "slot": slot, "baseline_sha": sha, "scope_digest": scope_digest,
@@ -140,6 +141,7 @@ elif "independent reviewer and integrator slot" in prompt or "independent deep-p
             "id": f"{slot}-Q-deep", "scope_id": "TARGET-001", "question": "Choose compatibility policy",
             "decision_owner": "USER", "blocking": True, "rationale": "Product choice needed",
             "options": ["preserve", "replace"], "evidence_ids": [f"{slot}-E1"],
+            "question_kind": "DECISION_REQUIRED",
         }]
 else:
     slot = re.search(r"reviewer \(([ABF])\)", prompt).group(1)

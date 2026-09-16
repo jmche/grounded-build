@@ -109,7 +109,7 @@ QUESTION_SCHEMA: dict[str, Any] = {
             "DECISION_REQUIRED", "MATERIAL_UNREADABLE", "UNKNOWN"]},
     },
     "required": ["id", "scope_id", "question", "decision_owner", "blocking",
-                 "rationale", "options", "evidence_ids"],
+                 "rationale", "options", "evidence_ids", "question_kind"],
 }
 
 EVIDENCE_ITEM_SCHEMA: dict[str, Any] = {
@@ -3820,7 +3820,8 @@ def command_investigate(args: argparse.Namespace) -> None:
         "evidence — never submit them as evidence entries. The output is strict JSON: double quotes only, no "
         "trailing commas, no Python literals such as 'x' inside an array. A PROVEN "
         "finding needs a concrete causal trace, affected surfaces, and verification. Return unresolved questions "
-        "as structured objects; a blocking question may name USER as decision_owner, while a PLANNER-owned "
+        "as structured objects with question_kind=DECISION_REQUIRED, MATERIAL_UNREADABLE, or UNKNOWN; "
+        "a blocking question may name USER as decision_owner, while a PLANNER-owned "
         "question must be resolved before delivery. Batch all residual user choices instead of asking serially. "
         "Trace symptoms to root cause where evidence permits; label hypotheses honestly. Rank first by scope gate, then "
         "user priority, severity, urgency, dependency/blocking effect, causal leverage, evidence strength, and effort. "

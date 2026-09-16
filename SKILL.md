@@ -196,7 +196,7 @@ discoveries go into structured `new_evidence`; unrecorded observations cannot be
 evidence-backed aliases for semantically duplicate `F-*` observations, but uncertain equivalence remains separate.
 Evidence receipts use non-empty claims and locators, a lowercase SHA-256 digest, and the frozen baseline
 as `version_or_commit` for repository and command evidence. Residual questions are structured and identify
-their scope, decision owner, blocking effect, options, rationale, and evidence. Blocking user questions are
+their scope, decision owner, blocking effect, question kind, options, rationale, and evidence. Blocking user questions are
 batched after both investigations and stop before drafting; blocking planner-owned questions are invalid.
 Every integrated draft declares `plan_scope_ids` and disposes the complete frozen finding ledger exactly once.
 
