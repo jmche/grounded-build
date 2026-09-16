@@ -86,6 +86,10 @@ review. Target movement is integration divergence, not execution staleness.
 - Do not use `git reset --hard`, `git clean`, automatic stash, silent rebase, or automatic conflict resolution.
 - Do not delete worktree directories directly; use the script's cleanup operation.
 - Continue fixed-baseline execution if the target advances. Previously issued review approvals do not authorize the combined code; use reviewed reconciliation before integration.
+- If a skill update changes the frozen engine files, Implement rejects ordinary commands until the
+  operator runs `migrate-engine --reason <reason> --actor <actor>` (preview first, then `--apply`).
+  Migration refuses active invocations, preserves frozen artifacts, and marks any current-SHA PASS
+  for one fresh review under the new engine before acceptance.
 - The ordinary cap is four valid review rounds per batch: one full discovery review and three bounded re-reviews. Reviewer infrastructure errors do not consume a round. Three separately audited exceptions may each add at most one ordinary round: a convergence-boundary grant, a review-budget grant, and a new-commit re-review after an effective PASS. A nonterminal typed decision applied only after those available rounds are exhausted authorizes one terminal closeout review bound to that decision, batch, and exact SHA. Thus the absolute non-legacy maximum is eight. Infrastructure or malformed output does not consume the closeout; one valid non-PASS result does, and cannot open another repair cycle.
 - Count every real reviewer invocation separately from valid quality rounds. Infrastructure failures consume invocation budget and remain auditable even though they do not consume repair budget.
 - Treat `plan/original.md` and `plan/batches.md` with their recorded digests as the run authority. The manifest defines this run's total included/excluded scope and batch mapping. A later edit or move of either source is informational; a changed snapshot is corruption.

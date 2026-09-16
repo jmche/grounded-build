@@ -385,6 +385,18 @@ def validate_controller_runtime(state: dict[str, Any]) -> None:
             "resume with the frozen installed skill or explicitly supersede the run")
 
 
+def engine_drift(state: dict[str, Any]) -> dict[str, Any] | None:
+    recorded = state.get("controller_runtime")
+    if not isinstance(recorded, dict):
+        return None
+    current = controller_runtime()
+    changed = [
+        key for key in ("implementation", "version", "resolved_executable", "engine_files")
+        if recorded.get(key) != current.get(key)
+    ]
+    return {"changed": changed, "recorded": recorded, "current": current} if changed else None
+
+
 def project_runtime_payload(project: Path) -> dict[str, Any]:
     """Report, but never provision, the project's optional verification environment."""
     launcher = project / ".venv" / "bin" / "python"
@@ -4256,9 +4268,15 @@ def command_review(args: argparse.Namespace) -> None:
         base = str((state.get("integration") or {}).get("approved_target_sha") or base)
     if head == base:
         raise WorkflowError(f"batch {args.batch!r} has no committed changes relative to its base")
+    engine_revalidation = state.get("engine_revalidation") or {}
+    revalidating_engine = bool(
+        engine_revalidation.get("required")
+        and engine_revalidation.get("batch") == args.batch
+        and engine_revalidation.get("reviewed_sha") == head
+    )
     if prior and prior[-1]["verdict"] == "FAIL" and prior[-1]["reviewed_sha"] == head:
         raise WorkflowError("review requested changes but implementation HEAD has no new fix commit")
-    if prior and prior[-1]["verdict"] == "PASS" and prior[-1]["reviewed_sha"] == head:
+    if prior and prior[-1]["verdict"] == "PASS" and prior[-1]["reviewed_sha"] == head and not revalidating_engine:
         raise WorkflowError(
             f"{head[:12]} already holds a PASS review; run accept for batch {args.batch!r} "
             "instead of paying for another review"
@@ -4646,6 +4664,12 @@ def command_review(args: argparse.Namespace) -> None:
         "FAIL": "CHANGES_REQUESTED",
         "NEEDS_USER_DECISION": "NEEDS_USER_DECISION",
     }[policy["effective_verdict"]]
+    if revalidating_engine:
+        state["engine_revalidation"] = None
+        append_event(state, "ENGINE_REVALIDATION_COMPLETED", {
+            "batch": args.batch, "reviewed_sha": head,
+            "effective_verdict": policy["effective_verdict"],
+        })
     if policy["effective_verdict"] == "NEEDS_USER_DECISION":
         if closeout_review:
             allowed = ["SUPERSEDE_RUN", "ABORT_RUN"]
@@ -4733,6 +4757,8 @@ def command_accept(args: argparse.Namespace) -> None:
     validate_active_state(project, state)
     if state.get("status") != "AWAITING_ACCEPTANCE":
         raise WorkflowError(f"accept is not allowed from workflow status {state.get('status')}")
+    if state.get("engine_revalidation"):
+        raise WorkflowError("accept is blocked until the current-SHA review is revalidated after engine migration")
     validate_plan_unchanged(state)
     require_target_unchanged(project, state)
     implementation = validate_implementation(state)
@@ -5015,6 +5041,7 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
             for key in ("implementation", "version", "resolved_executable")
         )
     )
+    recorded_engine = engine_drift(state)
     stale = not state["finalized"] and target_sha != state["baseline_sha"]
     implementation = Path(state["implementation_worktree"])
     implementation_head = git(implementation, "rev-parse", "HEAD") if implementation.is_dir() else None
@@ -5076,6 +5103,8 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "controller_runtime": recorded_controller,
         "current_controller_runtime": current_controller,
         "controller_runtime_drift": controller_drift,
+        "engine_drift": recorded_engine,
+        "engine_revalidation": state.get("engine_revalidation"),
         "project_runtime_at_start": state.get("project_runtime_at_start"),
         "environment": environment_status(project, state),
         "review_contract": state.get("review_contract"),
@@ -5301,6 +5330,75 @@ def command_migrate(args: argparse.Namespace) -> None:
         "backup_reused": backup_reused,
         "pending_decision_repair": decision_repair,
     })
+
+
+def active_engine_invocations(state: dict[str, Any]) -> list[str]:
+    active: list[str] = []
+    for collection_name in ("review_invocations", "contract_review_invocations", "verification_attempts"):
+        for item in state.get(collection_name, []):
+            if isinstance(item, dict) and item.get("status") in {"STARTED", "RUNNING"}:
+                active.append(str(item.get("invocation_id") or item.get("attempt_id") or collection_name))
+    return active
+
+
+def command_migrate_engine(args: argparse.Namespace) -> None:
+    project = resolve_project(args.project)
+    state = load_state(project, args.run_id)
+    if state["status"] in TERMINAL_STATUSES:
+        raise WorkflowError(f"engine migration is not allowed from terminal status {state['status']}")
+    drift = engine_drift(state)
+    if not drift:
+        emit({"status": "ENGINE_CURRENT", "run_id": state["run_id"],
+              "controller_runtime": state.get("controller_runtime")})
+    active = active_engine_invocations(state)
+    if active:
+        raise WorkflowError(
+            "engine migration is refused while invocations are active: " + ",".join(sorted(active)))
+    preview = {
+        "status": "ENGINE_MIGRATION_PREVIEW", "run_id": state["run_id"],
+        "from": drift["recorded"], "to": drift["current"],
+        "changed": drift["changed"], "reason": args.reason, "actor": args.actor,
+        "warning": (
+            "Prior artifacts and reviews remain frozen. Any PASS for the current implementation "
+            "SHA is revalidated under the migrated engine before acceptance."
+        ),
+    }
+    if not args.apply:
+        emit(preview)
+    decisions = Path(state["run_directory"]) / "decisions"
+    secure_directory(decisions)
+    path = decisions / f"engine_migration_{len(list(decisions.glob('engine_migration_*.json'))) + 1:03d}.json"
+    applied_at = utc_now()
+    atomic_json(path, {**preview, "applied_at": applied_at})
+    previous_status = state["status"]
+    current_batch_id = current_batch(state)
+    implementation = Path(state["implementation_worktree"])
+    head = git(implementation, "rev-parse", "HEAD") if implementation.is_dir() else None
+    latest = state.get("reviews", [])[-1] if state.get("reviews") else None
+    revalidation = None
+    if (
+        isinstance(latest, dict) and latest.get("verdict") == "PASS"
+        and latest.get("reviewed_sha") == head and current_batch_id == latest.get("batch")
+    ):
+        revalidation = {
+            "batch": current_batch_id, "reviewed_sha": head,
+            "migration_path": str(path), "required": True,
+        }
+        state["status"] = "IMPLEMENTING"
+    state["controller_runtime"] = drift["current"]
+    state["engine_epoch"] = int(state.get("engine_epoch", 0)) + 1
+    state.setdefault("engine_migration_history", []).append({
+        **preview, "applied_at": applied_at, "decision_path": str(path),
+    })
+    state["engine_revalidation"] = revalidation
+    append_event(state, "ENGINE_MIGRATED", {
+        "decision_path": str(path), "changed": drift["changed"],
+        "previous_status": previous_status, "revalidation": revalidation,
+    })
+    save_state(state)
+    emit({"status": state["status"], "run_id": state["run_id"],
+          "engine_epoch": state["engine_epoch"], "decision_record": str(path),
+          "revalidation": revalidation})
 
 
 def write_final_report(state: dict[str, Any], integrated: bool) -> Path:
@@ -6194,6 +6292,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_argument(migrate)
     migrate.add_argument("--apply", action="store_true")
     migrate.set_defaults(func=command_migrate)
+
+    migrate_engine = commands.add_parser(
+        "migrate-engine", help="preview or apply an audited engine migration for an active run",
+    )
+    add_project_argument(migrate_engine)
+    add_run_argument(migrate_engine)
+    migrate_engine.add_argument("--reason", required=True)
+    migrate_engine.add_argument("--actor", required=True)
+    migrate_engine.add_argument("--apply", action="store_true")
+    migrate_engine.set_defaults(func=command_migrate_engine)
 
     finalize = commands.add_parser("finalize", help="preview or apply fast-forward integration")
     add_project_argument(finalize)

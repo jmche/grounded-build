@@ -2,6 +2,12 @@
 
 All notable changes use semantic versioning.
 
+## [0.7.6] - 2026-09-16
+
+- Added audited Implement `migrate-engine` recovery for post-update engine drift. Active
+  invocations are refused, frozen artifacts remain intact, and current-SHA PASS results require
+  fresh review under the migrated engine before acceptance.
+
 ## [0.7.5] - 2026-09-16
 
 - Reduced Implement reviewer delivery to a small lifecycle envelope. Optional semantic finding

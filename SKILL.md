@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.7.5
+  version: 0.7.6
   compatibility: Linux, Git, Python 3.11+, bubblewrap and socat (both sandbox packages; the provider CLI sandbox is fail-closed), and at least one Claude, Codex, dsh, or protocol-compatible other CLI adapter
 ---
 
@@ -165,6 +165,10 @@ If a later skill update causes an engine-drift rejection, never bypass it by edi
 approval for `migrate-engine --reason <reason> --actor <actor> --apply`; this preserves the old and new identities.
 If an interrupted controller leaves one assignment marked `RUNNING`, preview and explicitly apply
 `recover-invocation` for that assignment before retrying or migrating. Its spent attempt remains charged.
+For an Implement run that reports engine drift after a skill update, use `migrate-engine --reason
+<reason> --actor <actor>` preview-first, then `--apply`; do not edit workflow state or silently
+resume under a different engine. Migration preserves prior artifacts and requires revalidation of
+any current-SHA PASS before acceptance.
 
 ### 3. Follow the deterministic next action
 

@@ -283,6 +283,23 @@ class WorkflowIntegrationTests(unittest.TestCase):
         event_path.write_text(json.dumps(event), encoding="utf-8")
         state_path.write_text(json.dumps(state), encoding="utf-8")
 
+    def reseal_state_checkpoint(self, state_path: Path, state: dict[str, object]) -> None:
+        events = state["events"]
+        assert isinstance(events, list) and events
+        reference = events[-1]
+        assert isinstance(reference, dict)
+        event_path = Path(str(reference["path"]))
+        event = json.loads(event_path.read_text(encoding="utf-8"))
+        event["details"]["state_digest"] = WORKFLOW_MODULE.state_authority_digest(state)
+        event.pop("event_hash", None)
+        event_hash = WORKFLOW_MODULE.sha256_bytes(
+            json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        )
+        event["event_hash"] = event_hash
+        reference["event_hash"] = event_hash
+        event_path.write_text(json.dumps(event), encoding="utf-8")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
     def test_preflight_and_init_record_controller_and_project_runtime(self) -> None:
         preflight = self.workflow(
             "preflight", "--project", str(self.project), "--target-branch", "main"
@@ -316,6 +333,55 @@ class WorkflowIntegrationTests(unittest.TestCase):
         ):
             WORKFLOW_MODULE.validate_controller_runtime({"controller_runtime": changed})
         WORKFLOW_MODULE.validate_controller_runtime({})
+
+    def test_engine_migration_is_preview_first_and_restores_an_active_run(self) -> None:
+        initialized = self.initialize("codex")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["controller_runtime"]["engine_files"]["workflow.py"] = "old-engine"
+        self.reseal_state_checkpoint(state_path, state)
+        preview = self.workflow(
+            "migrate-engine", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--reason", "apply reviewed skill update", "--actor", "test",
+        )
+        self.assertEqual(preview["status"], "ENGINE_MIGRATION_PREVIEW")
+        applied = self.workflow(
+            "migrate-engine", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--reason", "apply reviewed skill update", "--actor", "test", "--apply",
+        )
+        self.assertEqual(applied["status"], "IMPLEMENTING")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertIsNone(status["engine_drift"])
+
+    def test_engine_migration_revalidates_a_current_sha_pass_before_acceptance(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        first = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        )
+        self.assertEqual(first["status"], "REVIEW_PASS")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["controller_runtime"]["engine_files"]["workflow.py"] = "old-engine"
+        self.reseal_state_checkpoint(state_path, state)
+        migrated = self.workflow(
+            "migrate-engine", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--reason", "revalidate current pass", "--actor", "test", "--apply",
+        )
+        self.assertTrue(migrated["revalidation"]["required"])
+        second = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        )
+        self.assertEqual(second["status"], "REVIEW_PASS")
+        status = self.workflow(
+            "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertIsNone(status["engine_revalidation"])
 
     def commit_batch_change(self, implementation: Path, content: str = "implemented\n") -> str:
         (implementation / "tracked.txt").write_text(content, encoding="utf-8")
