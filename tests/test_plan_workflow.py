@@ -394,6 +394,20 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(payload["candidate_synthesis_manifest_sha256"], "e" * 64)
         self.assertGreaterEqual(len(disclosures), 7)
 
+    def test_machine_identity_fields_are_not_model_required(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_machine_fields", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for schema, fields in (
+            (module.INVESTIGATION_SCHEMA, {"provider", "slot", "baseline_sha", "scope_digest"}),
+            (module.DRAFT_SCHEMA, {"provider", "slot", "baseline_sha", "scope_digest"}),
+            (module.INTEGRATION_SCHEMA, {"provider", "slot", "reviewer_slot", "target", "round", "baseline_sha", "scope_digest"}),
+            (module.REVIEW_SCHEMA, {"provider", "reviewer_slot", "target", "baseline_sha", "scope_digest",
+                                    "candidate_plan_sha256", "candidate_batch_manifest_sha256",
+                                    "candidate_synthesis_manifest_sha256"}),
+        ):
+            self.assertTrue(fields.isdisjoint(set(schema["required"])))
+
     def test_material_unreadable_question_reports_attachment_recovery(self) -> None:
         spec = importlib.util.spec_from_file_location("gb_attachment_contract", SCRIPT)
         module = importlib.util.module_from_spec(spec)

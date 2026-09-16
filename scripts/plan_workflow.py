@@ -167,8 +167,9 @@ INVESTIGATION_SCHEMA: dict[str, Any] = {
         "findings": {"type": "array", "items": FINDING_SCHEMA},
         "unresolved_questions": {"type": "array", "items": QUESTION_SCHEMA},
     },
-    "required": ["provider", "slot", "baseline_sha", "scope_digest", "summary", "evidence",
-                 "findings", "unresolved_questions"],
+    # Provider, slot, baseline, and scope are invocation facts.  The engine binds them before
+    # validation; requiring the producer to echo them only creates avoidable wire failures.
+    "required": ["summary", "evidence", "findings", "unresolved_questions"],
 }
 
 
@@ -203,7 +204,7 @@ DRAFT_SCHEMA: dict[str, Any] = {
         "unresolved_questions": {"type": "array", "items": QUESTION_SCHEMA},
     },
     "required": [
-        "provider", "slot", "baseline_sha", "scope_digest", "evidence_ids", "new_evidence", "plan_scope_ids", "summary", "repository_facts",
+        "evidence_ids", "new_evidence", "plan_scope_ids", "summary", "repository_facts",
         "plan_markdown", "unresolved_questions",
     ],
 }
@@ -246,8 +247,7 @@ INTEGRATION_SCHEMA: dict[str, Any] = {
         }},
         "unresolved_questions": {"type": "array", "items": QUESTION_SCHEMA},
     },
-    "required": ["provider", "slot", "reviewer_slot", "target", "round", "baseline_sha", "scope_digest", "summary",
-                 "plan_markdown", "plan_scope_ids", "accepted_finding_ids", "rejected_finding_ids",
+    "required": ["summary", "plan_markdown", "plan_scope_ids", "accepted_finding_ids", "rejected_finding_ids",
                  "new_findings", "finding_aliases", "verdict", "findings", "unresolved_questions"],
 }
 
@@ -292,9 +292,7 @@ REVIEW_SCHEMA: dict[str, Any] = {
             },
         },
     },
-    "required": ["provider", "reviewer_slot", "target", "baseline_sha", "scope_digest",
-                 "candidate_plan_sha256", "candidate_batch_manifest_sha256",
-                 "candidate_synthesis_manifest_sha256", "verdict",
+    "required": ["verdict",
                  "summary", "criteria", "blocking_finding_ids_checked", "findings"],
 }
 
@@ -2847,7 +2845,10 @@ DELIVERY_CONTRACT = (
     "The object must also be COMPLETE. One cut off mid-string is discarded whole, so a long "
     "`evidence` string can cost you every finding after it. Keep each field to the shortest text "
     "that still identifies the thing — a path and a line number rather than a quoted passage. "
-    "Do NOT drop findings to save room: fewer words per finding, never fewer findings."
+    "Do NOT drop findings to save room: fewer words per finding, never fewer findings. "
+    "Invocation identity fields (provider, slot, reviewer_slot, target, round, baseline_sha, "
+    "scope_digest, and candidate digests) are engine-owned facts; if omitted, the engine supplies "
+    "them from the frozen run. Spend output on semantic evidence and judgement instead."
 )
 
 
@@ -3246,7 +3247,7 @@ def invoke(
 
 def validate_draft(payload: dict[str, Any], state: dict[str, Any], slot: str) -> None:
     required = set(DRAFT_SCHEMA["required"])
-    if set(payload) != required:
+    if not required.issubset(payload):
         raise WorkflowError("draft output fields do not match the contract")
     if payload["provider"] != assignment_provider(state, f"draft-{slot}", state["planners"][slot]) \
             or payload["slot"] != slot:
@@ -3284,7 +3285,7 @@ def validate_draft(payload: dict[str, Any], state: dict[str, Any], slot: str) ->
 
 
 def validate_investigation(payload: dict[str, Any], state: dict[str, Any], slot: str) -> None:
-    if set(payload) != set(INVESTIGATION_SCHEMA["required"]):
+    if not set(INVESTIGATION_SCHEMA["required"]).issubset(payload):
         raise WorkflowError("investigation output fields do not match the contract")
     provider = assignment_provider(state, f"investigate-{slot}", state["planners"][slot])
     if payload["provider"] != provider or payload["slot"] != slot:
@@ -3310,7 +3311,7 @@ def validate_integration(
     payload: dict[str, Any], state: dict[str, Any], slot: str, round_number: int,
     finding_keys: list[str] | None = None,
 ) -> None:
-    if set(payload) != set(INTEGRATION_SCHEMA["required"]):
+    if not set(INTEGRATION_SCHEMA["required"]).issubset(payload):
         raise WorkflowError("integrated draft fields do not match the contract")
     assignment = f"cross-{slot}" if round_number == 2 else f"diverge-{slot}"
     provider = assignment_provider(state, assignment, state["planners"][slot])
@@ -3399,7 +3400,7 @@ def integration_schema(
 def validate_review(
     payload: dict[str, Any], state: dict[str, Any], provider: str, slot: str, target: str,
 ) -> None:
-    if set(payload) != set(REVIEW_SCHEMA["required"]):
+    if not set(REVIEW_SCHEMA["required"]).issubset(payload):
         raise WorkflowError("review output fields do not match the contract")
     if payload["provider"] != provider or payload["reviewer_slot"] != slot:
         raise WorkflowError("review identity mismatch")
