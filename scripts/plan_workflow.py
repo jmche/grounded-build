@@ -2923,6 +2923,18 @@ def bind_machine_identity(
         })
     elif assignment.startswith("diverge-"):
         expected.update({"reviewer_slot": slot, "target": "draft-02-both", "round": 3})
+    elif assignment.startswith("convergence-1-") or assignment.startswith("final-"):
+        # Review receipts are semantic judgments, but their routing and candidate digests are
+        # machine facts owned by the engine.  Do not spend model budget asking the producer to
+        # reproduce values that are already present in the candidate record.
+        candidate = state.get("candidate") or {}
+        expected.update({
+            "reviewer_slot": slot,
+            "target": f"candidate-round-{candidate.get('round')}",
+            "candidate_plan_sha256": candidate.get("plan_sha256"),
+            "candidate_batch_manifest_sha256": candidate.get("batch_manifest_sha256"),
+            "candidate_synthesis_manifest_sha256": candidate.get("synthesis_manifest_sha256"),
+        })
     disclosures: list[dict[str, Any]] = []
     for field, value in expected.items():
         if field not in properties:

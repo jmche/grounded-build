@@ -359,6 +359,41 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertNotIn("accepted_finding_ids", payload)
         self.assertTrue(any("new_evidence" in item for item in disclosures))
 
+    def test_review_identity_is_bound_from_candidate_state(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_review_identity", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        state = {
+            "baseline_sha": "a" * 40,
+            "scope_digest": "b" * 64,
+            "candidate": {
+                "round": 3,
+                "plan_sha256": "c" * 64,
+                "batch_manifest_sha256": "d" * 64,
+                "synthesis_manifest_sha256": "e" * 64,
+            },
+        }
+        payload = {
+            "provider": "dsh", "reviewer_slot": "B", "target": "wrong",
+            "baseline_sha": "f" * 40, "scope_digest": "wrong",
+            "candidate_plan_sha256": "wrong", "candidate_batch_manifest_sha256": "wrong",
+            "candidate_synthesis_manifest_sha256": "wrong",
+        }
+        schema = {"properties": {
+            "provider": {}, "reviewer_slot": {}, "target": {}, "baseline_sha": {},
+            "scope_digest": {}, "candidate_plan_sha256": {},
+            "candidate_batch_manifest_sha256": {}, "candidate_synthesis_manifest_sha256": {},
+        }}
+        disclosures = module.bind_machine_identity(
+            payload, state, "final-3-A", "codex", "A", schema)
+        self.assertEqual(payload["provider"], "codex")
+        self.assertEqual(payload["reviewer_slot"], "A")
+        self.assertEqual(payload["target"], "candidate-round-3")
+        self.assertEqual(payload["candidate_plan_sha256"], "c" * 64)
+        self.assertEqual(payload["candidate_batch_manifest_sha256"], "d" * 64)
+        self.assertEqual(payload["candidate_synthesis_manifest_sha256"], "e" * 64)
+        self.assertGreaterEqual(len(disclosures), 7)
+
     def test_material_unreadable_question_reports_attachment_recovery(self) -> None:
         spec = importlib.util.spec_from_file_location("gb_attachment_contract", SCRIPT)
         module = importlib.util.module_from_spec(spec)
