@@ -3098,6 +3098,15 @@ def invoke(
         if delivery_disclosures:
             state.setdefault("delivery_disclosures", []).extend(delivery_disclosures)
             invocation_record["delivery_disclosures"] = delivery_disclosures
+        # Preserve long semantic content before any schema/semantic validator can reject the
+        # envelope. This artifact is advisory until the stage contract passes, but it prevents a
+        # mechanically malformed receipt from destroying an otherwise useful plan or review.
+        semantic_text = payload.get("plan_markdown")
+        if isinstance(semantic_text, str) and semantic_text.strip():
+            semantic_artifact = root / "semantic-artifact.md"
+            semantic_artifact.write_text(semantic_text.rstrip() + "\n", encoding="utf-8")
+            record_artifact(state, f"{artifact_prefix}-semantic", semantic_artifact)
+            invocation_record["semantic_artifact"] = str(semantic_artifact)
         # GB-4: keep what the model actually returned BEFORE any contract check. A rejected delivery
         # used to leave only stdout.log — the one case a diagnosis most needs was the one case with
         # no artifact.
