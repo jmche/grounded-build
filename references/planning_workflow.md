@@ -116,10 +116,13 @@ content digest, and supported claim. Search snippets are discovery aids only.
 
 Evidence receipt fields are consequential. Claims, locators, retrieval/version bindings, and digests are
 non-empty; digests are lowercase SHA-256 values; repository and command evidence bind
-`version_or_commit` to the frozen baseline. These checks establish traceability, not semantic truth—the
+`version_or_commit` to the frozen baseline; attachment evidence uses the exact manifest `context_name` as
+its locator and binds `version_or_commit` and `content_sha256` to that frozen attachment's SHA-256. These
+checks establish traceability, not semantic truth—the
 authorized reviewer still judges whether the evidence supports the claim.
 Repository locators are baseline-relative file paths with an optional line range, and their digest is
-checked against the complete frozen file. Command and external-source digests remain producer receipts
+checked against the complete frozen file. Attachment locators come from `attachments.json`, not host paths.
+Command and external-source digests remain producer receipts
 because replaying commands or network retrieval inside a deterministic validator would change authority.
 
 Residual questions are structured with scope id, decision owner, blocking flag, question kind, rationale,

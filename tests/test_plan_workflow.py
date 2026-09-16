@@ -352,6 +352,30 @@ class PlanWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(module.WorkflowError, "host capability.*DECISION_REQUIRED"):
             module.validate_questions([question], set(), "investigation", allow_blocking_user=True)
 
+    def test_attachment_evidence_binds_to_manifest_bytes(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_attachment_evidence", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        material = self.temp / "ledger.json"
+        material.write_text('{"finding":"C9"}\n', encoding="utf-8")
+        digest = hashlib.sha256(material.read_bytes()).hexdigest()
+        state = {
+            "baseline_sha": "a" * 40, "worktree": str(self.temp),
+            "attachments": [{"context_name": "attachments/001-ledger.json",
+                             "path": str(material), "sha256": digest}],
+        }
+        item = {"id": "A-NE1", "scope_id": "TARGET-001", "claim": "ledger claim",
+                "status": "VERIFIED", "source_type": "ATTACHMENT",
+                "locator": "attachments/001-ledger.json:1-2",
+                "retrieved_at": "2026-01-01T00:00:00Z", "version_or_commit": digest,
+                "content_sha256": ""}
+        module.validate_evidence_items([item], state, "draft new_evidence")
+        self.assertEqual(item["content_sha256"], digest)
+
+        bad = dict(item, id="A-NE2", locator="attachments/missing.json")
+        with self.assertRaisesRegex(module.WorkflowError, "attachments.json"):
+            module.validate_evidence_items([bad], state, "draft new_evidence")
+
     def test_init_rejects_symlink_attachment_before_creating_a_run(self) -> None:
         target = self.temp / "material.md"
         target.write_text("material\n", encoding="utf-8")
@@ -1450,6 +1474,22 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("PROVEN is NOT one of them", text)
         for value in ("STRONGLY_INFERRED", "WEAKLY_INFERRED", "REFUTED", "STOP_THE_LINE", "U0", "P2"):
             self.assertIn(value, text)
+
+    def test_draft_prompt_binds_new_evidence_to_frozen_baseline(self) -> None:
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude")
+        for slot in ("A", "B"):
+            self.call("investigate", "--project", str(self.project), "--run-id", initialized["run_id"],
+                      "--slot", slot)
+        self.call("draft", "--project", str(self.project), "--run-id", initialized["run_id"],
+                  "--slot", "A")
+        state = self.get_state(initialized)
+        prompts = sorted(Path(state["run_directory"]).glob("invocations/draft-A/*/prompt.md"))
+        self.assertTrue(prompts, "no rendered draft prompt to inspect")
+        text = prompts[-1].read_text(encoding="utf-8")
+        self.assertIn("Every new_evidence item follows the complete evidence receipt contract", text)
+        self.assertIn(f"version_or_commit to the exact frozen baseline SHA {state['baseline_sha']}", text)
 
     def test_a_wrong_agent_digest_is_disclosed_instead_of_rejecting_the_delivery(self) -> None:
         """d2: the digest is a machine fact, so the engine owns it.

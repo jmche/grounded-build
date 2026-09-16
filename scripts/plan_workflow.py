@@ -123,7 +123,7 @@ EVIDENCE_ITEM_SCHEMA: dict[str, Any] = {
         "claim": {"type": "string"},
         "status": {"type": "string", "enum": EVIDENCE_STATUSES},
         "source_type": {"type": "string", "enum": [
-            "REPOSITORY", "COMMAND", "OFFICIAL_DOCS", "OFFICIAL_GITHUB"]},
+            "REPOSITORY", "COMMAND", "ATTACHMENT", "OFFICIAL_DOCS", "OFFICIAL_GITHUB"]},
         "locator": {"type": "string"}, "retrieved_at": {"type": "string"},
         "version_or_commit": {"type": "string"}, "content_sha256": {"type": "string"},
     },
@@ -1194,6 +1194,18 @@ def resolve_locator_files(worktree: Path, locator: Any) -> list[tuple[str, Path]
     return found
 
 
+def attachment_for_locator(state: dict[str, Any], locator: Any) -> dict[str, Any] | None:
+    """Resolve an attachment locator through the frozen manifest, never through host paths."""
+    value = str(locator or "").strip().strip("`'\"")
+    value = re.sub(r":\d+(?:-\d+)?\s*$", "", value).strip()
+    if value.startswith("context/"):
+        value = value[len("context/"):]
+    for item in state.get("attachments", []):
+        if value == item.get("context_name"):
+            return item
+    return None
+
+
 def normalize_slot_prefixed_ids(payload: dict[str, Any], slot: str,
                                 state: dict[str, Any] | None = None) -> dict[str, str]:
     """Give this payload's ids the slot prefix they need, in one pass, and say so.
@@ -1284,7 +1296,31 @@ def validate_evidence_items(
         if item["source_type"] in {"REPOSITORY", "COMMAND"} and item["version_or_commit"] != baseline:
             problems.append(f"{evidence_id!r}: version_or_commit must be the baseline SHA {baseline}")
             continue
-        if item["source_type"] == "REPOSITORY":
+        if item["source_type"] == "ATTACHMENT":
+            attachment = attachment_for_locator(state, item["locator"])
+            if attachment is None:
+                problems.append(
+                    f"{evidence_id!r}: attachment locator {item['locator']!r} is not listed in "
+                    "attachments.json (use the manifest context_name)")
+                continue
+            expected = str(attachment["sha256"])
+            if item["version_or_commit"] != expected:
+                problems.append(
+                    f"{evidence_id!r}: ATTACHMENT version_or_commit must be the attachment SHA {expected}")
+                continue
+            computed = sha256_file(Path(attachment["path"]))
+            if not claimed_digest:
+                item["content_sha256"] = computed
+            elif claimed_digest != computed:
+                state.setdefault("evidence_digest_disclosures", []).append({
+                    "evidence_id": evidence_id, "path": attachment["context_name"],
+                    "claimed": claimed_digest, "engine_digest": computed,
+                    "detail": "the attachment digest the agent supplied differs; the frozen manifest bytes win",
+                })
+                item["content_sha256"] = computed
+            else:
+                item["content_sha256"] = computed
+        elif item["source_type"] == "REPOSITORY":
             worktree = Path(state["worktree"]).resolve()
             resolved_files = resolve_locator_files(worktree, item["locator"])
             if not resolved_files:
@@ -3818,7 +3854,9 @@ def command_investigate(args: argparse.Namespace) -> None:
         "(NNN is at least three digits; a bare class name is invalid). "
         "anything outside the frozen objective is OUT_OF_SCOPE or a PROPOSED_EXTENSION and must not enter the plan. "
         "Evidence fields are receipts, not labels: use non-empty claims and locators, a 64-character lowercase "
-        "content digest, and bind repository/command evidence version_or_commit to the baseline SHA. For repository "
+        "content digest, and bind repository/command evidence version_or_commit to the baseline SHA. For an "
+        "ATTACHMENT, use the exact context_name from attachments.json as locator and copy that attachment's sha256 "
+        "into version_or_commit; the engine binds content_sha256 to the frozen attachment bytes. For repository "
         "evidence, the locator is EXACTLY one worktree-relative file path, optionally followed by :start-end — no "
         "prose, no parenthetical notes and no ';'-joined list of files: give each file its own entry and keep "
         "descriptions in the claim. The digest is for the complete baseline file. The files in your context directory "
@@ -3880,7 +3918,13 @@ def command_draft(args: argparse.Namespace) -> None:
         "You cannot see the other planner's work. "
         "Re-check repository facts before planning. If that check discovers evidence absent from investigation.json, "
         "record it in new_evidence with a valid suffixed scope id and cite it from evidence_ids; never cite an unrecorded "
-        "observation. Read any typed decisions supplied in the context. Use evidence ids and preserve uncertainty. "
+        "observation. Every new_evidence item follows the complete evidence receipt contract: for source_type "
+        "REPOSITORY or COMMAND, set version_or_commit to the exact frozen baseline SHA {sha} (never HEAD, a "
+        "working-tree commit, or a model/current-date value); the engine verifies the bytes against that baseline. "
+        "For source_type ATTACHMENT, use the exact context_name from attachments.json as locator and copy that "
+        "attachment's sha256 into version_or_commit; do not cite context/attachments as a repository path. "
+        "Use the same locator, retrieval timestamp, and complete-file SHA-256 rules as investigation evidence. "
+        "Read any typed decisions supplied in the context. Use evidence ids and preserve uncertainty. "
         "Declare plan_scope_ids; OUT_OF_SCOPE is forbidden and PROPOSED_EXTENSION is allowed only when the state "
         "records explicit user authorization. No blocking unresolved question may remain in a draft. Produce a detailed "
         "implementation plan ordered by the frozen priority rules, with root-cause-driven solutions, finite batch boundaries, "
