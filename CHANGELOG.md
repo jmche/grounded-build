@@ -2,6 +2,15 @@
 
 All notable changes use semantic versioning.
 
+## [0.7.4] - 2026-09-16
+
+- Added repeated `init --attach <path>` for frozen, SHA-256-bound external review material. Attachments
+  are mounted read-only in every planning context through a generated manifest; original host paths are
+  never used as agent-readable locations.
+- Added advisory disclosure for absolute request paths outside readable roots and a distinct
+  `MATERIAL_UNREADABLE` diagnostic that preserves the blocking contract and gives the actionable
+  `--attach` recovery.
+
 ## [0.7.3] - 2026-09-15
 
 - Kept `bash` enabled in the DSH review sandbox. The evidence contract requires a content digest of

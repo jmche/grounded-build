@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.7.3"
+VERSION = "0.7.4"
 SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex", "dsh", "other")
 OTHER_BRIDGE_PROTOCOL = "grounded-build-other-v1"
@@ -1345,6 +1345,13 @@ def validate_questions(
             raise WorkflowError(f"{where} unresolved question has an invalid scope id")
         if not set(question.get("evidence_ids", [])).issubset(known_evidence):
             raise WorkflowError(f"{where} unresolved question cites unknown evidence")
+        if (question.get("blocking") and question.get("decision_owner") == "PLANNER"
+                and question.get("question_kind") == "MATERIAL_UNREADABLE"):
+            raise WorkflowError(
+                f"{where} question {question.get('id')!r} reports unreadable material: "
+                f"{question.get('question')!r}. The referenced material is not in the frozen "
+                "worktree or attached context; rerun with --attach <path> and do not silently "
+                "downgrade this blocking contract failure")
         if question.get("blocking") and question.get("decision_owner") == "PLANNER":
             # A rule the prompt states and a live slot still broke, so the complaint says what to DO:
             # the investigator owns this question and must answer it from the repository, or escalate
@@ -2029,6 +2036,36 @@ def context_digest(context_files: dict[str, Path]) -> str:
             continue
         parts.append(f"{name}:{sha256_file(context_files[name])}")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def attachment_context_files(state: dict[str, Any]) -> dict[str, Path]:
+    """Return frozen user attachments shared as common input to each planning stage."""
+    if not state.get("attachments"):
+        return {}
+    files = {item["context_name"]: Path(item["path"])
+             for item in state.get("attachments", [])}
+    if state.get("attachments_manifest"):
+        files["attachments.json"] = Path(state["attachments_manifest"])
+    return files
+
+
+def request_path_warnings(
+    request: Path, worktree: Path, attached_paths: set[Path] | None = None,
+) -> list[str]:
+    """Advisory disclosure for absolute paths outside the agent-readable roots."""
+    text = request.read_text(encoding="utf-8")
+    paths = sorted(set(re.findall(r"(?<![A-Za-z0-9_])/(?:[^\s`\"'<>]|\\ )+", text)))
+    roots = [worktree.resolve()]
+    attached = {path.resolve() for path in (attached_paths or set())}
+    warnings: list[str] = []
+    for raw in paths:
+        candidate = Path(raw.rstrip(".,;:)]}"))
+        if candidate.resolve() in attached or any(candidate.is_relative_to(root) for root in roots):
+            continue
+        warnings.append(
+            f"request references absolute path outside readable roots: {raw}; "
+            "provide it with --attach <path> if agents must inspect it")
+    return warnings
 
 
 def budget_reset_due(used: int, charged: list[str], digest: str) -> bool:
@@ -2797,6 +2834,7 @@ def invoke(
     context.mkdir(parents=True, exist_ok=False, mode=0o700)
     for name, source in context_files.items():
         destination = context / name
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         shutil.copyfile(source, destination)
         destination.chmod(0o600)
     raw = root / "raw.json"
@@ -3561,6 +3599,10 @@ def command_init(args: argparse.Namespace) -> None:
     request = Path(args.request).expanduser().resolve()
     if not request.is_file():
         raise WorkflowError(f"request file does not exist: {request}")
+    attachment_sources = [Path(raw).expanduser().resolve() for raw in (args.attach or [])]
+    for source in attachment_sources:
+        if source.is_symlink() or not source.is_file():
+            raise WorkflowError(f"attachment must be a regular file, not a directory or symlink: {source}")
     runtime = agent_runtime(args)
     topology, frozen_peer, final_reviewer, selection_checks = resolve_verified_host_selection(
         args, project, runtime,
@@ -3571,7 +3613,7 @@ def command_init(args: argparse.Namespace) -> None:
     root = run_directory(project, run_id)
     if root.exists():
         raise WorkflowError(f"run directory already exists: {root}")
-    for relative in ("input", "investigations", "drafts", "cross_reviews", "synthesis", "convergence_reviews", "final_reviews", "decisions", "invocations", "worktrees"):
+    for relative in ("input", "input/attachments", "audit", "investigations", "drafts", "cross_reviews", "synthesis", "convergence_reviews", "final_reviews", "decisions", "invocations", "worktrees"):
         (root / relative).mkdir(parents=True, exist_ok=True, mode=0o700)
     request_snapshot = root / "input" / "request.md"
     shutil.copyfile(request, request_snapshot)
@@ -3598,6 +3640,27 @@ def command_init(args: argparse.Namespace) -> None:
     )
     if result.returncode != 0:
         raise WorkflowError(result.stderr.strip() or "could not create planning worktree")
+    attachments: list[dict[str, Any]] = []
+    for index, source in enumerate(attachment_sources, 1):
+        context_name = f"attachments/{index:03d}-{source.name}"
+        destination = root / "input" / context_name
+        shutil.copyfile(source, destination)
+        destination.chmod(0o600)
+        attachments.append({
+            "context_name": context_name, "path": str(destination),
+            "source_basename": source.name, "source_path": str(source),
+            "bytes": destination.stat().st_size, "sha256": sha256_file(destination),
+        })
+    attachments_manifest = root / "input" / "attachments.json"
+    atomic_json(attachments_manifest, {
+        "attachments": [
+            {key: item[key] for key in ("context_name", "source_basename", "bytes", "sha256")}
+            for item in attachments
+        ],
+        "delivery": "Each listed file is frozen at init and mounted read-only in every planning context.",
+    })
+    input_warnings = request_path_warnings(
+        request, worktree, {Path(item["source_path"]) for item in attachments})
     state: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "software_version": VERSION,
@@ -3616,6 +3679,9 @@ def command_init(args: argparse.Namespace) -> None:
         "finding_ledger_path": str(finding_ledger_path),
         "finding_ledger": {},
         "finding_aliases": {},
+        "attachments": attachments,
+        "attachments_manifest": str(attachments_manifest),
+        "input_warnings": input_warnings,
         "authorized_scope_ids": ["TARGET-001"],
         "excluded_scope_ids": [],
         "resolved_question_ids": [],
@@ -3664,6 +3730,9 @@ def command_init(args: argparse.Namespace) -> None:
     record_artifact(state, "request", request_snapshot)
     record_artifact(state, "scope-contract", scope_contract)
     record_artifact(state, "finding-ledger", finding_ledger_path)
+    record_artifact(state, "attachments-manifest", attachments_manifest)
+    for item in attachments:
+        record_artifact(state, f"attachment-{item['context_name']}", Path(item["path"]))
     write_scope_authority(state)
     save_state(state)
     emit({
@@ -3678,6 +3747,11 @@ def command_init(args: argparse.Namespace) -> None:
         "provider_diversity": state["provider_diversity"],
         "model_diversity": state["model_diversity"], "agent_runtime": runtime,
         "runtime_warnings": state["runtime_warnings"],
+        "input_warnings": input_warnings,
+        "attachments": [
+            {key: item[key] for key in ("context_name", "source_basename", "bytes", "sha256")}
+            for item in attachments
+        ],
         "planning_depth": state["planning_depth"], "research_policy": state["research_policy"],
         "next_action": next_action(state),
     })
@@ -3747,7 +3821,8 @@ def command_investigate(args: argparse.Namespace) -> None:
         {"request.md": Path(state["request_snapshot"]),
          "scope_contract.json": Path(state["scope_contract"]),
          "scope_authority.json": Path(state["scope_authority_path"]),
-         "causal_analysis.md": CAUSAL_ANALYSIS},
+         "causal_analysis.md": CAUSAL_ANALYSIS,
+         **attachment_context_files(state)},
         INVESTIGATION_SCHEMA, prompt, args.timeout, args.dry_run,
         validator=lambda value: validate_investigation(value, state, slot),
     )
@@ -3797,6 +3872,7 @@ def command_draft(args: argparse.Namespace) -> None:
          "causal_analysis.md": CAUSAL_ANALYSIS,
          "investigation.json": Path(state["investigations"][slot]["path"]),
          "scope_authority.json": Path(state["scope_authority_path"]),
+         **attachment_context_files(state),
          **{
              f"decision_{index:03d}.json": decision
              for index, decision in enumerate(
@@ -3865,6 +3941,7 @@ def command_cross_review(args: argparse.Namespace) -> None:
         "scope_contract.json": Path(state["scope_contract"]),
         "scope_authority.json": Path(state["scope_authority_path"]),
         "causal_analysis.md": CAUSAL_ANALYSIS,
+        **attachment_context_files(state),
         "finding_ledger.json": barrier_ledger,
         "own_investigation.json": Path(state["investigations"][slot]["path"]),
         "peer_investigation.json": Path(state["investigations"][target_slot]["path"]),
@@ -3942,6 +4019,7 @@ def command_diverge(args: argparse.Namespace) -> None:
         "scope_contract.json": Path(state["scope_contract"]),
         "scope_authority.json": Path(state["scope_authority_path"]),
         "causal_analysis.md": CAUSAL_ANALYSIS,
+        **attachment_context_files(state),
         "finding_ledger.json": barrier_ledger,
         "investigation_A.json": Path(state["investigations"]["A"]["path"]),
         "investigation_B.json": Path(state["investigations"]["B"]["path"]),
@@ -4142,6 +4220,7 @@ def command_convergence_review(args: argparse.Namespace) -> None:
         "scope_contract.json": Path(state["scope_contract"]),
         "scope_authority.json": Path(state["scope_authority_path"]),
         "causal_analysis.md": CAUSAL_ANALYSIS,
+        **attachment_context_files(state),
         "finding_ledger.json": Path(state["finding_ledger_path"]),
         "implementation_plan.md": Path(state["candidate"]["plan"]),
         "batches.md": Path(state["candidate"]["batch_manifest"]),
@@ -4236,6 +4315,7 @@ def command_final_review(args: argparse.Namespace) -> None:
         "scope_contract.json": Path(state["scope_contract"]),
         "scope_authority.json": Path(state["scope_authority_path"]),
         "causal_analysis.md": CAUSAL_ANALYSIS,
+        **attachment_context_files(state),
         "finding_ledger.json": Path(state["finding_ledger_path"]),
         "blocking_findings.json": _blocking_path,
         "implementation_plan.md": Path(state["candidate"]["plan"]),
@@ -4744,6 +4824,10 @@ def build_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init")
     init.add_argument("--project", required=True)
     init.add_argument("--request", required=True)
+    init.add_argument(
+        "--attach", action="append", default=[],
+        help="freeze an external regular file into every planning context; repeat for multiple files",
+    )
     init.add_argument(
         "--base-ref", default="HEAD",
         help="Git branch, tag, or commit to freeze; uncommitted source-worktree changes are ignored",

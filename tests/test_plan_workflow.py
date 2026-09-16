@@ -290,6 +290,43 @@ class PlanWorkflowTest(unittest.TestCase):
                       "--run-id", initialized["run_id"], "--slot", slot)
         return initialized
 
+    def test_init_freezes_attachments_and_mounts_them_for_investigation(self) -> None:
+        attachment = self.temp / "repair-plan.md"
+        attachment.write_text("# External plan\ntrusted bytes\n", encoding="utf-8")
+        self.request.write_text(
+            self.request.read_text() + f"\nReview this file: {attachment}\n"
+            "A second missing file would be /outside/unattached-plan.md.\n", encoding="utf-8")
+        initialized = self.call(
+            "init", "--project", str(self.project), "--request", str(self.request),
+            "--backend", "claude", "--final-reviewer", "claude", "--attach", str(attachment))
+        self.assertTrue(initialized["attachments"])
+        state = self.get_state(initialized)
+        frozen = Path(state["attachments"][0]["path"])
+        self.assertEqual(frozen.read_text(encoding="utf-8"), "# External plan\ntrusted bytes\n")
+        self.assertTrue(any("outside readable roots" in item for item in state["input_warnings"]))
+        attachment.write_text("changed after init\n", encoding="utf-8")
+        dry = self.call(
+            "investigate", "--project", str(self.project), "--run-id", initialized["run_id"],
+            "--slot", "A", "--dry-run")
+        context = Path(dry["context"])
+        mounted = context / state["attachments"][0]["context_name"]
+        self.assertEqual(mounted.read_text(encoding="utf-8"), "# External plan\ntrusted bytes\n")
+        manifest = json.loads((context / "attachments.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["attachments"][0]["sha256"], state["attachments"][0]["sha256"])
+
+    def test_material_unreadable_question_reports_attachment_recovery(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_attachment_contract", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        question = {
+            "id": "A-Q1", "scope_id": "TARGET-001", "question": "Read /outside/plan.md",
+            "decision_owner": "PLANNER", "blocking": True,
+            "question_kind": "MATERIAL_UNREADABLE", "rationale": "file is unavailable",
+            "options": [], "evidence_ids": [],
+        }
+        with self.assertRaisesRegex(module.WorkflowError, "--attach <path>"):
+            module.validate_questions([question], set(), "investigation", allow_blocking_user=True)
+
     def get_state(self, initialized: dict) -> dict:
         return json.loads((Path(initialized["run_directory"]) / "workflow.json").read_text(encoding="utf-8"))
 

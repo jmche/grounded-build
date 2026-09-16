@@ -127,6 +127,14 @@ options, and evidence ids. A blocking planner-owned question is invalid because 
 owns that work. Blocking user-owned questions stop before draft and are presented as one batch. Drafts
 and synthesis may carry only non-blocking residual uncertainty.
 
+`init --attach <path>` may be repeated for external review material. The engine freezes each regular
+file, records its SHA-256 and byte count, and mounts it as a common read-only `context/attachments/...`
+file in every stage. `attachments.json` is the authoritative mapping. Absolute paths in the request
+outside the project and frozen worktree are disclosed as advisory warnings; they are not treated as
+delivered evidence. A producer that cannot read required material reports a blocking
+`question_kind=MATERIAL_UNREADABLE` question. The controller supplies the file with `--attach` and
+reruns the affected input; it never turns that failure into a non-blocking question.
+
 Every planning stage receives `causal_analysis.md`. Use its universal production trace for material
 defects and responsibility disputes, then adapt evidence to deterministic, generative, external,
 human, or hybrid producers. This is one causal model with producer-aware verification, not a keyword

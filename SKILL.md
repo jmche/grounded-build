@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.7.3
+  version: 0.7.4
   compatibility: Linux, Git, Python 3.11+, bubblewrap and socat (both sandbox packages; the provider CLI sandbox is fail-closed), and at least one Claude, Codex, dsh, or protocol-compatible other CLI adapter
 ---
 
@@ -134,6 +134,13 @@ python3 <skill-root>/scripts/plan_workflow.py init \
 worktree; staged, modified, and untracked files in the source checkout neither block initialization
 nor enter the planning snapshot. Pass an explicit ref whenever the checked-out branch is not the
 intended planning authority.
+
+Repeat `--attach <path>` on `init` for external review material. Each regular file is frozen with a
+SHA-256 digest and mounted read-only under `context/attachments/` for every planning stage; agents
+must use the names in `attachments.json`, never the original host path. Initialization reports
+absolute request paths outside the readable project/worktree roots as advisory warnings. If a
+producer cannot read required material, it must report a blocking `MATERIAL_UNREADABLE` question;
+the controller should rerun with `--attach <path>`, and must not weaken the blocking rule.
 
 Record `run_id`, `base_ref`, `baseline_sha`, the excluded source-worktree changes,
 `agent_runtime`, and the returned `next_action`.

@@ -13,7 +13,7 @@ provider-sandbox constructor so both phases enforce one filesystem and credentia
 ## Key Files
 | File | Description |
 |------|-------------|
-| `plan_workflow.py` | Planning engine (`VERSION = "0.7.2"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
+| `plan_workflow.py` | Planning engine (`VERSION = "0.7.4"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, frozen external attachments, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
 | `workflow.py` | Implementation engine (`SCHEMA_VERSION = 10`). Concurrent run discovery, worktree isolation, frozen reviewer contracts, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
 | `dsh_read_boundary.mjs` | Fail-closed DSH model-tool allowlist. Only bounded read/search tools under the frozen worktree and invocation context may execute; bubblewrap remains the outer enforcement boundary. |
 | `release_check.py` | No-network release gate: validates `evals/evals.json` shape, required public-release files, LICENSE/SECURITY content, cross-file version synchronization, and the English-only rule; then compiles both engines and runs the unit suites. Optional `--quick-validator <path>` chains an external skill validator. |
