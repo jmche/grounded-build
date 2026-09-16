@@ -2902,6 +2902,40 @@ def normalize_delivery_collections(payload: dict[str, Any], schema: dict[str, An
     return disclosures
 
 
+def bind_machine_identity(
+    payload: dict[str, Any], state: dict[str, Any], assignment: str, provider: str, slot: str,
+    schema: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Bind invocation facts; the producer must not spend semantic budget repeating them."""
+    expected: dict[str, Any] = {}
+    properties = set(schema.get("properties", {}))
+    for field, value in (
+        ("provider", provider), ("slot", slot),
+        ("baseline_sha", state.get("baseline_sha")), ("scope_digest", state.get("scope_digest")),
+    ):
+        if field in properties:
+            expected[field] = value
+    if assignment.startswith("cross-"):
+        expected.update({
+            "reviewer_slot": slot,
+            "target": f"draft-{'B' if slot == 'A' else 'A'}",
+            "round": 2,
+        })
+    elif assignment.startswith("diverge-"):
+        expected.update({"reviewer_slot": slot, "target": "draft-02-both", "round": 3})
+    disclosures: list[dict[str, Any]] = []
+    for field, value in expected.items():
+        if field not in properties:
+            continue
+        if field in payload and payload[field] != value:
+            disclosures.append({
+                "type": "MACHINE_IDENTITY_REBOUND", "field": field,
+                "claimed": payload[field], "engine": value,
+            })
+        payload[field] = value
+    return disclosures
+
+
 def invoke(
     state: dict[str, Any], assignment: str, provider: str, slot: str, context_files: dict[str, Path],
     schema: dict[str, Any], prompt: str, timeout: int, dry_run: bool,
@@ -3093,6 +3127,8 @@ def invoke(
             raise infrastructure_error
         delivery_disclosures: list[dict[str, Any]] = []
         payload = extract_payload(provider, result, raw, delivery_disclosures)
+        delivery_disclosures.extend(bind_machine_identity(
+            payload, state, assignment, provider, slot, schema))
         for note in normalize_delivery_collections(payload, schema):
             delivery_disclosures.append({"type": "OPTIONAL_COLLECTION_DEFAULTED", "detail": note})
         if delivery_disclosures:
