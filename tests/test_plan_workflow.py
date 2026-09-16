@@ -408,6 +408,21 @@ class PlanWorkflowTest(unittest.TestCase):
         ):
             self.assertTrue(fields.isdisjoint(set(schema["required"])))
 
+    def test_planning_provider_schema_removes_engine_identity_properties(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_provider_schema", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        machine = {
+            "provider", "slot", "reviewer_slot", "target", "round", "baseline_sha", "scope_digest",
+            "candidate_plan_sha256", "candidate_batch_manifest_sha256",
+            "candidate_synthesis_manifest_sha256",
+        }
+        for schema in (module.INVESTIGATION_SCHEMA, module.DRAFT_SCHEMA,
+                       module.INTEGRATION_SCHEMA, module.REVIEW_SCHEMA):
+            producer = module.producer_delivery_schema(schema, machine)
+            self.assertTrue(set(producer["properties"]).issubset(set(producer["required"])))
+            self.assertTrue(machine.isdisjoint(set(producer["properties"])))
+
     def test_material_unreadable_question_reports_attachment_recovery(self) -> None:
         spec = importlib.util.spec_from_file_location("gb_attachment_contract", SCRIPT)
         module = importlib.util.module_from_spec(spec)

@@ -2891,6 +2891,20 @@ SAFE_EMPTY_COLLECTIONS = {
 }
 
 
+def producer_delivery_schema(
+    schema: dict[str, Any], machine_fields: set[str],
+) -> dict[str, Any]:
+    """Expose semantic fields to providers; keep engine-owned identity internal."""
+    result = json.loads(json.dumps(schema))
+    properties = result.get("properties", {})
+    for field in machine_fields:
+        properties.pop(field, None)
+    result["required"] = [
+        field for field in result.get("required", []) if field not in machine_fields
+    ]
+    return result
+
+
 def normalize_delivery_collections(payload: dict[str, Any], schema: dict[str, Any]) -> list[str]:
     """Fill only semantically empty collection fields; never invent decisions or findings."""
     disclosures: list[str] = []
@@ -3023,8 +3037,13 @@ def invoke(
         assignment.startswith("investigate-")
         and state.get("research_policy") == "authoritative-web"
     )
+    machine_fields = {
+        "provider", "slot", "reviewer_slot", "target", "round", "baseline_sha", "scope_digest",
+        "candidate_plan_sha256", "candidate_batch_manifest_sha256", "candidate_synthesis_manifest_sha256",
+    }
+    producer_schema = producer_delivery_schema(schema, machine_fields)
     command = agent_command(
-        provider, worktree, context, schema, raw, prompt.format(context=context), runtime, allow_web)
+        provider, worktree, context, producer_schema, raw, prompt.format(context=context), runtime, allow_web)
     command = isolated_agent_command(
         command, state, root, worktree, context, allow_web=allow_web
     )
