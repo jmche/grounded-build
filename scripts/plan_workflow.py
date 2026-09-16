@@ -1415,6 +1415,18 @@ def state_evidence_ids(state: dict[str, Any]) -> set[str]:
     return evidence_ids
 
 
+def write_allowed_evidence_manifest(state: dict[str, Any], destination: Path) -> Path:
+    """Stage the exact evidence vocabulary available to a multi-artifact reviewer."""
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    atomic_json(destination, {
+        "purpose": "Allowed evidence IDs for this planning review stage.",
+        "allowed_evidence_ids": sorted(state_evidence_ids(state)),
+        "instruction": "Reference only these IDs; never infer, extend, or invent an ID.",
+    })
+    destination.chmod(0o600)
+    return destination
+
+
 def validate_questions(
     questions: Any, known_evidence: set[str], where: str, *, allow_blocking_user: bool,
 ) -> None:
@@ -4162,7 +4174,8 @@ def command_cross_review(args: argparse.Namespace) -> None:
         "is divergent: add missing in-scope causal, failure-path, alternative, and verification coverage, never a new "
         "objective. Every frozen ledger key must appear exactly once in accepted_finding_ids or "
         "rejected_finding_ids. Declare plan_scope_ids, and return NEEDS_USER_DECISION whenever a blocking user "
-        "question remains. Do not edit files. "
+        "question remains. Do not edit files. Use {context}/allowed_evidence_ids.json as the complete "
+        "evidence vocabulary for this stage: cite only listed IDs and never infer, extend, or invent an ID. "
         "{vocabulary}"
         "Return only schema JSON with provider={provider}, slot={slot}, "
         "reviewer_slot={slot}, target={target}, round=2, baseline_sha={sha}, scope_digest={scope_digest}."
@@ -4177,6 +4190,8 @@ def command_cross_review(args: argparse.Namespace) -> None:
         "causal_analysis.md": CAUSAL_ANALYSIS,
         **attachment_context_files(state),
         "finding_ledger.json": barrier_ledger,
+        "allowed_evidence_ids.json": write_allowed_evidence_manifest(
+            state, Path(state["run_directory"]) / "cross_reviews" / "allowed_evidence_ids.json"),
         "own_investigation.json": Path(state["investigations"][slot]["path"]),
         "peer_investigation.json": Path(state["investigations"][target_slot]["path"]),
         "own_plan.md": Path(state["drafts"][slot]["markdown"]),
@@ -4240,7 +4255,8 @@ def command_diverge(args: argparse.Namespace) -> None:
         "finding in full solution form. Propose evidence-backed finding_aliases when multiple stable keys are observations "
         "of one defect; preserve separate keys when equivalence is not established. Every frozen key needs exactly "
         "one accepted/rejected disposition. Declare plan_scope_ids and do not PASS with a blocking question or P0/P1 "
-        "review finding. "
+        "review finding. Use {context}/allowed_evidence_ids.json as the complete evidence vocabulary "
+        "for this stage: cite only listed IDs and never infer, extend, or invent an ID. "
         "{vocabulary}"
         "Return schema JSON with "
         "provider={provider}, slot={slot}, reviewer_slot={slot}, target={target}, round=3, baseline_sha={sha}, "
@@ -4255,6 +4271,8 @@ def command_diverge(args: argparse.Namespace) -> None:
         "causal_analysis.md": CAUSAL_ANALYSIS,
         **attachment_context_files(state),
         "finding_ledger.json": barrier_ledger,
+        "allowed_evidence_ids.json": write_allowed_evidence_manifest(
+            state, Path(state["run_directory"]) / "divergence" / "allowed_evidence_ids.json"),
         "investigation_A.json": Path(state["investigations"]["A"]["path"]),
         "investigation_B.json": Path(state["investigations"]["B"]["path"]),
         "draft_02_A.md": Path(state["draft_rounds"]["2"]["A"]["markdown"]),

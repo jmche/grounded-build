@@ -423,6 +423,20 @@ class PlanWorkflowTest(unittest.TestCase):
             self.assertTrue(set(producer["properties"]).issubset(set(producer["required"])))
             self.assertTrue(machine.isdisjoint(set(producer["properties"])))
 
+    def test_allowed_evidence_manifest_is_explicit_and_sorted(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_evidence_manifest", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "allowed_evidence_ids.json"
+            state = {
+                "investigations": {}, "drafts": {},
+            }
+            manifest = module.write_allowed_evidence_manifest(state, destination)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(payload["allowed_evidence_ids"], [])
+            self.assertIn("never infer", payload["instruction"])
+
     def test_material_unreadable_question_reports_attachment_recovery(self) -> None:
         spec = importlib.util.spec_from_file_location("gb_attachment_contract", SCRIPT)
         module = importlib.util.module_from_spec(spec)
