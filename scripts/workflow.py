@@ -2392,10 +2392,12 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
         end = text.rfind("}")
         if 0 <= start < end:
             candidates.append(text[start:end + 1])
+        first_error: json.JSONDecodeError | None = None
         for candidate in candidates:
             try:
                 payload = json.loads(candidate)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                first_error = first_error or exc
                 try:
                     # A literal control character inside a quoted field is a mechanical
                     # serialization slip, not a semantic review failure.  Keep the fallback
@@ -2405,6 +2407,12 @@ def extract_review(reviewer: str, stdout: str, raw_path: Path) -> dict[str, Any]
                     continue
             if isinstance(payload, dict):
                 return payload
+        if first_error is not None and text:
+            # The planning engine already distinguishes a judgement cut off in transit from
+            # deliberation submitted instead of a verdict; the two need different remedies.
+            raise WorkflowError(
+                planning_isolation_module().describe_unparseable("dsh", text, first_error)
+            )
         raise WorkflowError("dsh output did not contain a structured review result")
     if reviewer in {"codex", "other"}:
         source = raw_path.read_text(encoding="utf-8") if raw_path.is_file() else stdout
@@ -3161,6 +3169,37 @@ def ledger_bound_findings(
             view.update({key: entry[key] for key in LEDGER_BOUND_FINDING_FIELDS if key in entry})
         bound.append(view)
     return bound
+
+
+def reviewer_change_warnings(
+    state: dict[str, Any], prior_reviews: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Say, on the result itself, when a different reviewer than before produced this verdict.
+
+    An automatic rate-limit fallback is recorded once, at the moment it happens, on an error
+    result the host may not re-read. Every later verdict from the replacement reviewer looked
+    like the original reviewer's work, so a weaker model's judgements were taken at the strength
+    of the model the user selected.
+    """
+    warnings: list[dict[str, Any]] = []
+    for change in state.get("automatic_reviewer_fallbacks", []):
+        if change.get("to_reviewer") == state.get("reviewer"):
+            warnings.append({
+                "code": "REVIEWER_AUTO_FALLBACK_ACTIVE",
+                "from_reviewer": change.get("from_reviewer"),
+                "to_reviewer": change.get("to_reviewer"),
+                "decision_id": change.get("id"),
+                "reason": change.get("reason"),
+            })
+            break
+    previous = prior_reviews[-1].get("reviewer") if prior_reviews else None
+    if previous and previous != state.get("reviewer"):
+        warnings.append({
+            "code": "REVIEWER_CHANGED_SINCE_LAST_ROUND",
+            "from_reviewer": previous,
+            "to_reviewer": state.get("reviewer"),
+        })
+    return warnings
 
 
 def apply_convergence_policy(
@@ -4620,6 +4659,7 @@ def command_review(args: argparse.Namespace) -> None:
                 "review_round_consumed": False,
             }, 3)
         policy = apply_convergence_policy(state, payload, args.batch, round_number, head)
+        policy["warnings"].extend(reviewer_change_warnings(state, prior))
         if closeout_review and policy["effective_verdict"] != "PASS":
             policy["effective_verdict"] = "NEEDS_USER_DECISION"
             if "CLOSEOUT_REVIEW_DID_NOT_PASS" not in policy["decision_reasons"]:
@@ -4760,6 +4800,8 @@ def command_review(args: argparse.Namespace) -> None:
         {
             "status": status, "run_id": state["run_id"], "batch": args.batch,
             "round": round_number, "base_sha": base, "reviewed_sha": head,
+            "reviewer": state["reviewer"],
+            "reviewer_runtime": state.get("reviewer_runtime") or {},
             "verdict": policy["effective_verdict"],
             "reported_verdict": payload["verdict"], "summary": payload["summary"],
             "findings": ledger_bound_findings(state, payload["findings"]),

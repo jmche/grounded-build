@@ -272,7 +272,8 @@ still wins. Claude defaults to Opus, Codex to `gpt-5.6-sol`, and dsh to the mode
 `--codex-profile`, `--dsh-model`, and `--dsh-model-provider` may override that selection at `init`
 and `change-reviewer`. The frozen `reviewer_runtime` must be reported and preserved across review calls.
 If an auto-selected external reviewer reports a rate limit, the run records
-`REVIEWER_AUTO_FALLBACK`, switches permanently to the frozen host runtime, and requires the same
+`REVIEWER_AUTO_FALLBACK`, switches permanently to the frozen host runtime, flags every later review
+result with `REVIEWER_AUTO_FALLBACK_ACTIVE`, and requires the same
 contract or batch review to be retried. Other infrastructure failures and explicit reviewer choices
 continue to use `REVIEWER_ERROR` and preview-first `change-reviewer` recovery.
 

@@ -1969,10 +1969,10 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertIn("--patch", dsh_command)
         patch_path = Path(dsh_command[dsh_command.index("--patch") + 1])
         patch_text = patch_path.read_text(encoding="utf-8")
-        # GB-1/N1: bash stays ENABLED, because the evidence contract requires a content digest and
-        # only a command can compute one. Credential denial therefore no longer rests on bash being
-        # disabled — it rests on what is mounted and on what the boundary will read, which is what
-        # this test now checks.
+        # The patch's disable list is not the credential boundary: the read boundary plugin
+        # denies bash (and every non-read tool) at execution time, and evidence digests are
+        # engine-computed. Credential denial rests on what is mounted and on what the boundary
+        # will read, which is what this test checks; tool-bash is simply not part of the list.
         disabled = (
             "tool-pwsh", "jobs", "tool-jobs", "tool-skill", "tool-todo",
             "tool-goal", "web", "web-search-deepseek", "tool-web", "code-runtime", "subagent",

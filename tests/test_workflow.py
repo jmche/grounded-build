@@ -498,6 +498,20 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--run-id", str(initialized["run_id"]),
         )
         self.assertEqual(contract["status"], "CONTRACT_READY")
+        # The switch is visible on every later verdict, not only on the error result that made it.
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        review = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        )
+        self.assertEqual(review["status"], "REVIEW_PASS")
+        self.assertEqual(review["reviewer"], "other")
+        self.assertEqual(review["reviewer_runtime"]["adapter"], "other")
+        active = [item for item in review["warnings"] if item["code"] == "REVIEWER_AUTO_FALLBACK_ACTIVE"]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["from_reviewer"], "codex")
+        self.assertEqual(active[0]["to_reviewer"], "other")
 
     def test_explicit_reviewer_rate_limit_does_not_change_authority(self) -> None:
         initialized = self.initialize_raw("codex", implementer="dsh")
@@ -4557,6 +4571,14 @@ class ReviewerSchemaCompatibilityTests(unittest.TestCase):
         self.assertEqual(sorted(named - deliverable), [], "prompt names a field the wire cannot carry")
         finding_fields = set(wire["properties"]["findings"]["items"]["properties"])
         self.assertEqual(sorted(finding_fields - named), [], "prompt must explain every finding field")
+
+    def test_truncated_dsh_delivery_is_diagnosed_as_cut_off(self) -> None:
+        truncated = '{"verdict": "FAIL", "summary": "the object ran out of room here'
+        with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "cut off"):
+            WORKFLOW_MODULE.extract_review("dsh", truncated, Path("/nonexistent/raw.json"))
+        prose = "I reviewed the batch and believe it passes."
+        with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "not the schema object"):
+            WORKFLOW_MODULE.extract_review("dsh", prose, Path("/nonexistent/raw.json"))
 
     def test_compatibility_guard_detects_forbidden_keyword(self) -> None:
         bad_schema = {

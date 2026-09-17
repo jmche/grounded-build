@@ -1804,9 +1804,10 @@ def adapter_capabilities(provider: str) -> dict[str, Any]:
                 dsh_home = root / "dsh-home"
                 dsh_home.mkdir(mode=0o700)
                 patch = root / "capability.patch.yml"
-                # The probe composes a disable entry to prove patch composition works, and uses
-                # tool-pwsh rather than tool-bash: a dsh slot keeps bash so it can run the commands
-                # the evidence contract requires (e.g. sha256sum for a digest).
+                # The probe composes a disable entry to prove patch composition works. It uses
+                # tool-pwsh because the disable list is not the execution boundary: the read
+                # boundary plugin denies every tool outside its read allowlist, bash included,
+                # and evidence digests are computed by the engine, not by the slot.
                 patch.write_text(
                     "- id: tool-pwsh\n  disabled: true\n"
                     "- insert:\n"
@@ -2528,11 +2529,13 @@ def isolated_agent_command(
                 "        allowedRoots:\n"
                 f"          - {json.dumps(str(worktree))}\n"
                 f"          - {json.dumps(str(context))}\n"
-                # GB-1/N1: bash stays ENABLED. The contract requires a content digest for every
-                # repository evidence entry, and a slot that may not run a command cannot produce
-                # one — both slots answered with all-zero placeholders instead. Capability is not
-                # the enemy; unregistered provenance is, and the prompt now requires registration
-                # rather than forbidding the network.
+                # This disable list is not the execution boundary. The read boundary plugin
+                # inserted above denies every tool outside its read allowlist at execution time,
+                # so a dsh slot cannot run bash even though tool-bash is not listed here; the
+                # engine computes every evidence digest itself and discloses a slot's mismatch
+                # (see the REPOSITORY/ATTACHMENT branches of the evidence validator). What the
+                # list removes are agent-shaping surfaces (jobs, subagents, editors, workflows)
+                # that would otherwise change how the slot behaves inside the sandbox.
                 "- id: tool-pwsh\n  disabled: true\n"
                 "- id: jobs\n  disabled: true\n"
                 "- id: tool-jobs\n  disabled: true\n"

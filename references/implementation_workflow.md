@@ -346,18 +346,21 @@ Interpret statuses as follows:
 
 Every real reviewer call is stored under a unique `round_N/invocation_N/` directory. A malformed result or process failure leaves a terminal invocation record but does not create a quality review. Invocation budgets stop repeated infrastructure failures from consuming unbounded external-agent budget.
 
-The reviewer delivery envelope is deliberately small. The workflow owns routing identity, commit
-SHAs, legal verdicts, finding IDs, fingerprints, severities, and executable criterion evidence.
-Finding explanation fields are semantic reviewer content: providers may omit inapplicable prose or
-include additional explanatory keys, and the controller preserves the finding while supplying only
-empty compatibility values needed by the lifecycle ledger. Missing lifecycle facts are still a
-delivery error; semantic prose is not promoted into a new mechanical gate.
+The reviewer delivery envelope is deliberately small and has one shape. The workflow owns routing
+identity, commit SHAs, legal verdicts, and executable criterion evidence, and binds them at receipt.
+Each finding carries `id`, `fingerprint`, `severity`, `novelty`, `location`, `required_outcome`, and
+`details`; the controller checks presence and shape only. A missing `location` or `required_outcome`
+is disclosed and kept empty rather than invented, and never discards the review; a finding without
+`details` is a delivery error. Semantic prose is not promoted into a new mechanical gate.
 
 If an auto-selected external reviewer reports a machine-classified rate limit, the engine records
 `REVIEWER_AUTO_FALLBACK`, persistently switches to the frozen host runtime, and returns
 `retry_required: true`. Repeat the same contract-review or batch-review command; the failed
 infrastructure call consumes no quality round and does not change the finding ledger or accepted
-evidence. This also applies when the host is a configured `other` bridge.
+evidence. This also applies when the host is a configured `other` bridge. The switch is never
+silent afterwards: every later review result carries the `REVIEWER_AUTO_FALLBACK_ACTIVE` warning and
+names its `reviewer`, and the final response must state which reviewer produced each batch's
+verdicts. Offer the user `change-reviewer` back to the selected reviewer when its limit clears.
 
 An explicit reviewer is never replaced automatically. Other infrastructure failures, or a rate
 limit when the host is unavailable, remain `REVIEWER_ERROR`. In those cases switch to Claude, Codex,
@@ -407,6 +410,7 @@ A PASS describes one exact SHA, not the batch. If you commit again after `REVIEW
 
 Read `warnings` and `decision_reasons` on every review result:
 
+- `REVIEWER_AUTO_FALLBACK_ACTIVE` / `REVIEWER_CHANGED_SINCE_LAST_ROUND`: this verdict came from a different reviewer than the user selected or than the previous round used (every review result also names its `reviewer` and `reviewer_runtime`). Tell the user which reviewer produced the verdict before acting on it; a host-adapter fallback may be a weaker model than the one selected, and `change-reviewer` returns to the original reviewer once its limit clears.
 - `FINDING_WITHOUT_CLOSE_CONDITION`: the reviewer reported a finding without `required_outcome`. The finding is kept and the review is not discarded; ask the reviewer for the close condition on the next round rather than guessing one. The ledger adopts the first non-empty statement.
 - `SEVERITY_DOWNGRADE`: a P0/P1 finding was re-reported as P2 and stopped blocking on the reviewer's own authority; its `deferred_reason` records the downgrade. Surface it to the user with the reviewer's reason from `details`.
 - `CROSS_BATCH_RESOLUTION` / `CROSS_BATCH_FINDING`: the reviewer referenced a finding an earlier batch owns. The observation is recorded, that batch keeps authority over its own status, and only a cross-batch P0 raises `CROSS_BATCH_MATERIAL_FINDING` for adjudication.
@@ -648,7 +652,8 @@ Cleanup preserves the plan snapshot, state, reviews, logs, tests, final report, 
 
 ## Final response
 
-Report the project identity, run ID, plan digest, implementer and reviewer, baseline and final SHA,
+Report the project identity, run ID, plan digest, implementer and reviewer (including any automatic
+fallback and which reviewer produced each batch's verdicts), baseline and final SHA,
 working-tree changes excluded at initialization, frozen supplementary instruction paths and digests,
 batches accepted, review rounds, verification results, remaining P2 findings, integration status,
 report location, and whether worktrees remain registered.

@@ -4,6 +4,17 @@ All notable changes use semantic versioning.
 
 ## [0.7.8] - 2026-09-17
 
+- Every review result now names its `reviewer` and `reviewer_runtime`, and carries a
+  `REVIEWER_AUTO_FALLBACK_ACTIVE` warning on every verdict produced by a rate-limit fallback
+  reviewer (plus `REVIEWER_CHANGED_SINCE_LAST_ROUND` when the reviewer differs from the previous
+  round). The fallback was recorded once on an error result and every later verdict from the
+  weaker host model looked like the selected reviewer's work.
+- A dsh review delivery that cannot be parsed is now diagnosed as either a schema object cut off
+  in transit or prose submitted instead of a verdict, using the planning engine's diagnostic.
+- Corrected the 0.7.3 note that `bash` stays enabled in the DSH sandbox. The read boundary plugin
+  denies every tool outside its read allowlist at execution time, bash included, and evidence
+  digests are computed by the engine; the patch's disable list shapes the agent, it is not the
+  credential boundary. `SECURITY.md` was already accurate.
 - Added the `EXTEND_REVIEW_BUDGET` decision. When a batch's ordinary rounds are exhausted, including
   after a failed closeout, the user can add one more ordinary budget to the same batch with a
   recorded reason; the acceptance contract, finding ledger, accepted batches, and prior decisions
