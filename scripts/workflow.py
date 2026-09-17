@@ -2105,8 +2105,9 @@ def build_prompt(
         (
             "This is round 1 of the final integration review. Every plan batch was reviewed and "
             "accepted at its own SHA; do not re-litigate those batches. Judge the integrated "
-            "result at exact HEAD across the whole baseline range: cross-batch interactions, "
-            "consumers one batch left for another, and every acceptance-contract criterion."
+            "result at exact HEAD across the authoritative coverage range stated below: "
+            "cross-batch interactions, consumers one batch left for another, and every "
+            "acceptance-contract criterion."
             if final_review
             else "This is round 1: perform the complete discovery review for this batch."
         )
