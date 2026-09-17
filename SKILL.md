@@ -56,7 +56,9 @@ Create a repository-evidenced plan through isolated agent calls, then optionally
 - Implementation review keeps P0/P1/P2 in consequence order. P2 is constructive and nonblocking;
   pure preference is not a ledger finding. When a nonterminal typed decision is applied only after
   ordinary review rounds are exhausted, one decision-, batch-, and SHA-bound closeout review can
-  confirm recovery without creating an unbounded repair loop or minting PASS from adjudication.
+  confirm recovery without creating an unbounded repair loop or minting PASS from adjudication. After
+  that, only a reasoned `EXTEND_REVIEW_BUDGET` decision continues the same batch, keeping the contract
+  and finding ledger; superseding the run is no longer the only exit.
 
 ## Plan workflow
 

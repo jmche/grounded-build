@@ -90,7 +90,7 @@ review. Target movement is integration divergence, not execution staleness.
   operator runs `migrate-engine --reason <reason> --actor <actor>` (preview first, then `--apply`).
   Migration refuses active invocations, preserves frozen artifacts, and marks any current-SHA PASS
   for one fresh review under the new engine before acceptance.
-- The ordinary cap is four valid review rounds per batch: one full discovery review and three bounded re-reviews. Reviewer infrastructure errors do not consume a round. Three separately audited exceptions may each add at most one ordinary round: a convergence-boundary grant, a review-budget grant, and a new-commit re-review after an effective PASS. A nonterminal typed decision applied only after those available rounds are exhausted authorizes one terminal closeout review bound to that decision, batch, and exact SHA. Thus the absolute non-legacy maximum is eight. Infrastructure or malformed output does not consume the closeout; one valid non-PASS result does, and cannot open another repair cycle.
+- The ordinary cap is four valid review rounds per batch: one full discovery review and three bounded re-reviews. Reviewer infrastructure errors do not consume a round. Three separately audited exceptions may each add at most one ordinary round: a convergence-boundary grant, a review-budget grant, and a new-commit re-review after an effective PASS. A nonterminal typed decision applied only after those available rounds are exhausted authorizes one terminal closeout review bound to that decision, batch, and exact SHA. Infrastructure or malformed output does not consume the closeout; one valid non-PASS result does. Beyond that, only the user's explicit `EXTEND_REVIEW_BUDGET` decision, recorded with its reason and the open findings at that moment, adds another ordinary budget to the same batch; the loop is bounded by reasoned decisions, not by discarding the run.
 - Count every real reviewer invocation separately from valid quality rounds. Infrastructure failures consume invocation budget and remain auditable even though they do not consume repair budget.
 - Treat `plan/original.md` and `plan/batches.md` with their recorded digests as the run authority. The manifest defines this run's total included/excluded scope and batch mapping. A later edit or move of either source is informational; a changed snapshot is corruption.
 - Never overwrite a contract, review, or verification attempt. Every invocation receives a unique append-only directory and event record.
@@ -247,6 +247,8 @@ Before implementation, run:
 
 The reviewer considers host criteria, the complete plan, the frozen run scope/batch mapping, and repository contracts. `CONTRACT_READY` stores an immutable effective contract with its own digest and permits implementation. The contract is a minimum obligation, not a whitelist of possible defects. Excluded work reserved for a future run is not an unmet criterion in the current run.
 
+Host criteria supplied at `init` must agree with the plan. Do not write a host condition that narrows or contradicts what the plan requires (for example forbidding an artifact the plan calls for) in order to steer the reviewer; if the plan's requirement looks wrong, that is a user decision before initialization, not a host condition. The contract reviewer reports a host-versus-plan contradiction as a `NEEDS_USER_DECISION` issue rather than choosing a side, because a contract that silently prefers one source leaves the implementer to be failed for following the other.
+
 A READY contract must cover every declared batch. Each criterion states an evidence kind. `COMMAND` criteria provide argv and expected exit and are automatically scheduled for fixed-SHA execution; repository assertions remain semantic reviewer judgments.
 
 When it returns `NEEDS_USER_DECISION`, present the issues and proposed observations to the user. Record the chosen boundary in a JSON decision file containing `reason` and normalized `criteria`, preview it, then apply it:
@@ -306,11 +308,12 @@ applied migration in `migration_history`, so sequential upgrades never reuse an 
 For the next pending batch:
 
 1. Read that batch from the plan snapshot.
-2. Inspect governing repository instructions and all affected producers, consumers, failure paths, recovery paths, and compatibility paths. For a material defect, trace authority, actual production input, responsible producer, consumer interpretation, and the earliest supported divergence. For a direct local edit, keep this trace correspondingly small.
-3. Implement only that batch in `implementation_worktree`.
-4. Add focused tests and run required verification there.
-5. Commit all intended changes and leave the implementation worktree clean.
-6. Request review.
+2. Read the batch's acceptance criteria from the effective contract (`status` returns `acceptance_contract`; each criterion names an observation, its expected result, and its scope). They are the close conditions the reviewer will judge, so they are also the implementer's definition of done for the batch. Note the observation for each one before writing code, and if a criterion is undecidable or contradicts the plan, stop and raise it as a user decision rather than implementing one reading of it.
+3. Inspect governing repository instructions and all affected producers, consumers, failure paths, recovery paths, and compatibility paths. For a material defect, trace authority, actual production input, responsible producer, consumer interpretation, and the earliest supported divergence. For a direct local edit, keep this trace correspondingly small.
+4. Implement only that batch in `implementation_worktree`.
+5. Add focused tests and run required verification there. Before requesting review, check each of the batch's criteria against the worktree yourself: the observation should already hold at the SHA you are about to submit.
+6. Commit all intended changes and leave the implementation worktree clean.
+7. Request review.
 
 Use small logical commits. The reviewer evaluates the cumulative batch range from the prior accepted SHA through the current implementation HEAD.
 
@@ -444,9 +447,20 @@ exhausted every then-available ordinary quality round, the engine records exactl
 authorization. `RETURN_TO_FIX` requires a new commit; deferral or a decision-only resume may retain
 the same SHA. The first paid attempt binds the authorization to exact HEAD, while infrastructure,
 malformed output, and `NEEDS_VERIFICATION` leave it retryable only at that SHA. The first valid quality
-result consumes it. PASS permits acceptance; any other effective result offers only `SUPERSEDE_RUN`
-or `ABORT_RUN`, never another fix/defer/review loop. This recovery is a route back to independent review,
-not user-authored PASS or completion authority.
+result consumes it. PASS permits acceptance; any other effective result offers `EXTEND_REVIEW_BUDGET`,
+`SUPERSEDE_RUN`, or `ABORT_RUN`. This recovery is a route back to independent review, not user-authored
+PASS or completion authority.
+
+`EXTEND_REVIEW_BUDGET` is the continuity exit. It is offered whenever a batch's ordinary rounds are
+exhausted, including after a failed closeout, and it adds one more ordinary budget
+(`max_quality_rounds_per_batch` rounds) to that batch while keeping the acceptance contract, the finding
+ledger, the accepted batches, and every prior decision exactly as they are. The decision records the
+extension number, the rounds completed, and the OPEN blocking finding IDs at that moment, so each
+extension is a reasoned, auditable receipt rather than an automatic retry. The consumed closeout moves
+to `closeout_review_history`, and a fresh closeout can be authorized once the extended budget is
+exhausted again. Prefer it over `SUPERSEDE_RUN` when the remaining findings are real and the contract
+still describes the intended work; superseding discards that continuity and makes the next run
+rediscover the contract and the findings from scratch.
 
 Runs created before the finding ledger existed receive a narrow compatibility path. A resolved ID absent from the ledger is tolerated only when a same-batch, pre-policy formal report proves that ID existed; the policy records `LEGACY_UNTRACKED_RESOLUTION` and does not fabricate a fingerprint or ledger entry. Such a stranded batch may use exactly one fifth recovery review. Unknown IDs without that evidence remain `REVIEWER_ERROR`, leave state unchanged, and do not consume a valid round.
 

@@ -3407,7 +3407,7 @@ def apply_convergence_policy(
 
     if payload["verdict"] == "NEEDS_USER_DECISION":
         decision_reasons.append("REVIEWER_REQUESTED_DECISION")
-    if open_blocking and round_number >= MAX_REVIEW_ROUNDS:
+    if open_blocking and round_number >= ordinary_review_round_limit(state, batch):
         decision_reasons.append("FINAL_REVIEW_ROUND_REACHED")
     if open_blocking and convergence["no_progress_streak"] >= 2:
         decision_reasons.append("NO_PROGRESS_FOR_TWO_ROUNDS")
@@ -4148,9 +4148,17 @@ def qualifies_for_post_pass_review(
 
 
 def ordinary_review_round_limit(state: dict[str, Any], batch: str) -> int:
-    """Return the batch's ordinary quality-round limit, excluding closeout recovery."""
+    """Return the batch's ordinary quality-round limit, excluding closeout recovery.
+
+    Each `EXTEND_REVIEW_BUDGET` decision adds one more ordinary budget for the batch. The bound on
+    repair loops is the user's explicit, reasoned decision rather than a constant: the alternative
+    exit, superseding the run, threw away the acceptance contract and the finding ledger and made
+    the next run rediscover both from scratch.
+    """
+    budgets = state.get("budgets") or {}
     return (
-        int(state["budgets"]["max_quality_rounds_per_batch"])
+        int(budgets.get("max_quality_rounds_per_batch", MAX_REVIEW_ROUNDS))
+        * (1 + int(state.get("review_budget_extensions", {}).get(batch, 0)))
         + int(state.get("extra_review_rounds_granted", {}).get(batch, 0))
         + int(state.get("budget_review_rounds_granted", {}).get(batch, 0))
         + int(bool(state.get("post_pass_review_exemptions_used", {}).get(batch)))
@@ -4258,9 +4266,9 @@ def command_review(args: argparse.Namespace) -> None:
     ):
         existing_closeout = state.get("closeout_review_grants", {}).get(args.batch)
         if isinstance(existing_closeout, dict):
-            allowed_choices = ["SUPERSEDE_RUN", "ABORT_RUN"]
+            allowed_choices = ["EXTEND_REVIEW_BUDGET", "SUPERSEDE_RUN", "ABORT_RUN"]
         else:
-            allowed_choices = ["DEFER_ELIGIBLE_P1", "ABORT_RUN"]
+            allowed_choices = ["DEFER_ELIGIBLE_P1", "EXTEND_REVIEW_BUDGET", "ABORT_RUN"]
             if not state.get("budget_review_rounds_granted", {}).get(args.batch):
                 allowed_choices.insert(0, "GRANT_ONE_REVIEW")
         state["status"] = "NEEDS_USER_DECISION"
@@ -4698,7 +4706,7 @@ def command_review(args: argparse.Namespace) -> None:
         })
     if policy["effective_verdict"] == "NEEDS_USER_DECISION":
         if closeout_review:
-            allowed = ["SUPERSEDE_RUN", "ABORT_RUN"]
+            allowed = ["EXTEND_REVIEW_BUDGET", "SUPERSEDE_RUN", "ABORT_RUN"]
         else:
             allowed = ["ABORT_RUN"]
             if any(
@@ -4769,7 +4777,7 @@ def command_review(args: argparse.Namespace) -> None:
             "supplied_diff_base_sha": diff_base,
             "supplied_diff_bytes": supplied_diff_bytes,
             "duration_seconds": duration,
-            "final_review_round": round_number >= MAX_REVIEW_ROUNDS,
+            "final_review_round": round_number >= round_limit,
             "legacy_recovery_round": legacy_recovery_round,
             "closeout_review": closeout_review,
         },
@@ -4936,6 +4944,20 @@ def command_adjudicate(args: argparse.Namespace) -> None:
         if int(state.get("extra_review_invocations_granted", {}).get(batch, 0)) >= 1:
             raise WorkflowError(
                 "the single extra review invocation grant was already used for this batch")
+    elif args.choice == "EXTEND_REVIEW_BUDGET":
+        batch = pending.get("batch")
+        if not isinstance(batch, str):
+            raise WorkflowError("a review budget extension requires a batch-scoped decision")
+        decision["review_budget_extension"] = {
+            "batch": batch,
+            "extension_number": int(state.get("review_budget_extensions", {}).get(batch, 0)) + 1,
+            "rounds_completed": completed_batch_rounds,
+            "open_blocking_findings": sorted(
+                item["id"] for item in state["finding_ledger"].values()
+                if item.get("batch") == batch and item.get("status") == "OPEN"
+                and item.get("severity") in {"P0", "P1"}
+            ),
+        }
     elif args.choice == "DEFER_ELIGIBLE_P1":
         if not finding_ids:
             raise WorkflowError("DEFER_ELIGIBLE_P1 requires --finding-ids")
@@ -4974,6 +4996,27 @@ def command_adjudicate(args: argparse.Namespace) -> None:
     elif args.choice == "GRANT_ONE_REVIEW_INVOCATION":
         state.setdefault("extra_review_invocations_granted", {})[str(pending["batch"])] = 1
         state["status"] = str(pending.get("previous_status", "CHANGES_REQUESTED"))
+    elif args.choice == "EXTEND_REVIEW_BUDGET":
+        batch = str(pending["batch"])
+        extensions = state.setdefault("review_budget_extensions", {})
+        extensions[batch] = int(extensions.get(batch, 0)) + 1
+        # The consumed closeout belongs to the previous budget. It stays in the audit history and
+        # a fresh closeout can be authorized once the extended budget is exhausted in turn.
+        consumed = state.get("closeout_review_grants", {}).pop(batch, None)
+        if isinstance(consumed, dict):
+            state.setdefault("closeout_review_history", []).append(
+                {**consumed, "batch": batch, "retired_by_decision": decision["id"]}
+            )
+        decision["review_budget_extension"]["new_round_limit"] = ordinary_review_round_limit(
+            state, batch
+        )
+        # The no-progress streak measured the budget that just ended. The user has read those
+        # rounds and chosen to continue, so the extended budget starts its own measurement;
+        # otherwise the first extended round would re-park the batch before any fix is judged.
+        convergence = state.setdefault("batch_convergence", {}).get(batch)
+        if isinstance(convergence, dict):
+            convergence["no_progress_streak"] = 0
+        state["status"] = "CHANGES_REQUESTED"
     elif args.choice == "DEFER_ELIGIBLE_P1":
         ledger_by_id = {item["id"]: item for item in state["finding_ledger"].values()}
         for finding_id in finding_ids:
@@ -5181,6 +5224,8 @@ def status_payload(project: Path, state: dict[str, Any]) -> dict[str, Any]:
         "budgets": state.get("budgets", {}), "usage": state.get("usage", {}),
         "pending_decision": state.get("pending_decision"),
         "closeout_review_grants": state.get("closeout_review_grants", {}),
+        "review_budget_extensions": state.get("review_budget_extensions", {}),
+        "closeout_review_history": state.get("closeout_review_history", []),
         "final_verification": state.get("final_verification"),
         "final_sha": state["final_sha"], "plan_digest": state["plan_digest"],
         "plan_snapshot": state["plan_snapshot"],

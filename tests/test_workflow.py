@@ -3090,8 +3090,82 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "status", "--project", str(self.project), "--run-id", run_id,
         )["pending_decision"]
         self.assertEqual(terminal["type"], "CLOSEOUT_REVIEW_DID_NOT_PASS")
-        self.assertEqual(terminal["allowed_choices"], ["SUPERSEDE_RUN", "ABORT_RUN"])
+        self.assertEqual(
+            terminal["allowed_choices"], ["EXTEND_REVIEW_BUDGET", "SUPERSEDE_RUN", "ABORT_RUN"]
+        )
         self.environment.pop("FAKE_FINDINGS")
+
+    def test_extending_the_review_budget_keeps_contract_and_ledger_and_reopens_closeout(self) -> None:
+        """Replays B06: after a failed closeout the only exits were supersede or abort, and the
+        superseding run rewrote the contract and renamed every finding."""
+        initialized, implementation, finding = self._reach_exhausted_review_decision()
+        run_id = str(initialized["run_id"])
+        run_directory = Path(str(initialized["run_directory"]))
+
+        def state() -> dict:
+            return json.loads((run_directory / "workflow.json").read_text(encoding="utf-8"))
+
+        pending = self.workflow("status", "--project", str(self.project), "--run-id", run_id)["pending_decision"]
+        self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(pending["decision_id"]), "--choice", "RETURN_TO_FIX",
+            "--reason", "attempt the final bounded repair", "--actor", "test-user", "--apply",
+        )
+        self.commit_batch_change(implementation, "still unfixed at closeout\n")
+        closeout = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1", expected=3,
+        )
+        self.assertEqual(closeout["round"], 5)
+        before = state()
+        contract_digest = before["acceptance_contract"]["digest"]
+        ledger_before = before["finding_ledger"]
+        pending = self.workflow("status", "--project", str(self.project), "--run-id", run_id)["pending_decision"]
+        extended = self.workflow(
+            "adjudicate", "--project", str(self.project), "--run-id", run_id,
+            "--decision-id", str(pending["decision_id"]), "--choice", "EXTEND_REVIEW_BUDGET",
+            "--reason", "the remaining P1 is real and the contract still describes the work",
+            "--actor", "test-user", "--apply",
+        )
+        self.assertEqual(extended["run_status"], "CHANGES_REQUESTED")
+        extension = extended["decision"]["review_budget_extension"]
+        self.assertEqual(extension["extension_number"], 1)
+        self.assertEqual(extension["rounds_completed"], 5)
+        self.assertEqual(extension["open_blocking_findings"], [finding["id"]])
+        self.assertEqual(extension["new_round_limit"], 8)
+        after = state()
+        self.assertEqual(after["acceptance_contract"]["digest"], contract_digest)
+        self.assertEqual(after["finding_ledger"], ledger_before)
+        self.assertEqual(after["review_budget_extensions"], {"1": 1})
+        self.assertNotIn("1", after["closeout_review_grants"])
+        self.assertEqual(len(after["closeout_review_history"]), 1)
+
+        # The same batch continues with its ledger: round 6 is an ordinary DELTA re-review.
+        self.commit_batch_change(implementation, "unfixed round 6\n")
+        sixth = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1", expected=2,
+        )
+        self.assertEqual(sixth["status"], "REVIEW_FAIL")
+        self.assertEqual(sixth["round"], 6)
+        self.assertEqual(sixth["review_mode"], "DELTA")
+        self.assertFalse(sixth["closeout_review"])
+        self.assertFalse(sixth["final_review_round"])
+        self.assertEqual(sixth["findings"][0]["id"], finding["id"])
+        self.assertEqual(state()["finding_ledger"][finding["fingerprint"]]["occurrences"], 6)
+
+        # The repair lands: the frozen ledger entry closes and the batch is accepted normally.
+        self.environment.pop("FAKE_FINDINGS")
+        self.environment["FAKE_RESOLVED_FINDING_IDS"] = json.dumps([finding["id"]])
+        head = self.commit_batch_change(implementation, "fixed in the extended budget\n")
+        passed = self.workflow("review", "--project", str(self.project), "--run-id", run_id, "--batch", "1")
+        self.environment.pop("FAKE_RESOLVED_FINDING_IDS")
+        self.assertEqual(passed["status"], "REVIEW_PASS")
+        self.assertEqual(passed["round"], 7)
+        accepted = self.workflow(
+            "accept", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+            "--review-file", str(passed["report_path"]),
+        )
+        self.assertEqual(accepted["accepted_sha"], head)
+        self.assertEqual(state()["finding_ledger"][finding["fingerprint"]]["status"], "VERIFIED")
 
     def test_closeout_invocation_exhaustion_has_one_grant_then_terminal_choices(self) -> None:
         initialized, implementation, _ = self._reach_exhausted_review_decision()

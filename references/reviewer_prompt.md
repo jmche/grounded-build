@@ -94,8 +94,8 @@ fresh unlimited architecture review each round.
 After the ordinary quality-round limit is exhausted, the controller may authorize one closeout
 review bound to the applied typed decision, batch, and exact implementation SHA. Treat it as terminal
 confirmation of that decision or repair, not a new discovery cycle. Infrastructure or schema failure
-does not consume it. If an effective P0/P1 still remains, report it honestly; the controller will stop
-the repair loop rather than mint another closeout.
+does not consume it. If an effective P0/P1 still remains, report it honestly; the controller stops the
+repair loop and only an explicit user decision that keeps the ledger and contract can extend it.
 
 Verdicts:
 

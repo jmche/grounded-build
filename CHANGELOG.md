@@ -4,6 +4,18 @@ All notable changes use semantic versioning.
 
 ## [0.7.8] - 2026-09-17
 
+- Added the `EXTEND_REVIEW_BUDGET` decision. When a batch's ordinary rounds are exhausted, including
+  after a failed closeout, the user can add one more ordinary budget to the same batch with a
+  recorded reason; the acceptance contract, finding ledger, accepted batches, and prior decisions
+  stay exactly as they are, the consumed closeout moves to `closeout_review_history`, and a fresh
+  closeout can be authorized later. Superseding the run was the only exit before, and the
+  observed superseding run rewrote the contract (C01-C05 became C1-C7 with a new demand) and
+  renamed every finding. The round-cap reason now follows the batch's actual limit.
+- Contract reviewer: each criterion is one decidable observation written for the implementer,
+  not a reviewer task list; a host criterion that contradicts the plan is reported as a
+  `NEEDS_USER_DECISION` issue instead of silently binding one side. Host contract: read the
+  batch's criteria before implementing and check them before requesting review; host conditions
+  must agree with the plan.
 - Made the final integration review its own stage (`review --batch FINAL`) instead of a property
   of the last plan batch. Every plan batch, including the last one, is now reviewed from the
   previously accepted SHA against its own criteria; the final review runs once after the last
