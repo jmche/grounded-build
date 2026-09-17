@@ -3347,6 +3347,7 @@ def apply_convergence_policy(
             **finding,
             "latest_required_outcome": finding["required_outcome"],
             "obligation_revisions": [],
+            "severity_history": [],
             "batch": batch,
             "status": "OPEN" if blocking else "DEFERRED",
             "blocking": blocking,

@@ -3455,12 +3455,8 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(second["decision_reasons"], [])
         emitted = second["findings"][0]
         overlay = set(emitted) - {"id", "fingerprint", "severity", "novelty", "location", "details"}
-        self.assertTrue(overlay <= set(WORKFLOW_MODULE.LEDGER_BOUND_FINDING_FIELDS), overlay)
-        self.assertTrue(
-            {"status", "deferred_reason", "required_outcome", "latest_required_outcome",
-             "obligation_revisions"} <= overlay,
-            overlay,
-        )
+        self.assertEqual(overlay, set(WORKFLOW_MODULE.LEDGER_BOUND_FINDING_FIELDS))
+        self.assertEqual(emitted["severity_history"], [])
         self.assertEqual(emitted["required_outcome"], "enforce it at the write boundary")
         self.assertEqual(emitted["latest_required_outcome"], "reject every produced filename")
         self.assertEqual(emitted["status"], "OPEN")
