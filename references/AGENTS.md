@@ -27,7 +27,7 @@ processes — the second kind is executable input, not prose.
 - **Wording here is asserted by tests.** `tests/test_workflow.py::DocumentationContractTests` requires
   a shared vocabulary across `implementation_workflow.md`, `reviewer_prompt.md`, and `SKILL.md`:
   `fingerprint`, `novelty`, `INITIAL_REVIEW`, `INTRODUCED_BY_FIX`, `PREVIOUSLY_MASKED`, `PRE_EXISTING`,
-  `UNRELATED`, `resolved_finding_ids`, `introduced_by_sha`, `severity_change_justification`, `OPEN`,
+  `UNRELATED`, `resolved_finding_ids`, `required_outcome`, `location`, `details`, `OPEN`,
   `VERIFIED`, `DEFERRED`, `legacy recovery`, `decidable`, `machine checkable`, `named`,
   `verdict=NEEDS_USER_DECISION`, `exactly one P1 finding`, `controller_runtime`, `<controller-python>`,
   `original project environment`, and ``never runs `uv sync` ``. Run the suite after any edit.

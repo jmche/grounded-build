@@ -117,8 +117,9 @@ follow their own migration boundary. The host must reason with the same lifecycl
 reviewer output as an opaque PASS/FAIL gate.
 
 - Every finding has a stable semantic `fingerprint` and an ID that is reused while the same defect remains.
-- `novelty` is exactly one of `INITIAL_REVIEW`, `INTRODUCED_BY_FIX`, `PREVIOUSLY_MASKED`, `PRE_EXISTING`, or `UNRELATED`. `INTRODUCED_BY_FIX` requires `introduced_by_sha`; `PREVIOUSLY_MASKED` requires an explanation of why earlier detection was impossible.
-- `resolved_finding_ids` may name only prior OPEN findings that the reviewed SHA verifiably resolves. A severity change requires `severity_change_justification`.
+- Every finding carries `location`, `required_outcome`, and `details`. `required_outcome` is the close condition the implementer works against; the ledger freezes it at first statement, records later restatements as `obligation_revisions` without moving the obligation, and expects a wider obligation to arrive as a new finding.
+- `novelty` is exactly one of `INITIAL_REVIEW`, `INTRODUCED_BY_FIX`, `PREVIOUSLY_MASKED`, `PRE_EXISTING`, or `UNRELATED`. The controller binds the reviewed SHA and round to every finding, so the reviewer never repeats them; the reasoning for `INTRODUCED_BY_FIX` and `PREVIOUSLY_MASKED` lives in `details` and is judged by the host and the user, not by the controller.
+- `resolved_finding_ids` may name only prior OPEN findings that the reviewed SHA verifiably resolves. A severity change is recorded in the ledger's `severity_history`; its reason lives in `details`.
 - The finding ledger owns lifecycle state: blocking findings are `OPEN`, verified repairs become `VERIFIED`, and nonblocking findings become `DEFERRED` with an explicit reason. Missing OPEN findings do not disappear merely because a later reviewer omits them.
 - Legacy recovery is an evidence-preserving exception for pre-ledger reports, not permission to invent IDs or fingerprints.
 - Acceptance criteria use `COMMAND`, `REPOSITORY_ASSERTION`, or `USER_BOUNDARY` evidence. Deterministic code verifies provenance, SHA, command execution, and state; the independent reviewer decides semantic sufficiency.
@@ -404,7 +405,7 @@ Read `warnings` and `decision_reasons` on every review result:
 
 - `CROSS_BATCH_RESOLUTION` / `CROSS_BATCH_FINDING`: the reviewer referenced a finding an earlier batch owns. The observation is recorded, that batch keeps authority over its own status, and only a cross-batch P0 raises `CROSS_BATCH_MATERIAL_FINDING` for adjudication.
 - `REVIEW_INVOCATION_BUDGET_EXHAUSTED`: the batch spent its reviewer calls, typically on invocations that errored without producing a review. `GRANT_ONE_REVIEW_INVOCATION` releases exactly one more, once per batch, and returns the run to the status it parked from. Deferring a finding cannot replenish call authority, so it is not offered as an invocation-budget remedy. Before the grant is used, the menu contains that grant plus `SUPERSEDE_RUN` and `ABORT_RUN`; afterward only those honest terminal choices remain. Both budget guards honour the grant, so the extra call really runs, including for a still-unused closeout review.
-- `OBLIGATION_DRIFT:<finding-id>`: the finding's `required_outcome` or the files it names changed for the second time. The ledger keeps `original_required_outcome`, `original_location`, and the full `obligation_revisions` history. Present that history when adjudicating: a requirement restated at three sites is a widening class, not one unfixed defect, and `RETURN_TO_FIX` or `DEFER_ELIGIBLE_P1` are both legitimate answers.
+- A finding whose `obligation_revisions` list is growing is being restated by the reviewer while the ledger keeps judging it against the frozen `required_outcome`; `latest_required_outcome` shows the newest wording. Implement against the frozen text. When such a finding reaches `NO_PROGRESS_FOR_TWO_ROUNDS` or the round cap, present that history when adjudicating: a requirement restated at three sites is a widening class, not one unfixed defect, and `RETURN_TO_FIX` or `DEFER_ELIGIBLE_P1` are both legitimate answers.
 
 Convergence policy:
 

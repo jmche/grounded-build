@@ -46,16 +46,20 @@ inflate uncertainty into P1.
 
 Give every defect a semantic `fingerprint` that remains stable across file movement or rewording, for example `budget-routing:infra-error-charged-to-quality`. Reuse the existing finding ID and fingerprint when the same defect remains. Never present a rephrased prior issue as a new finding.
 
-The machine envelope is intentionally small. Every finding must provide `id`, `fingerprint`,
-`severity`, `novelty`, and one `details` string containing its semantic explanation. The controller
-maps that explanation into the audit ledger and supplies empty compatibility values for legacy prose
-fields; do not invent separate prose fields merely to satisfy formatting. Always return the top-level
-arrays `resolved_finding_ids`, `verification_requests`, and `criterion_results`; use `[]` when empty.
-Never omit a required criterion result for a non-`NEEDS_VERIFICATION` verdict.
+Every finding carries exactly these fields: `id`, `fingerprint`, `severity`, `novelty`,
+`location`, `required_outcome`, and `details`. `location` names where the defect lives
+(`path:line`, or empty when the defect has no single site). `required_outcome` is the close
+condition: the observable state that lets the implementer and the next review call the finding
+resolved. `details` holds everything else you reason from: the trigger, the consequence, why a
+masked defect could not be seen earlier, and why a severity changed. Do not add other fields, and do
+not repeat facts the controller already owns, such as the reviewed SHA, the base SHA, or the round.
+Always return the top-level arrays `resolved_finding_ids`, `verification_requests`, and
+`criterion_results`; use `[]` when empty. Never omit a required criterion result for a
+non-`NEEDS_VERIFICATION` verdict.
 
 That stability covers one instance that moved or was reworded. Another instance of the same class at a different site is a NEW finding with its own fingerprint, even when the underlying cause is identical: reuse the old ID only when you are re-reporting the same instance. Reusing one ID for a widening class of sites hides late discoveries from the round rules that would otherwise defer them.
 
-`required_outcome` is the close condition the implementer is entitled to work against, so it is frozen when first stated. Restating it, or naming a different file, is recorded as an obligation revision. A second revision stops the batch for a typed user decision instead of continuing an unbounded round loop. If the real obligation is wider than you first stated, say so once as a new finding rather than by enlarging an existing one.
+`required_outcome` is the close condition the implementer is entitled to work against, so the ledger freezes it when first stated: later wording you supply for the same finding is recorded as a restatement but does not move the obligation, and the finding is judged against the frozen text. Repeat the ledger's `required_outcome` for a finding you re-report. If the real obligation is wider than you first stated, say so once as a new finding with its own fingerprint rather than by enlarging an existing one; the round rules then classify that new finding honestly.
 
 Read the supplied finding ledger. Put prior OPEN finding IDs in `resolved_finding_ids` only when the current code verifiably resolves them. If a prior finding remains, include it again with the same ID and fingerprint.
 
@@ -64,14 +68,14 @@ The ledger lifecycle states are `OPEN`, `VERIFIED`, and `DEFERRED`. You report e
 Classify novelty as:
 
 - `INITIAL_REVIEW`: found during the first full discovery review;
-- `INTRODUCED_BY_FIX`: introduced by a repair commit; provide `introduced_by_sha`;
-- `PREVIOUSLY_MASKED`: genuinely impossible to establish before the earlier defect was fixed; explain why;
+- `INTRODUCED_BY_FIX`: introduced by a repair commit in the reviewed delta; the controller records the reviewed SHA and round, so name the offending change in `details` rather than repeating the SHA;
+- `PREVIOUSLY_MASKED`: genuinely impossible to establish before the earlier defect was fixed; say in `details` what masked it;
 - `PRE_EXISTING`: existed at the target baseline and was not caused by this batch;
 - `UNRELATED`: outside the current batch or plan.
 
 On later rounds, a new P1 blocks only when it is `INTRODUCED_BY_FIX` or `PREVIOUSLY_MASKED`. Late pre-existing, unrelated, or merely newly noticed non-catastrophic issues should be recorded for deferral rather than reopening the batch indefinitely. A newly discovered P0 always blocks.
 
-If severity changes, provide `severity_change_justification`. Upgrading a deferred issue to blocking requires user adjudication rather than automatic repair.
+If severity changes, explain why in `details`; the ledger records the change and the user, not the controller, judges the reason. Upgrading a deferred issue to blocking requires user adjudication rather than automatic repair.
 
 ## Round scope
 

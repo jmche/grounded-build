@@ -87,23 +87,23 @@ REVIEW_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
+                # One finding shape for the reviewer, the validator, and the ledger. Facts the
+                # controller already knows (reviewed SHA, base SHA, round) are bound after receipt
+                # and are never requested from the reviewer. Reasoning such as why a defect was
+                # masked earlier or why a severity changed belongs in `details`; the controller
+                # never machine-judges that prose.
                 "properties": {
                     "id": {"type": "string"},
                     "fingerprint": {"type": "string"},
                     "severity": {"type": "string", "enum": ["P0", "P1", "P2"]},
                     "novelty": {"type": "string", "enum": ["INITIAL_REVIEW", "INTRODUCED_BY_FIX", "PREVIOUSLY_MASKED", "PRE_EXISTING", "UNRELATED"]},
-                    "why_not_detectable_earlier": {"type": "string"},
-                    "introduced_by_sha": {"type": "string"},
-                    "severity_change_justification": {"type": "string"},
                     "location": {"type": "string"},
-                    "trigger": {"type": "string"},
-                    "consequence": {"type": "string"},
                     "required_outcome": {"type": "string"},
+                    "details": {"type": "string"},
                 },
                 "required": [
-                    "id", "fingerprint", "severity", "novelty", "why_not_detectable_earlier",
-                    "introduced_by_sha", "severity_change_justification", "location", "trigger",
-                    "consequence", "required_outcome",
+                    "id", "fingerprint", "severity", "novelty", "location", "required_outcome",
+                    "details",
                 ],
             },
         },
@@ -215,27 +215,6 @@ def producer_delivery_schema(
     for field in removed:
         properties.pop(field, None)
     result["required"] = [field for field in result.get("required", []) if field not in removed]
-    findings = properties.get("findings")
-    if isinstance(findings, dict):
-        item = findings.get("items")
-        if isinstance(item, dict):
-            # Strict Codex schemas require an explicit closed object. Keep the machine
-            # lifecycle envelope small and carry reviewer prose in one semantic field.
-            item["additionalProperties"] = False
-            item["properties"] = {
-                "id": {"type": "string"},
-                "fingerprint": {"type": "string"},
-                "severity": {"type": "string", "enum": ["P0", "P1", "P2"]},
-                "novelty": {
-                    "type": "string",
-                    "enum": [
-                        "INITIAL_REVIEW", "INTRODUCED_BY_FIX", "PREVIOUSLY_MASKED",
-                        "PRE_EXISTING", "UNRELATED",
-                    ],
-                },
-                "details": {"type": "string"},
-            }
-            item["required"] = ["id", "fingerprint", "severity", "novelty", "details"]
     return result
 
 
@@ -2468,15 +2447,11 @@ def bind_contract_identity(
     return disclosures
 
 
-REVIEW_FINDING_TEXT_FIELDS = (
-    "why_not_detectable_earlier",
-    "introduced_by_sha",
-    "severity_change_justification",
-    "location",
-    "trigger",
-    "consequence",
-    "required_outcome",
-)
+# A defect may genuinely have no single site (a missing invariant, a repository-wide policy), so
+# `location` is the one finding field a non-strict provider may omit. `details` and
+# `required_outcome` are the finding's substance and its close condition; a finding without them
+# gives the implementer nothing to act on, so their absence is a delivery error, not prose.
+REVIEW_FINDING_OPTIONAL_TEXT_FIELDS = ("location",)
 
 
 def normalize_review_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2489,10 +2464,7 @@ def normalize_review_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for index, finding in enumerate(payload.get("findings", [])):
         if not isinstance(finding, dict):
             continue
-        details = finding.get("details")
-        if isinstance(details, str):
-            finding.setdefault("consequence", details)
-        for field in REVIEW_FINDING_TEXT_FIELDS:
+        for field in REVIEW_FINDING_OPTIONAL_TEXT_FIELDS:
             if field not in finding:
                 finding[field] = ""
                 disclosures.append({
@@ -2944,7 +2916,8 @@ def validate_review_payload(
     if payload.get("verdict") not in {"PASS", "FAIL", "NEEDS_USER_DECISION", "NEEDS_VERIFICATION"}:
         raise WorkflowError(f"invalid review verdict: {payload.get('verdict')!r}")
     findings = payload.get("findings")
-    required = {"id", "fingerprint", "severity", "novelty"}
+    required = {"id", "fingerprint", "severity", "novelty", "required_outcome", "details"}
+    novelties = set(REVIEW_SCHEMA["properties"]["findings"]["items"]["properties"]["novelty"]["enum"])
     if not isinstance(findings, list):
         raise WorkflowError("review findings must be a list")
     for index, finding in enumerate(findings):
@@ -2952,16 +2925,13 @@ def validate_review_payload(
             raise WorkflowError(f"finding {index} is missing required fields")
         if finding["severity"] not in {"P0", "P1", "P2"}:
             raise WorkflowError(f"finding {index} has invalid severity")
-        if not finding["fingerprint"].strip():
-            raise WorkflowError(f"finding {index} has an empty fingerprint")
-        if finding["novelty"] == "PREVIOUSLY_MASKED" and not finding[
-            "why_not_detectable_earlier"
-        ].strip():
-            raise WorkflowError(f"finding {index} claims PREVIOUSLY_MASKED without explanation")
-        if finding["novelty"] == "INTRODUCED_BY_FIX" and not re.fullmatch(
-            r"[0-9a-f]{7,40}", finding["introduced_by_sha"]
-        ):
-            raise WorkflowError(f"finding {index} lacks a valid introduced_by_sha")
+        if finding["novelty"] not in novelties:
+            raise WorkflowError(f"finding {index} has invalid novelty")
+        for field in ("fingerprint", "required_outcome", "details"):
+            if not isinstance(finding[field], str) or not finding[field].strip():
+                raise WorkflowError(f"finding {index} has an empty {field}")
+        if not isinstance(finding.get("location", ""), str):
+            raise WorkflowError(f"finding {index} has a non-string location")
     resolved = payload.get("resolved_finding_ids")
     if not isinstance(resolved, list) or not all(isinstance(item, str) for item in resolved):
         raise WorkflowError("resolved_finding_ids must be a list of strings")
@@ -3141,18 +3111,6 @@ def _normalized_text(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
-def _obligation_paths(location: Any) -> frozenset[str]:
-    """File paths named by a finding location, ignoring line numbers.
-
-    Line numbers move with every fix commit, so comparing them would report drift for an
-    obligation that never changed. The set of files a defect lives in is the stable part.
-    """
-    return frozenset(
-        match.group(1)
-        for match in re.finditer(r"([\w./\\-]+\.[A-Za-z0-9_]+)(?::\d+)?", str(location or ""))
-    )
-
-
 def apply_convergence_policy(
     state: dict[str, Any], payload: dict[str, Any], batch: str, round_number: int, head: str
 ) -> dict[str, Any]:
@@ -3274,57 +3232,40 @@ def apply_convergence_policy(
             old_severity = existing["severity"]
             new_severity = finding["severity"]
             if old_severity != new_severity:
-                if not finding["severity_change_justification"].strip():
-                    raise ReviewContractError(
-                        f"severity changed without justification for {finding['id']}: "
-                        f"{old_severity} -> {new_severity}"
-                    )
+                # Whether the new severity is justified is a judgement for the adjudicating user;
+                # the reviewer's reasoning arrives in `details`. The controller records the machine
+                # fact that it changed and escalates only the upgrade of a deferred finding.
+                existing.setdefault("severity_history", []).append(
+                    {"round": round_number, "from": old_severity, "to": new_severity}
+                )
                 if old_severity == "P2" and new_severity in {"P0", "P1"}:
                     decision_reasons.append(f"SEVERITY_UPGRADE:{finding['id']}")
-            # `required_outcome` is what "fixed" means for this finding, and it used to be
-            # overwritten silently every round. Measured on five stuck findings, one ID absorbed a
-            # whole class of defects: F-B05-002 was restated at five locations across three files
-            # over five rounds, each restatement looking narrow on its own. The host satisfied the
-            # named site, the obligation moved, `occurrences` grew, and the finding never closed --
-            # slipping past the round-2+ rule that would otherwise have deferred a late
-            # INITIAL_REVIEW discovery. Line numbers are excluded from the comparison because they
-            # move with every commit; the files a defect lives in are the stable part.
-            previous_paths = _obligation_paths(existing.get("location"))
-            current_paths = _obligation_paths(finding["location"])
-            obligation_changed = (
-                _normalized_text(existing.get("required_outcome"))
-                != _normalized_text(finding["required_outcome"])
-                or previous_paths != current_paths
-            )
+            # `required_outcome` is what "fixed" means for this finding. It is frozen at the first
+            # statement so the implementer always has one close condition to work against.
+            # Measured on five stuck findings, one ID used to absorb a whole class of defects:
+            # F-B05-002 was restated at five sites over five rounds and never closed. Restatements
+            # are kept for audit but do not move the obligation; a wider obligation is a new
+            # finding, which the round rules then classify. Line numbers and files may move with
+            # every commit, so `location` is refreshed freely.
+            frozen = existing.get("required_outcome")
             revisions = list(existing.get("obligation_revisions", []))
-            if obligation_changed:
+            if not frozen:
+                frozen = finding["required_outcome"]
+            elif _normalized_text(frozen) != _normalized_text(finding["required_outcome"]):
                 revisions.append(
-                    {
-                        "round": round_number,
-                        "from_required_outcome": existing.get("required_outcome"),
-                        "to_required_outcome": finding["required_outcome"],
-                        "from_paths": sorted(previous_paths),
-                        "to_paths": sorted(current_paths),
-                    }
+                    {"round": round_number, "stated_required_outcome": finding["required_outcome"]}
                 )
-                # Only a round that moves the obligation again can force the decision. A finding
-                # whose obligation has stabilised must be allowed to converge.
-                if len(revisions) >= 2:
-                    decision_reasons.append(f"OBLIGATION_DRIFT:{finding['id']}")
-            existing.setdefault("original_required_outcome", existing.get("required_outcome"))
-            existing.setdefault("original_location", existing.get("location"))
             existing.update(
                 {
                     "severity": new_severity,
                     "location": finding["location"],
-                    "trigger": finding["trigger"],
-                    "consequence": finding["consequence"],
-                    "required_outcome": finding["required_outcome"],
+                    "details": finding["details"],
+                    "required_outcome": frozen,
+                    "latest_required_outcome": finding["required_outcome"],
                     "obligation_revisions": revisions,
                     "last_seen_round": round_number,
                     "last_seen_sha": head,
                     "occurrences": existing.get("occurrences", 1) + 1,
-                    "severity_change_justification": finding["severity_change_justification"],
                 }
             )
             if new_severity == "P0":
@@ -4687,7 +4628,6 @@ def command_review(args: argparse.Namespace) -> None:
             if any(
                 reason == "NO_PROGRESS_FOR_TWO_ROUNDS"
                 or reason.startswith("SEVERITY_UPGRADE:")
-                or reason.startswith("OBLIGATION_DRIFT:")
                 for reason in policy["decision_reasons"]
             ):
                 allowed.insert(0, "RETURN_TO_FIX")
@@ -5418,7 +5358,7 @@ def write_final_report(state: dict[str, Any], integrated: bool) -> Path:
         for item in state["reviews"]
     ]
     deferred_lines = [
-        f"- `{item['id']}` ({item['severity']}): {item['consequence']} "
+        f"- `{item['id']}` ({item['severity']}): {item.get('details') or item.get('consequence', '')} "
         f"[{item.get('deferred_reason') or 'deferred'}]"
         for item in state["finding_ledger"].values()
         if item["status"] == "DEFERRED"

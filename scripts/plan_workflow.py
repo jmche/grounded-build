@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-VERSION = "0.7.7"
+VERSION = "0.7.8"
 SCHEMA_VERSION = 2
 SUPPORTED_PROVIDERS = ("claude", "codex", "dsh", "other")
 OTHER_BRIDGE_PROTOCOL = "grounded-build-other-v1"

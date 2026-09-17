@@ -2,7 +2,7 @@
 name: grounded-build
 description: Produce and audit repository-grounded implementation plans with isolated planning instances, cross-review, deterministic workflow state, and optional reviewed implementation. Use only when the user explicitly requests grounded-build. For implementing an unrelated existing plan, prefer implement-plan-with-review.
 metadata:
-  version: 0.7.7
+  version: 0.7.8
   compatibility: Linux, Git, Python 3.11+, bubblewrap and socat (both sandbox packages; the provider CLI sandbox is fail-closed), and at least one Claude, Codex, dsh, or protocol-compatible other CLI adapter
 ---
 

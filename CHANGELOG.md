@@ -2,6 +2,27 @@
 
 All notable changes use semantic versioning.
 
+## [0.7.8] - 2026-09-17
+
+- Gave Implement review findings one shape for the reviewer, the validator, and the ledger: `id`,
+  `fingerprint`, `severity`, `novelty`, `location`, `required_outcome`, `details`. The provider
+  schema is now derived from that shape instead of restated, so the prompt can no longer name a
+  field the wire cannot carry. 0.7.5 had removed `introduced_by_sha` and
+  `why_not_detectable_earlier` from the wire while the validator still demanded them, which made
+  `INTRODUCED_BY_FIX` and `PREVIOUSLY_MASKED` unreportable: a truthful regression report was
+  rejected as a contract error, and the only reportable label deferred the regression as a late
+  discovery. A test now proves every `novelty` value is deliverable under the strict schema.
+- Stopped asking the reviewer for facts the controller already owns. The reviewed SHA and round
+  are bound to every finding at receipt; `introduced_by_sha` is retired.
+- Froze each finding's `required_outcome` at its first statement. Restatements are recorded as
+  `obligation_revisions` with the latest wording in `latest_required_outcome`, and the finding is
+  judged against the frozen text; a wider obligation is a new finding. The `OBLIGATION_DRIFT`
+  decision and its path-set comparison are retired: whether a restatement widened the obligation is
+  a semantic judgement, and the machine had also flagged a shrinking file set as drift. The
+  no-progress and round-cap rules still bound the loop.
+- Retired `severity_change_justification` as a machine gate. A severity change is recorded in
+  `severity_history`; the reviewer's reason lives in `details` and is judged by the user.
+
 ## [0.7.7] - 2026-09-17
 
 - Restored strict-compatible Implement reviewer delivery: closed finding objects use a minimal
