@@ -3,7 +3,7 @@
 # grounded-build
 
 ## Purpose
-A local coding-agent skill (v0.7.4, public beta) with two independent modes. **Plan** runs two
+A local coding-agent skill (v0.7.7, public beta) with two independent modes. **Plan** runs two
 isolated Claude/Codex/dsh/generic-bridge CLI instances against one frozen Git SHA, has them investigate independently,
 cross-review each other's evidence, and converge on a host-synthesized implementation plan. **Implement**
 executes an approved plan batch by batch in isolated Git worktrees with fixed-SHA independent review,
@@ -16,7 +16,7 @@ next rather than reconstructing a state machine from prose.
 |------|-------------|
 | `SKILL.md` | Host-facing skill contract and entry point: routing (Plan / Implement / end-to-end), non-negotiable boundaries, and the command sequence for both workflows. Frontmatter carries `name`, `description`, and `metadata.version`. |
 | `README.md` | Human-facing overview, install location, examples, runtime notes, and coexistence rules with `implement-plan-with-review`. |
-| `VERSION` | Single source of truth for the release version (`0.7.4`). The release gate rejects drift against SKILL.md, README.md, CHANGELOG.md, and `scripts/plan_workflow.py`. |
+| `VERSION` | Single source of truth for the release version (`0.7.7`). The release gate rejects drift against SKILL.md, README.md, CHANGELOG.md, and `scripts/plan_workflow.py`. |
 | `CHANGELOG.md` | Semantic-versioned history; entries record measured behavior (e.g. limits derived from a completed 223-verification run), not intentions. |
 | `SECURITY.md` | Trust model, enforced bubblewrap/filesystem boundaries, the deliberate limit of local HMAC, and private vulnerability reporting. Content is asserted by the release gate. |
 | `LICENSE` | MIT license. The release gate requires it to start with `MIT License`. |
@@ -44,9 +44,9 @@ Not documented (generated or transient): `.omc/`, `.pytest_cache/`, `.ipynb_chec
 - **Runtime state lives outside this repository.** Planning writes to `~/.grounded-build/planning/`
   (override: `GROUNDED_BUILD_PLAN_HOME`), implementation to `~/.grounded-build/implementation/`
   (override: `GROUNDED_BUILD_IMPLEMENT_HOME`). Never create run state inside the skill directory.
-- **Editing `scripts/plan_workflow.py`, `SKILL.md`, `references/planning_workflow.md`, or
-  `references/causal_analysis.md` invalidates in-flight planning runs.** `engine_contract()` hashes
-  those four files; a run whose hashes
+- **Editing `scripts/plan_workflow.py`, `scripts/dsh_read_boundary.mjs`, `SKILL.md`,
+  `references/planning_workflow.md`, or `references/causal_analysis.md` invalidates in-flight planning
+  runs.** `engine_contract()` hashes those five files; a run whose hashes
   changed rejects ordinary commands as engine drift. The only sanctioned recovery is
   `migrate-engine --reason … --actor … --apply` — never edit run state to bypass it.
 - **The version must be changed in five places at once**: `VERSION`, `SKILL.md`

@@ -13,8 +13,8 @@ provider-sandbox constructor so both phases enforce one filesystem and credentia
 ## Key Files
 | File | Description |
 |------|-------------|
-| `plan_workflow.py` | Planning engine (`VERSION = "0.7.4"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, frozen external attachments, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
-| `workflow.py` | Implementation engine (`SCHEMA_VERSION = 10`). Concurrent run discovery, worktree isolation, frozen reviewer contracts, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
+| `plan_workflow.py` | Planning engine (`VERSION = "0.7.7"`, `SCHEMA_VERSION = 2`). Adapter discovery and sandboxing, isolated A/B agent invocation, evidence/finding validation, frozen external attachments, the `next_action` protocol, synthesis diagnostics, typed adjudication, export and audit export. |
+| `workflow.py` | Implementation engine (`SCHEMA_VERSION = 11`). Concurrent run discovery, worktree isolation, frozen reviewer contracts, acceptance-contract review, fixed-SHA reviewer dispatch, environment fingerprints, reviewed reconciliation, finalization, and cleanup. |
 | `dsh_read_boundary.mjs` | Fail-closed DSH model-tool allowlist. Only bounded read/search tools under the frozen worktree and invocation context may execute; bubblewrap remains the outer enforcement boundary. |
 | `release_check.py` | No-network release gate: validates `evals/evals.json` shape, required public-release files, LICENSE/SECURITY content, cross-file version synchronization, and the English-only rule; then compiles both engines and runs the unit suites. Optional `--quick-validator <path>` chains an external skill validator. |
 | `package_release.py` | Deterministic standard-library packager for versioned `.tar.gz` release archives and SHA-256 checksum files. |
@@ -74,14 +74,15 @@ without paid calls.
 
 `workflow.py`: `preflight`, `list`, `init`, `contract-review`, `contract-adjudicate`, `review`,
 `verify`, `adjudicate`, `accept`, `status`, `migrate`, `finalize`, `reconcile`, `submit-reconciliation`, `abandon-reconciliation`, `supersede`, `change-reviewer`,
-`cleanup`.
+`migrate-engine`, `cleanup`.
 
 ## Dependencies
 
 ### Internal
 - `../references/reviewer_prompt.md` and `../references/contract_reviewer_prompt.md` — installed
   sources that `workflow.py` freezes into each run before dispatch.
-- `../SKILL.md` and `../references/planning_workflow.md` — hashed by `plan_workflow.engine_contract()`.
+- `../SKILL.md`, `../references/planning_workflow.md`, and `../references/causal_analysis.md` — hashed
+  together with `plan_workflow.py` and `dsh_read_boundary.mjs` by `plan_workflow.engine_contract()`.
 - `../evals/evals.json`, `../LICENSE`, `../SECURITY.md`, `../VERSION`, `../README.md`,
   `../CHANGELOG.md`, `../.github/workflows/ci.yml` — read by `release_check.py`.
 
