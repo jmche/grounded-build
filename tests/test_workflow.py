@@ -961,6 +961,15 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(done["all_batches_accepted"])
         self.assertEqual(done["accepted_sha"], fixed_head)
+        # The repair commit is the accepted final SHA, so the run finalizes on it.
+        finalized = self.workflow(
+            "finalize", "--project", str(self.project), "--run-id", run_id, "--apply",
+        )
+        self.assertEqual(finalized["status"], "FINALIZED")
+        self.assertEqual(
+            self.run_command("git", "-C", str(self.project), "rev-parse", "main").stdout.strip(),
+            fixed_head,
+        )
 
     def test_original_project_is_untouched_until_finalize(self) -> None:
         original_branch = self.run_command(
@@ -1265,6 +1274,11 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--run-id", str(initialized["run_id"]), "--batch", batch,
         )
         self.assertEqual(review["status"], "REVIEW_PASS")
+        merged_report = json.loads(Path(str(review["report_path"])).read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(item["criterion_id"] for item in merged_report["criterion_results"]),
+            ["1-exit", "INTEGRATION_01-combined-behavior"],
+        )
         accepted = self.workflow(
             "accept", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--batch", batch,

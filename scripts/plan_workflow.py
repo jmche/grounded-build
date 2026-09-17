@@ -3999,6 +3999,39 @@ def command_init(args: argparse.Namespace) -> None:
     })
 
 
+def investigation_tool_rules(provider: str, research_policy: str) -> dict[str, str]:
+    """Prompt sentences about commands and the network that match what the slot can actually run.
+
+    A dsh slot's read boundary denies every tool outside read/glob/grep, so it must not be told
+    to run commands or reach the network with curl; the engine computes digests for every slot
+    anyway. Telling a slot to do what its sandbox denies produced all-zero digest placeholders.
+    """
+    has_shell = provider != "dsh"
+    web_rule = (
+        "When repository evidence is insufficient, you MAY consult the upstream project's official "
+        "documentation or official GitHub repository, and you MAY reach them with "
+        + ("a shell (curl/wget) or the web " if has_shell else "the web ")
+        + "tools — nothing here forbids using the network. What it does forbid is UNREGISTERED evidence: material "
+        "you obtain from outside the frozen worktree must appear as its own evidence entry with source_type "
+        "OFFICIAL_DOCS or OFFICIAL_GITHUB and the exact URL, retrieval time, version/tag/commit and content "
+        "digest of what you read. Search snippets and third-party summaries are discovery leads, never evidence."
+        if research_policy == "authoritative-web" else
+        "This run is DECLARED local-only: establish every claim from the frozen worktree at the baseline SHA. "
+        + ("You may still run commands inside it, but if" if has_shell
+           else "Your tools are read, glob and grep; if")
+        + " you draw on anything outside it, say so in the claim and mark that "
+        "evidence UNRESOLVED instead of presenting it as a repository fact."
+    )
+    digest_rule = (
+        "If you want to cross-check one yourself, run `cd <the frozen worktree> && sha256sum <path>`; the "
+        "digest is of the COMPLETE file, never of the cited line range. "
+        if has_shell else
+        "Your sandbox has no shell, so do not compute or guess a digest: cite the path and leave the value "
+        "to the engine. "
+    )
+    return {"web_rule": web_rule, "digest_rule": digest_rule}
+
+
 def command_investigate(args: argparse.Namespace) -> None:
     project = resolve_project(args.project)
     state = load_state(project, args.run_id)
@@ -4008,26 +4041,16 @@ def command_investigate(args: argparse.Namespace) -> None:
     if slot in state["investigations"] and not args.dry_run:
         raise WorkflowError(f"slot {slot} already completed investigation")
     provider = assignment_provider(state, f"investigate-{slot}", state["planners"][slot])
-    web_rule = (
-        "When repository evidence is insufficient, you MAY consult the upstream project's official "
-        "documentation or official GitHub repository, and you MAY reach them with a shell (curl/wget) or the web "
-        "tools — nothing here forbids using the network. What it does forbid is UNREGISTERED evidence: material "
-        "you obtain from outside the frozen worktree must appear as its own evidence entry with source_type "
-        "OFFICIAL_DOCS or OFFICIAL_GITHUB and the exact URL, retrieval time, version/tag/commit and content "
-        "digest of what you read. Search snippets and third-party summaries are discovery leads, never evidence."
-        if state["research_policy"] == "authoritative-web" else
-        "This run is DECLARED local-only: establish every claim from the frozen worktree at the baseline SHA. You may still "
-        "run commands inside it, but if you draw on anything outside it, say so in the claim and mark that "
-        "evidence UNRESOLVED instead of presenting it as a repository fact."
-    )
+    rules = investigation_tool_rules(provider, state["research_policy"])
+    web_rule = rules["web_rule"]
+    digest_rule = rules["digest_rule"]
     prompt = (
         "You are independent evidence investigator {slot}. Read {context}/request.md and "
         "{context}/scope_contract.json, then inspect the complete relevant repository surface at baseline {sha}. "
         "The frozen worktree IS the repository and nothing outside it is part of this baseline: {worktree} "
         "(read-only; the sandbox denies every other path). The ENGINE computes and records the digest of every "
         "repository file you cite, so you do not have to: cite the path and the engine binds it to the baseline "
-        "bytes. If you want to cross-check one yourself, run `cd <the frozen worktree> && sha256sum <path>`; the "
-        "digest is of the COMPLETE file, never of the cited line range. A value that differs from the file's real "
+        "bytes. {digest_rule}A value that differs from the file's real "
         "digest is recorded as a compliance finding against this delivery and the engine's own value is used "
         "either way — so fabricating one gains nothing and costs you credibility. The baseline_sha and "
         "scope_digest printed in this prompt are NOT evidence digests: never copy them into that field. Leave the "
@@ -4060,7 +4083,7 @@ def command_investigate(args: argparse.Namespace) -> None:
         "provider={provider}, slot={slot}, baseline_sha={sha}, scope_digest={scope_digest}."
         + DELIVERY_CONTRACT
     ).format(slot=slot, provider=provider, sha=state["baseline_sha"],
-             scope_digest=state["scope_digest"], web_rule=web_rule, context="{context}",
+             scope_digest=state["scope_digest"], web_rule=web_rule, digest_rule=digest_rule, context="{context}",
              evidence_contract=evidence_prompt_contract(state["baseline_sha"]),
              worktree=str(state["worktree"]), vocabulary=VOCABULARY_NOTE)
     payload = invoke(

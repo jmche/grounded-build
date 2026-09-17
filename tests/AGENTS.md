@@ -12,7 +12,7 @@ drives the actual `scripts/*.py` commands. No paid model calls are made.
 ## Key Files
 | File | Description |
 |------|-------------|
-| `test_plan_workflow.py` | 141 tests over `scripts/plan_workflow.py`. Embeds a `FAKE_AGENT` script that parses the prompt (provider, slot, baseline SHA, scope digest) and returns schema-valid payloads per assignment type, including canary checks that the sandbox hides forbidden paths. Classes: `PlanWorkflowTest`, `ReassignmentTest`, `InputScopedBudgetTest`, `DeliveryFailureTest`, `CodexTrustStoreTest`, `DshAdapterTest`, `HostProtocolTest`. |
+| `test_plan_workflow.py` | 143 tests over `scripts/plan_workflow.py`. Embeds a `FAKE_AGENT` script that parses the prompt (provider, slot, baseline SHA, scope digest) and returns schema-valid payloads per assignment type, including canary checks that the sandbox hides forbidden paths. Classes: `PlanWorkflowTest`, `ReassignmentTest`, `InputScopedBudgetTest`, `DeliveryFailureTest`, `CodexTrustStoreTest`, `DshAdapterTest`, `HostProtocolTest`. |
 | `test_workflow.py` | 195 tests over `scripts/workflow.py`, loaded as a module via `importlib` so internal helpers are directly testable. Classes: `WorkflowIntegrationTests`, `ConvergencePolicyTests`, `CrossBatchFindingTests`, `ObligationDriftTests`, `ReviewerSchemaCompatibilityTests`, `DocumentationContractTests`, `SharedVerificationWorktreeTests`, `ReviewerRuntimeTest` (plus the `ConvergencePolicyFindingBuilder` helper). |
 | `test_release.py` | Deterministic archive tests: exact runtime manifest, normalized metadata, reproducible bytes, CLI output, and matching SHA-256 checksum. |
 

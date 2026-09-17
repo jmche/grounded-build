@@ -2994,6 +2994,38 @@ class DshAdapterTest(unittest.TestCase):
         self.assertEqual(self.module.resolve_topology("dsh"), {"A": "dsh", "B": "dsh"})
 
 
+class InvestigationToolRulesTest(unittest.TestCase):
+    """A slot is only told to run what its sandbox will actually execute."""
+
+    @staticmethod
+    def engine():
+        spec = importlib.util.spec_from_file_location("gb_investigation_tool_rules", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+    def test_dsh_slot_is_not_told_to_run_commands_it_cannot_run(self) -> None:
+        plan_workflow = self.engine()
+        for policy in ("local-only", "authoritative-web"):
+            with self.subTest(policy=policy):
+                rules = plan_workflow.investigation_tool_rules("dsh", policy)
+                text = rules["web_rule"] + rules["digest_rule"]
+                for forbidden in ("sha256sum", "curl", "run commands", "a shell ("):
+                    self.assertNotIn(forbidden, text)
+                if policy == "local-only":
+                    self.assertIn("read, glob and grep", rules["web_rule"])
+                self.assertIn("no shell", rules["digest_rule"])
+
+    def test_shell_capable_slots_keep_the_digest_cross_check(self) -> None:
+        plan_workflow = self.engine()
+        for provider in ("claude", "codex", "other"):
+            with self.subTest(provider=provider):
+                rules = plan_workflow.investigation_tool_rules(provider, "authoritative-web")
+                self.assertIn("sha256sum", rules["digest_rule"])
+                self.assertIn("curl/wget", rules["web_rule"])
+
+
 class HostProtocolTest(unittest.TestCase):
     def setUp(self) -> None:
         spec = importlib.util.spec_from_file_location("gb_host_protocol", SCRIPT)

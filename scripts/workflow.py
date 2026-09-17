@@ -1383,6 +1383,19 @@ def parse_batches(value: str) -> list[str]:
     return batches
 
 
+def judges_all_criteria(batch: str) -> bool:
+    """Stages that judge the integrated result: the final review and reconciliation reviews."""
+    return batch == FINAL_REVIEW_BATCH or batch.startswith("INTEGRATION_")
+
+
+def final_accepted_sha(state: dict[str, Any]) -> str | None:
+    """SHA of the last accepted stage, in acceptance order (plan batch, FINAL, INTEGRATION_nn)."""
+    accepted = state.get("accepted_batches") or []
+    if not accepted:
+        return None
+    return state.get("accepted_shas", {}).get(accepted[-1])
+
+
 def current_batch(state: dict[str, Any]) -> str | None:
     accepted = set(state["accepted_batches"])
     pending = next((item for item in state["batches"] if item not in accepted), None)
@@ -2087,7 +2100,7 @@ def build_prompt(
     closeout_review: bool = False,
 ) -> str:
     contract = read_review_contract(state, "batch_review")
-    final_review = batch == FINAL_REVIEW_BATCH
+    final_review = judges_all_criteria(batch)
     round_scope = (
         (
             "This is round 1 of the final integration review. Every plan batch was reviewed and "
@@ -3013,7 +3026,7 @@ def validate_review_payload(
         if not isinstance(criterion_result.get("evidence_ids"), list):
             raise WorkflowError(f"criterion result {criterion_id} has invalid evidence_ids")
     if state is not None and payload["verdict"] != "NEEDS_VERIFICATION":
-        final_review = batch == FINAL_REVIEW_BATCH
+        final_review = judges_all_criteria(batch)
         criteria = [
             item for item in state.get("acceptance_contract", {}).get("criteria", [])
             if final_review or item.get("batch") == batch
@@ -3506,7 +3519,7 @@ def register_verification_requests(
 def register_missing_contract_verification(
     state: dict[str, Any], batch: str, round_number: int, base: str, head: str
 ) -> list[dict[str, Any]]:
-    final_review = batch == FINAL_REVIEW_BATCH
+    final_review = judges_all_criteria(batch)
     criteria = [
         item for item in state.get("acceptance_contract", {}).get("criteria", [])
         if (final_review or item.get("batch") == batch) and item.get("evidence_kind") == "COMMAND"
@@ -4760,20 +4773,10 @@ def command_review(args: argparse.Namespace) -> None:
                 for reason in policy["decision_reasons"]
             ):
                 allowed.insert(0, "RESUME_WITH_DECISION")
-            maximum = state["budgets"]["max_quality_rounds_per_batch"]
             convergence_granted = int(
                 state.get("extra_review_rounds_granted", {}).get(args.batch, 0)
             )
-            budget_granted = int(
-                state.get("budget_review_rounds_granted", {}).get(args.batch, 0)
-            )
-            post_pass_granted = int(bool(
-                state.get("post_pass_review_exemptions_used", {}).get(args.batch)
-            ))
-            if (
-                round_number >= maximum + convergence_granted + budget_granted + post_pass_granted
-                and convergence_granted < 1
-            ):
+            if round_number >= round_limit and convergence_granted < 1:
                 allowed.insert(0, "GRANT_ONE_REVIEW")
             if any(
                 item["batch"] == args.batch and item["status"] == "OPEN" and item["severity"] == "P1"
@@ -4857,7 +4860,7 @@ def command_accept(args: argparse.Namespace) -> None:
         raise WorkflowError("cannot accept while fixed-SHA verification is unresolved or failing")
     if payload.get("effective_verdict") != "PASS":
         raise WorkflowError("only a PASS review can accept a batch")
-    final_review = args.batch == FINAL_REVIEW_BATCH
+    final_review = judges_all_criteria(args.batch)
     criteria = [
         item for item in state.get("acceptance_contract", {}).get("criteria", [])
         if final_review or item.get("batch") == args.batch
@@ -5618,7 +5621,7 @@ def command_finalize(args: argparse.Namespace) -> None:
     if current_batch(state) is not None:
         raise WorkflowError(f"cannot finalize before accepting batch {current_batch(state)!r}")
     validate_plan_unchanged(state)
-    accepted_final = state["accepted_shas"].get(state["batches"][-1])
+    accepted_final = final_accepted_sha(state)
     final_verification = state.get("final_verification")
     if not isinstance(final_verification, dict) or final_verification.get("status") not in {"PASS", "NOT_APPLICABLE"}:
         raise WorkflowError("final fixed-SHA verification has not completed")
@@ -5825,7 +5828,7 @@ def command_reconcile(args: argparse.Namespace) -> None:
     validate_active_state(project, state)
     if state.get("status") != "READY_TO_FINALIZE":
         raise WorkflowError(f"reconcile requires READY_TO_FINALIZE, found {state.get('status')}")
-    accepted = state.get("accepted_shas", {}).get(state["batches"][-1])
+    accepted = final_accepted_sha(state)
     final_verification = state.get("final_verification") or {}
     if not isinstance(accepted, str) or final_verification.get("reviewed_sha") != accepted:
         raise WorkflowError("reconciliation source is not the final accepted and verified SHA")
