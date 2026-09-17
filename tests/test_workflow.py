@@ -184,10 +184,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
                             evidence_ids = [item["evidence_id"] for item in json.load(handle)["evidence"]]
                     with open(field("Acceptance contract"), encoding="utf-8") as handle:
                         contract_criteria = json.load(handle)["criteria"]
-                    cumulative = field("Cumulative final review") == "yes"
+                    final_review = field("Final integration review") == "yes"
                     selected_criteria = [
                         item for item in contract_criteria
-                        if cumulative or item["batch"] == field("Batch")
+                        if final_review or item["batch"] == field("Batch")
                     ]
                     payload = {{
                         "reviewer": "{name}",
@@ -820,8 +820,133 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "--run-id", str(initialized["run_id"]), "--batch", "1",
             "--review-file", str(review["report_path"]),
         )
-        self.assertTrue(accepted["all_batches_accepted"])
+        self.assertFalse(accepted["all_batches_accepted"])
+        self.assertEqual(accepted["next_batch"], "FINAL")
+        self.final_review_accept(initialized, head)
         return head, review
+
+    def final_review_accept(self, initialized: dict[str, object], head: str) -> dict[str, object]:
+        """Run the final integration review at HEAD and accept it."""
+        final = self.workflow(
+            "review", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "FINAL",
+        )
+        self.assertEqual(final["status"], "REVIEW_PASS")
+        self.assertEqual(final["reviewed_sha"], head)
+        self.assertEqual(final["review_mode"], "FULL")
+        accepted = self.workflow(
+            "accept", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--batch", "FINAL",
+            "--review-file", str(final["report_path"]),
+        )
+        self.assertTrue(accepted["all_batches_accepted"])
+        return final
+
+    def test_last_batch_is_ordinary_and_final_review_judges_integration_once(self) -> None:
+        """Replays the B04-B06 shape: every round of the last batch used to be a full baseline review."""
+        self.plan.write_text(
+            "# Plan\n\n## Batch 1\n\nChange tracked.txt.\n\n## Batch 2\n\nChange second.txt.\n",
+            encoding="utf-8",
+        )
+        self.batch_manifest.write_text(
+            "# Run scope\n\nIncluded: plan batches 1 and 2.\n\nExcluded: none.\n", encoding="utf-8",
+        )
+        initialized = self.workflow(
+            "init", "--project", str(self.project), "--plan", str(self.plan),
+            "--batch-manifest", str(self.batch_manifest), "--reviewer", "codex",
+            "--implementer", "current-host-agent", "--fix-policy", "ask",
+            "--batches", "1,2", "--target-branch", "main",
+        )
+        contract = self.workflow(
+            "contract-review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+        )
+        self.assertEqual(contract["status"], "CONTRACT_READY")
+        run_id = str(initialized["run_id"])
+        implementation = Path(str(initialized["implementation_worktree"]))
+        first_head = self.commit_batch_change(implementation, "batch one\n")
+        first = self.workflow("review", "--project", str(self.project), "--run-id", run_id, "--batch", "1")
+        self.assertEqual(first["status"], "REVIEW_PASS")
+        self.workflow(
+            "accept", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+            "--review-file", str(first["report_path"]),
+        )
+        (implementation / "second.txt").write_text("batch two\n", encoding="utf-8")
+        self.run_command("git", "-C", str(implementation), "add", "second.txt")
+        self.run_command("git", "-C", str(implementation), "commit", "-qm", "batch two")
+        second_head = self.run_command("git", "-C", str(implementation), "rev-parse", "HEAD").stdout.strip()
+
+        # The last plan batch is reviewed from the previously accepted SHA against its own criteria.
+        second = self.workflow("review", "--project", str(self.project), "--run-id", run_id, "--batch", "2")
+        self.assertEqual(second["status"], "REVIEW_PASS")
+        self.assertEqual(second["base_sha"], first_head)
+        self.assertEqual(second["authoritative_coverage_base_sha"], first_head)
+        report = json.loads(Path(str(second["report_path"])).read_text(encoding="utf-8"))
+        self.assertEqual([item["criterion_id"] for item in report["criterion_results"]], ["2-exit"])
+        accepted = self.workflow(
+            "accept", "--project", str(self.project), "--run-id", run_id, "--batch", "2",
+            "--review-file", str(second["report_path"]),
+        )
+        self.assertFalse(accepted["all_batches_accepted"])
+        self.assertEqual(accepted["next_batch"], "FINAL")
+
+        # Integration is judged once, from the baseline, across every criterion, without new commits.
+        final = self.workflow("review", "--project", str(self.project), "--run-id", run_id, "--batch", "FINAL")
+        self.assertEqual(final["status"], "REVIEW_PASS")
+        self.assertEqual(final["base_sha"], str(initialized["baseline_sha"]))
+        self.assertEqual(final["reviewed_sha"], second_head)
+        self.assertEqual(final["review_mode"], "FULL")
+        final_report = json.loads(Path(str(final["report_path"])).read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(item["criterion_id"] for item in final_report["criterion_results"]),
+            ["1-exit", "2-exit"],
+        )
+        done = self.workflow(
+            "accept", "--project", str(self.project), "--run-id", run_id, "--batch", "FINAL",
+            "--review-file", str(final["report_path"]),
+        )
+        self.assertTrue(done["all_batches_accepted"])
+        status = self.workflow("status", "--project", str(self.project), "--run-id", run_id)
+        self.assertEqual(status["status"], "READY_TO_FINALIZE")
+        self.assertEqual(status["final_verification"]["status"], "NOT_APPLICABLE")
+        self.assertEqual(status["accepted_batches"], ["1", "2", "FINAL"])
+
+    def test_final_review_repair_rounds_use_delta_transport(self) -> None:
+        initialized = self.initialize("codex")
+        run_id = str(initialized["run_id"])
+        implementation = Path(str(initialized["implementation_worktree"]))
+        head = self.commit_batch_change(implementation)
+        review = self.workflow("review", "--project", str(self.project), "--run-id", run_id, "--batch", "1")
+        self.workflow(
+            "accept", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+            "--review-file", str(review["report_path"]),
+        )
+        self.environment["FAKE_FINDINGS"] = json.dumps([{
+            "id": "F-FINAL-001", "fingerprint": "integration-gap", "severity": "P1",
+            "novelty": "INITIAL_REVIEW", "location": "tracked.txt:1",
+            "details": "batch one's consumer was never wired at HEAD",
+            "required_outcome": "the consumer reads the produced value",
+        }])
+        failed = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "FINAL", expected=2,
+        )
+        self.assertEqual(failed["status"], "REVIEW_FAIL")
+        self.assertEqual(failed["review_mode"], "FULL")
+        self.assertEqual(failed["base_sha"], str(initialized["baseline_sha"]))
+        self.environment.pop("FAKE_FINDINGS")
+        self.environment["FAKE_RESOLVED_FINDING_IDS"] = json.dumps(["F-FINAL-001"])
+        fixed_head = self.commit_batch_change(implementation, "integration repaired\n")
+        repaired = self.workflow("review", "--project", str(self.project), "--run-id", run_id, "--batch", "FINAL")
+        self.environment.pop("FAKE_RESOLVED_FINDING_IDS")
+        self.assertEqual(repaired["status"], "REVIEW_PASS")
+        self.assertEqual(repaired["review_mode"], "DELTA")
+        self.assertEqual(repaired["supplied_diff_base_sha"], head)
+        self.assertEqual(repaired["reviewed_sha"], fixed_head)
+        done = self.workflow(
+            "accept", "--project", str(self.project), "--run-id", run_id, "--batch", "FINAL",
+            "--review-file", str(repaired["report_path"]),
+        )
+        self.assertTrue(done["all_batches_accepted"])
+        self.assertEqual(done["accepted_sha"], fixed_head)
 
     def test_original_project_is_untouched_until_finalize(self) -> None:
         original_branch = self.run_command(
@@ -2011,20 +2136,22 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "accept", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
             "--batch", "1", "--review-file", str(review["report_path"]),
         )
-        self.assertEqual(len(accepted["final_verification_requests"]), 1)
-        final_request = accepted["final_verification_requests"][0]["request_key"]
-        completed = self.workflow(
-            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
-            "--request-id", final_request, "--network-policy", "host",
-            "--network-reason", "test fixture", "--actor", "test-suite", "--apply",
-        )
-        self.assertEqual(completed["status"], "VERIFICATION_PASS")
+        self.assertEqual(accepted["final_verification_requests"], [])
+        self.assertEqual(accepted["next_batch"], "FINAL")
+        # HEAD did not move, so the batch's current-SHA PASS evidence already proves the COMMAND
+        # criterion for the final integration review; nothing is executed twice at one SHA.
+        self.final_review_accept(initialized, head)
         status = self.workflow(
             "status", "--project", str(self.project), "--run-id", str(initialized["run_id"])
         )
         self.assertEqual(status["status"], "READY_TO_FINALIZE")
         self.assertEqual(status["final_verification"]["status"], "PASS")
         self.assertEqual(status["final_verification"]["reviewed_sha"], head)
+        self.assertEqual(len(status["final_verification"]["evidence_ids"]), 1)
+        self.assertEqual(
+            len([item for item in json.loads((Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8"))["verification_requests"]]),
+            1,
+        )
 
     def test_verification_infrastructure_error_is_retryable_and_audited(self) -> None:
         initialized = self.initialize("codex")
@@ -3268,20 +3395,20 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(len(state["review_invocations"]), 1)
 
     def test_accept_binds_to_the_head_reviewed_after_the_post_pass_commit(self) -> None:
-        initialized, _, later_head = self._pass_then_commit()
+        initialized, first, later_head = self._pass_then_commit()
         second = self.workflow(
             "review", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--batch", "1",
         )
-        self.assertEqual(second["review_mode"], "FULL")
-        self.assertEqual(second["review_mode_reason"], "CUMULATIVE_FINAL_REVIEW")
-        self.assertEqual(second["supplied_diff_base_sha"], second["base_sha"])
+        self.assertEqual(second["review_mode"], "DELTA")
+        self.assertEqual(second["review_mode_reason"], "FOLLOW_UP_FROM_PRIOR_REVIEWED_SHA")
+        self.assertEqual(second["supplied_diff_base_sha"], first["reviewed_sha"])
         accepted = self.workflow(
             "accept", "--project", str(self.project),
             "--run-id", str(initialized["run_id"]), "--batch", "1",
             "--review-file", str(second["report_path"]),
         )
-        self.assertTrue(accepted["all_batches_accepted"])
+        self.assertEqual(accepted["next_batch"], "FINAL")
         state = json.loads(
             (Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8")
         )
@@ -4795,14 +4922,14 @@ class ReviewerRuntimeTest(unittest.TestCase):
             ).strip()
 
             mode, diff_base, reason = WORKFLOW_MODULE.select_review_transport(
-                project, base, head, [{"reviewed_sha": old_head}], False
+                project, base, head, [{"reviewed_sha": old_head}]
             )
 
             self.assertEqual(mode, "FULL")
             self.assertEqual(diff_base, base)
             self.assertEqual(reason, "PRIOR_REVIEWED_SHA_NOT_ANCESTOR")
 
-    def test_same_sha_and_cumulative_reviews_retain_full_transport(self) -> None:
+    def test_same_sha_review_retains_full_transport_and_follow_up_is_delta(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             project = Path(scratch)
             subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
@@ -4823,7 +4950,7 @@ class ReviewerRuntimeTest(unittest.TestCase):
             prior = [{"reviewed_sha": reviewed}]
 
             self.assertEqual(
-                WORKFLOW_MODULE.select_review_transport(project, base, reviewed, prior, False),
+                WORKFLOW_MODULE.select_review_transport(project, base, reviewed, prior),
                 ("FULL", base, "SAME_SHA_AFTER_USER_DECISION"),
             )
             tracked.write_text("later\n", encoding="utf-8")
@@ -4832,8 +4959,8 @@ class ReviewerRuntimeTest(unittest.TestCase):
                 ["git", "rev-parse", "HEAD"], cwd=project, text=True
             ).strip()
             self.assertEqual(
-                WORKFLOW_MODULE.select_review_transport(project, base, later, prior, True),
-                ("FULL", base, "CUMULATIVE_FINAL_REVIEW"),
+                WORKFLOW_MODULE.select_review_transport(project, base, later, prior),
+                ("DELTA", reviewed, "FOLLOW_UP_FROM_PRIOR_REVIEWED_SHA"),
             )
 
     def test_large_review_diff_falls_back_to_bounded_changed_path_manifest(self) -> None:

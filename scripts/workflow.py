@@ -33,6 +33,13 @@ from typing import Any, Iterator, Sequence
 SCHEMA_VERSION = 11
 DEFAULT_TIMEOUT_SECONDS = 1800
 MAX_REVIEW_ROUNDS = 4
+# The final integration review is its own reviewable stage, not a property of the last plan batch.
+# Each plan batch is judged against its own criteria from the previously accepted SHA; the batches
+# were accepted at their own SHAs and that acceptance is owned by the state machine. Cross-batch
+# integration and every acceptance-contract criterion at exact HEAD are judged once, here, with the
+# ordinary round loop for repairs. Folding that judgement into every round of the last batch made
+# every round a full baseline review that re-litigated accepted work.
+FINAL_REVIEW_BATCH = "FINAL"
 DEFAULT_MAX_REVIEW_INVOCATIONS_PER_BATCH = 10
 DEFAULT_MAX_CONTRACT_INVOCATIONS = 3
 DEFAULT_MAX_VERIFICATION_ATTEMPTS = 3
@@ -1378,7 +1385,14 @@ def parse_batches(value: str) -> list[str]:
 
 def current_batch(state: dict[str, Any]) -> str | None:
     accepted = set(state["accepted_batches"])
-    return next((item for item in state["batches"] if item not in accepted), None)
+    pending = next((item for item in state["batches"] if item not in accepted), None)
+    if pending is not None:
+        return pending
+    # A run that already scheduled the pre-0.7.8 final verification finishes on that path; every
+    # other run reviews integration explicitly before it can finalize.
+    if FINAL_REVIEW_BATCH not in accepted and state.get("final_verification") is None:
+        return FINAL_REVIEW_BATCH
+    return None
 
 
 def upstream_info(project: Path, target_branch: str) -> dict[str, Any]:
@@ -2073,9 +2087,16 @@ def build_prompt(
     closeout_review: bool = False,
 ) -> str:
     contract = read_review_contract(state, "batch_review")
-    cumulative_final_review = batch == state["batches"][-1]
+    final_review = batch == FINAL_REVIEW_BATCH
     round_scope = (
-        "This is round 1: perform the complete discovery review for this batch."
+        (
+            "This is round 1 of the final integration review. Every plan batch was reviewed and "
+            "accepted at its own SHA; do not re-litigate those batches. Judge the integrated "
+            "result at exact HEAD across the whole baseline range: cross-batch interactions, "
+            "consumers one batch left for another, and every acceptance-contract criterion."
+            if final_review
+            else "This is round 1: perform the complete discovery review for this batch."
+        )
         if round_number == 1
         else (
             "This is a bounded re-review. Verify prior findings, inspect regressions introduced by "
@@ -2091,7 +2112,7 @@ def build_prompt(
         f"- Assignment metadata and user decisions: `{assignment_path}`\n"
         f"- Run ID: `{state['run_id']}`\n"
         f"- Batch: `{batch}`\n"
-        f"- Cumulative final review: `{'yes' if cumulative_final_review else 'no'}`\n"
+        f"- Final integration review: `{'yes' if final_review else 'no'}`\n"
         f"- Review round: `{round_number}`\n"
         f"- Review mode: `{review_mode}`\n"
         f"- Review mode reason: `{review_mode_reason}`\n"
@@ -2129,7 +2150,7 @@ def build_prompt(
         "in source comments or other text. Reuse the existing finding ID and fingerprint for the same defect. "
         "List verified prior IDs in resolved_finding_ids. Return JSON matching the supplied schema, "
         "and return exactly one criterion_results entry for every acceptance-contract criterion "
-        + ("across all batches because this is the cumulative final review. " if cumulative_final_review else "in this batch. ")
+        + ("across all batches because this is the final integration review. " if final_review else "in this batch. ")
         + "The supplied patch is a transport optimization, not review authority: the acceptance "
         "contract and authoritative coverage range still apply to exact HEAD. In DELTA mode, start "
         "with the supplied fix delta and prior ledger obligations. Expand inspection in the fixed-SHA "
@@ -2196,9 +2217,11 @@ def prepare_review_context(
                 "rule": "Each ID must be resolved or reported again in this recovery review.",
             },
         )
+    # Evidence is bound to the reviewed SHA, not to the stage that requested it: the final
+    # integration review cites the last batch's command evidence when HEAD did not move.
     evidence = [
         copy.deepcopy(item) for item in state.get("verification_evidence", [])
-        if item.get("batch") == batch and item.get("reviewed_sha") == head
+        if item.get("reviewed_sha") == head
     ]
     rejected = [
         item for item in state.get("verification_requests", [])
@@ -2982,10 +3005,10 @@ def validate_review_payload(
         if not isinstance(criterion_result.get("evidence_ids"), list):
             raise WorkflowError(f"criterion result {criterion_id} has invalid evidence_ids")
     if state is not None and payload["verdict"] != "NEEDS_VERIFICATION":
-        cumulative = bool(state.get("batches")) and batch == state["batches"][-1]
+        final_review = batch == FINAL_REVIEW_BATCH
         criteria = [
             item for item in state.get("acceptance_contract", {}).get("criteria", [])
-            if cumulative or item.get("batch") == batch
+            if final_review or item.get("batch") == batch
         ]
         expected_ids = {item["id"] for item in criteria}
         if result_ids != expected_ids:
@@ -3173,7 +3196,7 @@ def apply_convergence_policy(
         if not fingerprint:
             other_fingerprint = all_id_to_fp.get(finding_id)
             if other_fingerprint:
-                # The cumulative final review's base is the run baseline, so it is required to
+                # The final integration review's base is the run baseline, so it is required to
                 # judge every batch -- and will therefore confirm fixes that an earlier,
                 # already-accepted batch owns. Rejecting the whole payload for that returned no
                 # verdict at all and burned 49.8 minutes across two adapters. Record it and leave
@@ -3444,18 +3467,25 @@ def register_verification_requests(
 def register_missing_contract_verification(
     state: dict[str, Any], batch: str, round_number: int, base: str, head: str
 ) -> list[dict[str, Any]]:
-    cumulative = batch == state["batches"][-1]
+    final_review = batch == FINAL_REVIEW_BATCH
     criteria = [
         item for item in state.get("acceptance_contract", {}).get("criteria", [])
-        if (cumulative or item.get("batch") == batch) and item.get("evidence_kind") == "COMMAND"
+        if (final_review or item.get("batch") == batch) and item.get("evidence_kind") == "COMMAND"
     ]
     existing = {
         item.get("criterion_id") for item in state.get("verification_requests", [])
         if item.get("batch") == batch and item.get("reviewed_sha") == head
     }
+    # Evidence is bound to a SHA, not to the stage that requested it. A command that already
+    # passed at exact HEAD (for instance the last batch's criterion when the final integration
+    # review starts without new commits) is citable as-is; paying to run it again proves nothing.
+    proven = {
+        item.get("criterion_id") for item in state.get("verification_evidence", [])
+        if item.get("reviewed_sha") == head and item.get("status") == "PASS"
+    }
     registered: list[dict[str, Any]] = []
     for criterion in criteria:
-        if criterion["id"] in existing:
+        if criterion["id"] in existing or criterion["id"] in proven:
             continue
         request = {
             "id": f"criterion-{criterion['id']}", "argv": criterion["argv"],
@@ -4144,7 +4174,6 @@ def select_review_transport(
     authoritative_base: str,
     head: str,
     prior_reviews: list[dict[str, Any]],
-    cumulative_final_review: bool,
 ) -> tuple[str, str, str]:
     """Choose transported bytes without narrowing the reviewer's semantic authority.
 
@@ -4159,8 +4188,6 @@ def select_review_transport(
     previous_head = prior_reviews[-1].get("reviewed_sha")
     if previous_head == head:
         return "FULL", authoritative_base, "SAME_SHA_AFTER_USER_DECISION"
-    if cumulative_final_review:
-        return "FULL", authoritative_base, "CUMULATIVE_FINAL_REVIEW"
     if isinstance(previous_head, str) and run(
         ("git", "-C", str(implementation), "merge-base", "--is-ancestor", previous_head, head),
         check=False,
@@ -4263,8 +4290,7 @@ def command_review(args: argparse.Namespace) -> None:
     previous_sha = state["accepted_shas"].get(previous, state["baseline_sha"])
     if run(("git", "-C", str(implementation), "merge-base", "--is-ancestor", previous_sha, head), check=False).returncode != 0:
         raise WorkflowError("current implementation HEAD no longer descends from the previously accepted SHA")
-    cumulative_final_review = args.batch == state["batches"][-1]
-    base = state["baseline_sha"] if cumulative_final_review else previous_sha
+    base = state["baseline_sha"] if args.batch == FINAL_REVIEW_BATCH else previous_sha
     if args.batch.startswith("INTEGRATION_"):
         base = str((state.get("integration") or {}).get("approved_target_sha") or base)
     if head == base:
@@ -4283,7 +4309,7 @@ def command_review(args: argparse.Namespace) -> None:
             "instead of paying for another review"
         )
     review_mode, diff_base, review_mode_reason = select_review_transport(
-        implementation, base, head, prior, cumulative_final_review
+        implementation, base, head, prior
     )
     contract_requests = register_missing_contract_verification(
         state, args.batch, round_number, base, head
@@ -4781,10 +4807,10 @@ def command_accept(args: argparse.Namespace) -> None:
         raise WorkflowError("cannot accept while fixed-SHA verification is unresolved or failing")
     if payload.get("effective_verdict") != "PASS":
         raise WorkflowError("only a PASS review can accept a batch")
-    cumulative = args.batch == state["batches"][-1]
+    final_review = args.batch == FINAL_REVIEW_BATCH
     criteria = [
         item for item in state.get("acceptance_contract", {}).get("criteria", [])
-        if cumulative or item.get("batch") == args.batch
+        if final_review or item.get("batch") == args.batch
     ]
     results = payload.get("criterion_results", [])
     by_id = {item.get("criterion_id"): item for item in results if isinstance(item, dict)}
@@ -4801,9 +4827,30 @@ def command_accept(args: argparse.Namespace) -> None:
     state["accepted_shas"][args.batch] = head
     next_batch = current_batch(state)
     final_requests: list[dict[str, Any]] = []
-    if next_batch:
+    if final_review:
+        # The COMMAND criteria already ran at this exact SHA before the final review could PASS
+        # (validate_review_payload requires current-SHA PASS evidence for each), so the final
+        # verification is that evidence, not a second paid execution of the same commands.
+        command_ids = {item["id"] for item in criteria if item.get("evidence_kind") == "COMMAND"}
+        if command_ids:
+            state["final_verification"] = {
+                "status": "PASS", "reviewed_sha": head,
+                "evidence_ids": [
+                    item.get("evidence_path") for item in state.get("verification_evidence", [])
+                    if item.get("reviewed_sha") == head and item.get("status") == "PASS"
+                    and item.get("criterion_id") in command_ids
+                ],
+            }
+        else:
+            state["final_verification"] = {
+                "status": "NOT_APPLICABLE", "reviewed_sha": head,
+                "reason": "acceptance contract contains no executable COMMAND criteria",
+            }
+        state["status"] = "READY_TO_FINALIZE"
+    elif next_batch:
         state["status"] = "IMPLEMENTING"
     else:
+        # Pre-0.7.8 run whose final verification was already scheduled: finish on that path.
         final_requests = register_final_contract_verification(state, head)
         if final_requests:
             state["status"] = "FINAL_VERIFICATION_REQUIRED"

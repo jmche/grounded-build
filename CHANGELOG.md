@@ -4,6 +4,17 @@ All notable changes use semantic versioning.
 
 ## [0.7.8] - 2026-09-17
 
+- Made the final integration review its own stage (`review --batch FINAL`) instead of a property
+  of the last plan batch. Every plan batch, including the last one, is now reviewed from the
+  previously accepted SHA against its own criteria; the final review runs once after the last
+  acceptance, covers `baseline..HEAD` and every criterion, and repairs in ordinary `DELTA` rounds.
+  Folding the cumulative review into every round of the last batch had made each of those rounds
+  a full baseline review that re-judged accepted batches (117-132 KB patches, 13 criteria, and
+  cross-batch warnings on every round of one observed run). `accept --batch FINAL` records the
+  final verification from the current-SHA command evidence the review already cited; a command that
+  passed at exact HEAD is never paid for twice, and supplied evidence is bound to the SHA rather than
+  to the requesting stage. Runs that already scheduled the older final verification finish on that
+  path.
 - Gave Implement review findings one shape for the reviewer, the validator, and the ledger: `id`,
   `fingerprint`, `severity`, `novelty`, `location`, `required_outcome`, `details`. The provider
   schema is now derived from that shape instead of restated, so the prompt can no longer name a

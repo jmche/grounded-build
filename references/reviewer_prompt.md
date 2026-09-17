@@ -85,9 +85,11 @@ supply only the Git delta since the immediately preceding reviewed SHA, but that
 optimization rather than a semantic boundary. The acceptance contract, authoritative coverage range,
 and exact-HEAD worktree remain controlling. Expand inspection when the delta changes or invalidates an
 authority, public contract, state or security boundary, scope, prior assumption, or affected consumer.
-The controller retains full transport for same-SHA reviews after user adjudication and for cumulative
-final reviews whose criterion results cover every batch. Do not otherwise restart a fresh unlimited
-architecture review each round.
+The controller retains full transport for same-SHA reviews after user adjudication and for the first
+round of the final integration review (batch `FINAL`), whose criterion results cover every batch and
+whose range is the whole run baseline. Accepted plan batches keep their own verdicts: the final
+review judges their integration at exact HEAD, not their acceptance. Do not otherwise restart a
+fresh unlimited architecture review each round.
 
 After the ordinary quality-round limit is exhausted, the controller may authorize one closeout
 review bound to the applied typed decision, batch, and exact implementation SHA. Treat it as terminal

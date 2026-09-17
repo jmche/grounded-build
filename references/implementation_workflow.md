@@ -102,9 +102,9 @@ review. Target movement is integration divergence, not execution staleness.
 - Transport the full authoritative Git range for round one. On later rounds, transport only the delta
   since the immediately preceding reviewed SHA when that SHA remains an ancestor, while retaining the
   full acceptance contract, finding ledger, plan authority, and exact-HEAD worktree. If review history
-  is no longer ancestral, the review follows a user decision without a new commit, or the batch is the
-  cumulative final review, return to full transport. Never use filenames, line counts, or keyword rules
-  to decide semantic review scope.
+  is no longer ancestral or the review follows a user decision without a new commit, return to full
+  transport. The final integration review starts from the run baseline like any first round.
+  Never use filenames, line counts, or keyword rules to decide semantic review scope.
 
 ## Shared review contract
 
@@ -396,8 +396,9 @@ and duration. `DELTA` never means "review only these lines": the reviewer retain
 worktree and expands inspection when a changed authority, contract, state/security boundary, scope,
 prior assumption, or consumer invalidates earlier evidence. A rewritten branch automatically returns
 to `FULL` transport. A same-SHA review after user adjudication also remains `FULL`, because the changed
-decision context—not a Git delta—is the new evidence. Cumulative final reviews remain `FULL` because
-they must issue criterion results across every batch.
+decision context—not a Git delta—is the new evidence. The final integration review's first round is
+`FULL` from the run baseline because it issues criterion results across every batch; its repair rounds
+are ordinary `DELTA` rounds.
 
 A PASS describes one exact SHA, not the batch. If you commit again after `REVIEW_PASS` — a deferred finding fixed anyway, say — `accept` will refuse because the report no longer authorizes HEAD; run `review` again instead and the new commit gets its own round. A PASS or FAIL cannot buy another paid review of the same SHA. A typed user decision may legitimately return the same SHA for reconsideration; that review uses full transport because the decision context, rather than a code delta, changed. After acceptance the contract is closed: commits beyond the accepted SHA cannot be finalized, and the choice is to reset the implementation worktree back to that SHA or to supersede the run and review the extra commits in a new one.
 
@@ -517,7 +518,7 @@ After `REVIEW_PASS` and required tests pass:
   --review-file <absolute-report-path>
 ```
 
-Only the latest registered `PASS` report for the current clean implementation HEAD can authorize acceptance. The report must contain a PASS result for every batch criterion; COMMAND results must cite current-SHA PASS evidence IDs. Continue with the next declared batch unless the user requested per-batch confirmation.
+Only the latest registered `PASS` report for the current clean implementation HEAD can authorize acceptance. The report must contain a PASS result for every batch criterion; COMMAND results must cite current-SHA PASS evidence IDs. Continue with `next_batch` unless the user requested per-batch confirmation. Every plan batch, including the last one, is reviewed from the previously accepted SHA against its own criteria; after the last plan batch `next_batch` is `FINAL`, the final integration review described below.
 
 ## Supersede an obsolete run
 
@@ -532,9 +533,11 @@ When the user chooses to abandon an obsolete run:
 
 This preserves its branch, worktrees, reports, and state for audit. It does not affect any sibling run.
 
-## Final verification and integration
+## Final integration review, final verification, and integration
 
-After the last batch is accepted, the workflow automatically schedules every COMMAND criterion again against the final cumulative SHA. Run each returned request through `verify`. A failure reopens the last batch; all PASS results produce `final_verification=PASS`. If the contract contains no executable criteria, the state records an explicit `NOT_APPLICABLE` reason rather than pretending tests ran. Preview finalization only after this gate closes:
+After the last plan batch is accepted, `next_batch` is `FINAL`: one explicit review of the integrated result. Run `review --batch FINAL` without new commits. Its first round covers the full `baseline..HEAD` range and returns one criterion result for every acceptance-contract criterion across all batches; every COMMAND criterion is first re-executed at exact HEAD through the usual `VERIFICATION_REQUIRED` requests. Accepted plan batches keep their authority: the final review judges cross-batch integration and the criteria at HEAD, and a finding it reports enters the ledger under batch `FINAL`. Repair rounds follow the ordinary fix loop with `DELTA` transport; the same round budget, convergence policy, and typed decisions apply.
+
+`accept --batch FINAL` closes the run's review: `final_verification` records the current-SHA COMMAND evidence the final review already cited, or an explicit `NOT_APPLICABLE` reason when the contract has no executable criteria, and the run becomes `READY_TO_FINALIZE`. A run started before this stage existed and already holding a scheduled final verification finishes on that older path: run each returned request through `verify`; a failure reopens the last batch. Preview finalization only after this gate closes:
 
 ```bash
 <controller-python> <skill-root>/scripts/workflow.py finalize \

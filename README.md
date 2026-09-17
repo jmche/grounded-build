@@ -182,8 +182,9 @@ verification, and repair loop.
 The first code review receives the complete authoritative range. Follow-up reviews receive the patch
 since the preceding reviewed SHA while retaining the full contract, finding ledger, and exact-HEAD
 worktree. Rewritten history falls back to full transport, and semantic impact can always widen the
-reviewer's inspection beyond the supplied patch. Same-SHA reviews after a user decision and cumulative
-final reviews retain full transport because their new evidence is not bounded by a code delta.
+reviewer's inspection beyond the supplied patch. Same-SHA reviews after a user decision and the first
+round of the final integration review retain full transport because their new evidence is not bounded
+by a code delta.
 
 ```text
 frozen plan + batch manifest + Git SHA
