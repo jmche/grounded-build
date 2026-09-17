@@ -21,7 +21,15 @@ All notable changes use semantic versioning.
   a semantic judgement, and the machine had also flagged a shrinking file set as drift. The
   no-progress and round-cap rules still bound the loop.
 - Retired `severity_change_justification` as a machine gate. A severity change is recorded in
-  `severity_history`; the reviewer's reason lives in `details` and is judged by the user.
+  `severity_history`; the reviewer's reason lives in `details` and is judged by the user. A
+  downgrade to P2 records `deferred_reason: SEVERITY_DOWNGRADE:<from>->P2` and a
+  `SEVERITY_DOWNGRADE` warning, so a batch never unblocks without a visible receipt.
+- Review results now report ledger-bound findings: each carries the ledger `status`, the frozen
+  `required_outcome`, and `latest_required_outcome`, so the implementer's primary channel shows
+  the authoritative close condition rather than the round's restatement.
+- A finding delivered without `required_outcome` no longer discards the review. It is disclosed
+  as `FINDING_CLOSE_CONDITION_MISSING`, warned as `FINDING_WITHOUT_CLOSE_CONDITION`, and the
+  ledger adopts the first non-empty statement; the controller never invents a close condition.
 
 ## [0.7.7] - 2026-09-17
 

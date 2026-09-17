@@ -2448,10 +2448,16 @@ def bind_contract_identity(
 
 
 # A defect may genuinely have no single site (a missing invariant, a repository-wide policy), so
-# `location` is the one finding field a non-strict provider may omit. `details` and
-# `required_outcome` are the finding's substance and its close condition; a finding without them
-# gives the implementer nothing to act on, so their absence is a delivery error, not prose.
-REVIEW_FINDING_OPTIONAL_TEXT_FIELDS = ("location",)
+# `location` may be omitted by a non-strict provider. `required_outcome` is the close condition and
+# the strict wire schema always carries it; when a non-strict provider omits it the review still
+# holds the reviewer's other work, so the gap is disclosed here and warned about by the convergence
+# policy rather than discarding the round. The controller never invents a close condition: the
+# ledger adopts the first non-empty statement. `details` is the finding's substance and stays
+# required.
+REVIEW_FINDING_OPTIONAL_TEXT_FIELDS = {
+    "location": "OPTIONAL_FINDING_FIELD_DEFAULTED",
+    "required_outcome": "FINDING_CLOSE_CONDITION_MISSING",
+}
 
 
 def normalize_review_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2464,14 +2470,10 @@ def normalize_review_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for index, finding in enumerate(payload.get("findings", [])):
         if not isinstance(finding, dict):
             continue
-        for field in REVIEW_FINDING_OPTIONAL_TEXT_FIELDS:
+        for field, disclosure in REVIEW_FINDING_OPTIONAL_TEXT_FIELDS.items():
             if field not in finding:
                 finding[field] = ""
-                disclosures.append({
-                    "type": "OPTIONAL_FINDING_FIELD_DEFAULTED",
-                    "finding_index": index,
-                    "field": field,
-                })
+                disclosures.append({"type": disclosure, "finding_index": index, "field": field})
     return disclosures
 
 
@@ -2916,7 +2918,7 @@ def validate_review_payload(
     if payload.get("verdict") not in {"PASS", "FAIL", "NEEDS_USER_DECISION", "NEEDS_VERIFICATION"}:
         raise WorkflowError(f"invalid review verdict: {payload.get('verdict')!r}")
     findings = payload.get("findings")
-    required = {"id", "fingerprint", "severity", "novelty", "required_outcome", "details"}
+    required = {"id", "fingerprint", "severity", "novelty", "details"}
     novelties = set(REVIEW_SCHEMA["properties"]["findings"]["items"]["properties"]["novelty"]["enum"])
     if not isinstance(findings, list):
         raise WorkflowError("review findings must be a list")
@@ -2927,11 +2929,12 @@ def validate_review_payload(
             raise WorkflowError(f"finding {index} has invalid severity")
         if finding["novelty"] not in novelties:
             raise WorkflowError(f"finding {index} has invalid novelty")
-        for field in ("fingerprint", "required_outcome", "details"):
+        for field in ("fingerprint", "details"):
             if not isinstance(finding[field], str) or not finding[field].strip():
                 raise WorkflowError(f"finding {index} has an empty {field}")
-        if not isinstance(finding.get("location", ""), str):
-            raise WorkflowError(f"finding {index} has a non-string location")
+        for field in REVIEW_FINDING_OPTIONAL_TEXT_FIELDS:
+            if not isinstance(finding.get(field, ""), str):
+                raise WorkflowError(f"finding {index} has a non-string {field}")
     resolved = payload.get("resolved_finding_ids")
     if not isinstance(resolved, list) or not all(isinstance(item, str) for item in resolved):
         raise WorkflowError("resolved_finding_ids must be a list of strings")
@@ -3111,6 +3114,32 @@ def _normalized_text(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
+LEDGER_BOUND_FINDING_FIELDS = (
+    "status", "deferred_reason", "required_outcome", "latest_required_outcome",
+    "obligation_revisions", "severity_history", "first_seen_round", "occurrences",
+)
+
+
+def ledger_bound_findings(
+    state: dict[str, Any], findings: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Overlay the ledger's lifecycle facts on the findings a review reported.
+
+    The reviewer's payload is its statement; the ledger is the authority for status and for the
+    frozen close condition. The host reads findings from the review result, so that result must
+    carry the frozen `required_outcome` rather than the round's restatement.
+    """
+    ledger = state.get("finding_ledger", {})
+    bound = []
+    for finding in findings:
+        entry = ledger.get(finding["fingerprint"])
+        view = dict(finding)
+        if entry is not None:
+            view.update({key: entry[key] for key in LEDGER_BOUND_FINDING_FIELDS if key in entry})
+        bound.append(view)
+    return bound
+
+
 def apply_convergence_policy(
     state: dict[str, Any], payload: dict[str, Any], batch: str, round_number: int, head: str
 ) -> dict[str, Any]:
@@ -3221,6 +3250,10 @@ def apply_convergence_policy(
             if finding["severity"] == "P0":
                 decision_reasons.append(f"CROSS_BATCH_MATERIAL_FINDING:{finding['id']}")
             continue
+        if not finding["required_outcome"].strip():
+            # The reviewer left the implementer without a close condition. The finding is kept;
+            # the host asks the reviewer for the condition on the next round.
+            warnings.append({"code": "FINDING_WITHOUT_CLOSE_CONDITION", "finding_id": finding["id"]})
         if existing:
             if existing["id"] != finding["id"]:
                 raise ReviewContractError(
@@ -3240,6 +3273,13 @@ def apply_convergence_policy(
                 )
                 if old_severity == "P2" and new_severity in {"P0", "P1"}:
                     decision_reasons.append(f"SEVERITY_UPGRADE:{finding['id']}")
+                elif new_severity == "P2":
+                    # A blocking finding stops blocking on the reviewer's own authority. The
+                    # host and the final report see why the batch unblocked.
+                    warnings.append({
+                        "code": "SEVERITY_DOWNGRADE", "finding_id": finding["id"],
+                        "from": old_severity, "to": new_severity,
+                    })
             # `required_outcome` is what "fixed" means for this finding. It is frozen at the first
             # statement so the implementer always has one close condition to work against.
             # Measured on five stuck findings, one ID used to absorb a whole class of defects:
@@ -3274,8 +3314,13 @@ def apply_convergence_policy(
                 existing["status"] = "OPEN"
             elif new_severity == "P2":
                 existing["status"] = "DEFERRED"
+                existing["deferred_reason"] = (
+                    "NON_BLOCKING_P2" if old_severity == "P2"
+                    else f"SEVERITY_DOWNGRADE:{old_severity}->P2"
+                )
             elif existing["status"] != "DEFERRED":
                 existing["status"] = "OPEN"
+            existing["blocking"] = existing["status"] == "OPEN"
             continue
 
         severity = finding["severity"]
@@ -4678,7 +4723,8 @@ def command_review(args: argparse.Namespace) -> None:
             "round": round_number, "base_sha": base, "reviewed_sha": head,
             "verdict": policy["effective_verdict"],
             "reported_verdict": payload["verdict"], "summary": payload["summary"],
-            "findings": payload["findings"], "report_path": str(report_path),
+            "findings": ledger_bound_findings(state, payload["findings"]),
+            "report_path": str(report_path),
             "blocking_fingerprints": policy["blocking_fingerprints"],
             "blocking_count": policy["blocking_count"],
             "deferred_findings": policy["deferred_findings"],

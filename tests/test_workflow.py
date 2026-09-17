@@ -2335,14 +2335,32 @@ class WorkflowIntegrationTests(unittest.TestCase):
             {"type": "OPTIONAL_FINDING_FIELD_DEFAULTED", "finding_index": 0, "field": "location"},
             disclosures,
         )
-        # The close condition is the finding's substance for the implementer: its absence is a
-        # delivery error the reviewer must repair, never prose the controller invents.
+        # A missing close condition must neither be invented by the controller nor cost the
+        # reviewer's other work: it is disclosed, kept empty, and warned about by the policy.
         without_close_condition = json.loads(json.dumps(payload))
         del without_close_condition["findings"][0]["required_outcome"]
-        WORKFLOW_MODULE.normalize_review_payload(without_close_condition)
-        with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "missing required fields"):
+        disclosures = WORKFLOW_MODULE.normalize_review_payload(without_close_condition)
+        self.assertIn(
+            {"type": "FINDING_CLOSE_CONDITION_MISSING", "finding_index": 0, "field": "required_outcome"},
+            disclosures,
+        )
+        WORKFLOW_MODULE.validate_review_payload(
+            without_close_condition, "codex", "B1", "a" * 40, "b" * 40,
+        )
+        state = {"finding_ledger": {}, "batch_convergence": {}}
+        policy = WORKFLOW_MODULE.apply_convergence_policy(
+            state, without_close_condition, "B1", 1, "b" * 40
+        )
+        self.assertIn(
+            {"code": "FINDING_WITHOUT_CLOSE_CONDITION", "finding_id": "F1"}, policy["warnings"]
+        )
+        self.assertEqual(state["finding_ledger"]["f1"]["required_outcome"], "")
+        # A finding with no substance at all is still a delivery error.
+        without_details = json.loads(json.dumps(payload))
+        without_details["findings"][0]["details"] = " "
+        with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "empty details"):
             WORKFLOW_MODULE.validate_review_payload(
-                without_close_condition, "codex", "B1", "a" * 40, "b" * 40,
+                without_details, "codex", "B1", "a" * 40, "b" * 40,
             )
 
     def test_provider_schema_excludes_engine_owned_identity(self) -> None:
@@ -3435,6 +3453,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(second["status"], "REVIEW_FAIL")
         self.assertEqual(second["decision_reasons"], [])
+        emitted = second["findings"][0]
+        self.assertEqual(emitted["required_outcome"], "enforce it at the write boundary")
+        self.assertEqual(emitted["latest_required_outcome"], "reject every produced filename")
+        self.assertEqual(emitted["status"], "OPEN")
 
         self.commit_batch_change(implementation, "implemented round 3\n")
         self.environment["FAKE_FINDINGS"] = drifting(
@@ -3461,6 +3483,36 @@ class WorkflowIntegrationTests(unittest.TestCase):
             [item["stated_required_outcome"] for item in entry["obligation_revisions"]],
             ["reject every produced filename", "reject every produced path or directory component"],
         )
+        self.environment.pop("FAKE_FINDINGS")
+
+    def test_upgraded_deferred_p2_offers_return_to_fix_on_the_real_path(self) -> None:
+        initialized = self.initialize("codex")
+        run_id = str(initialized["run_id"])
+        implementation = Path(str(initialized["implementation_worktree"]))
+
+        def graded(severity: str) -> str:
+            return json.dumps([{
+                "id": "F-1-001", "fingerprint": "graded-defect", "severity": severity,
+                "novelty": "INITIAL_REVIEW", "location": "tracked.txt:1",
+                "details": "the fixture content is wrong; severity re-assessed on new evidence",
+                "required_outcome": "make the fixture content correct",
+            }])
+
+        self.commit_batch_change(implementation, "round one\n")
+        self.environment["FAKE_FINDINGS"] = graded("P2")
+        first = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1",
+        )
+        self.assertEqual(first["status"], "REVIEW_PASS")
+        self.commit_batch_change(implementation, "round two\n")
+        self.environment["FAKE_FINDINGS"] = graded("P1")
+        second = self.workflow(
+            "review", "--project", str(self.project), "--run-id", run_id, "--batch", "1", expected=3,
+        )
+        self.assertEqual(second["status"], "NEEDS_USER_DECISION")
+        self.assertEqual(second["decision_reasons"], ["SEVERITY_UPGRADE:F-1-001"])
+        status = self.workflow("status", "--project", str(self.project), "--run-id", run_id)
+        self.assertIn("RETURN_TO_FIX", status["pending_decision"]["allowed_choices"])
         self.environment.pop("FAKE_FINDINGS")
 
     def test_deferred_p1_rereported_as_p0_blocks_acceptance(self) -> None:
@@ -3952,7 +4004,6 @@ class ObligationDriftTests(ConvergencePolicyFindingBuilder):
             (2, "b/two.py:2", "preserve the  required behaviour everywhere"),
             (3, "c/three.py:3", "reject every produced path"),
         ):
-            state["batch_convergence"] = {}
             result = self.apply(
                 state,
                 self.payload(
@@ -3961,8 +4012,10 @@ class ObligationDriftTests(ConvergencePolicyFindingBuilder):
                 ),
                 round_number,
             )
-            self.assertEqual(result["effective_verdict"], "FAIL")
-            self.assertEqual(result["decision_reasons"], [])
+            self.assertEqual(
+                [reason for reason in result["decision_reasons"] if reason != "NO_PROGRESS_FOR_TWO_ROUNDS"],
+                [],
+            )
 
     def test_close_condition_is_frozen_and_restatements_are_kept_for_audit(self) -> None:
         state = self.state()
@@ -4043,6 +4096,40 @@ class ObligationDriftTests(ConvergencePolicyFindingBuilder):
         self.assertEqual(entry["severity_history"], [{"round": 2, "from": "P1", "to": "P0"}])
         self.assertEqual(entry["status"], "OPEN")
         self.assertEqual(result["effective_verdict"], "FAIL")
+
+    def test_downgrade_to_p2_unblocks_with_a_recorded_reason_and_a_warning(self) -> None:
+        state = self.state()
+        first = self.apply(state, self.payload("FAIL", [self.finding("F-1", "graded", severity="P0")]), 1)
+        self.assertEqual(first["effective_verdict"], "FAIL")
+        second = self.apply(
+            state, self.payload("PASS", [self.finding("F-1", "graded", severity="P2")]), 2
+        )
+        entry = state["finding_ledger"]["graded"]
+        self.assertEqual(second["effective_verdict"], "PASS")
+        self.assertEqual(entry["status"], "DEFERRED")
+        self.assertFalse(entry["blocking"])
+        self.assertEqual(entry["deferred_reason"], "SEVERITY_DOWNGRADE:P0->P2")
+        self.assertIn(
+            {"code": "SEVERITY_DOWNGRADE", "finding_id": "F-1", "from": "P0", "to": "P2"},
+            second["warnings"],
+        )
+
+    def test_upgrade_of_a_deferred_p2_escalates_to_the_user(self) -> None:
+        state = self.state()
+        self.apply(state, self.payload("PASS", [self.finding("F-1", "graded", severity="P2")]), 1)
+        self.assertEqual(state["finding_ledger"]["graded"]["status"], "DEFERRED")
+        second = self.apply(
+            state, self.payload("FAIL", [self.finding("F-1", "graded", severity="P1")]), 2
+        )
+        self.assertEqual(second["effective_verdict"], "NEEDS_USER_DECISION")
+        self.assertEqual(second["decision_reasons"], ["SEVERITY_UPGRADE:F-1"])
+        entry = state["finding_ledger"]["graded"]
+        # The upgrade is the user's call (RETURN_TO_FIX or DEFER_ELIGIBLE_P1): the entry stays
+        # deferred until that decision rather than reopening on the reviewer's authority alone.
+        self.assertEqual(entry["status"], "DEFERRED")
+        self.assertFalse(entry["blocking"])
+        self.assertEqual(entry["severity"], "P1")
+        self.assertEqual(entry["severity_history"], [{"round": 2, "from": "P2", "to": "P1"}])
 
     def test_ledger_entry_written_before_this_change_still_converges(self) -> None:
         """A run created with the retired prose fields must review and converge unchanged."""
@@ -4171,6 +4258,10 @@ class ReviewerSchemaCompatibilityTests(unittest.TestCase):
             if not isinstance(instance, dict):
                 return [f"expected object, got {type(instance).__name__}"]
             properties = schema.get("properties", {})
+            if schema.get("additionalProperties") is not False:
+                problems.append("object is not closed")
+            if sorted(schema.get("required", [])) != sorted(properties):
+                problems.append("strict mode requires every property")
             for key in schema.get("required", []):
                 if key not in instance:
                     problems.append(f"missing required {key}")
@@ -4236,13 +4327,22 @@ class ReviewerSchemaCompatibilityTests(unittest.TestCase):
         wire = WORKFLOW_MODULE.producer_delivery_schema(
             WORKFLOW_MODULE.REVIEW_SCHEMA, {"reviewer", "reviewed_sha", "base_sha", "batch"},
         )
-        deliverable = set(wire["properties"]["findings"]["items"]["properties"])
-        internal = set(WORKFLOW_MODULE.REVIEW_SCHEMA["properties"]["findings"]["items"]["properties"])
-        retired = {"introduced_by_sha", "why_not_detectable_earlier", "severity_change_justification"}
+
+        def property_names(schema: dict, names: set) -> set:
+            for key, value in schema.get("properties", {}).items():
+                names.add(key)
+                property_names(value, names)
+            if isinstance(schema.get("items"), dict):
+                property_names(schema["items"], names)
+            return names
+
+        deliverable = property_names(wire, set())
+        interpreters = {"python", "pypy"}  # the only backticked lowercase words that are not fields
         prompt = (SKILL_ROOT / "references" / "reviewer_prompt.md").read_text(encoding="utf-8")
-        named = set(re.findall(r"`([a-z_]+)`", prompt))
-        self.assertEqual(sorted((named & (internal | retired)) - deliverable), [])
-        self.assertEqual(sorted(deliverable - named), [], "prompt must explain every wire field")
+        named = set(re.findall(r"`([a-z_]+)`", prompt)) - interpreters
+        self.assertEqual(sorted(named - deliverable), [], "prompt names a field the wire cannot carry")
+        finding_fields = set(wire["properties"]["findings"]["items"]["properties"])
+        self.assertEqual(sorted(finding_fields - named), [], "prompt must explain every finding field")
 
     def test_compatibility_guard_detects_forbidden_keyword(self) -> None:
         bad_schema = {
