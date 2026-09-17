@@ -3454,6 +3454,13 @@ class WorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(second["status"], "REVIEW_FAIL")
         self.assertEqual(second["decision_reasons"], [])
         emitted = second["findings"][0]
+        overlay = set(emitted) - {"id", "fingerprint", "severity", "novelty", "location", "details"}
+        self.assertTrue(overlay <= set(WORKFLOW_MODULE.LEDGER_BOUND_FINDING_FIELDS), overlay)
+        self.assertTrue(
+            {"status", "deferred_reason", "required_outcome", "latest_required_outcome",
+             "obligation_revisions"} <= overlay,
+            overlay,
+        )
         self.assertEqual(emitted["required_outcome"], "enforce it at the write boundary")
         self.assertEqual(emitted["latest_required_outcome"], "reject every produced filename")
         self.assertEqual(emitted["status"], "OPEN")
@@ -4096,6 +4103,16 @@ class ObligationDriftTests(ConvergencePolicyFindingBuilder):
         self.assertEqual(entry["severity_history"], [{"round": 2, "from": "P1", "to": "P0"}])
         self.assertEqual(entry["status"], "OPEN")
         self.assertEqual(result["effective_verdict"], "FAIL")
+
+    def test_reopened_finding_carries_no_stale_deferred_reason(self) -> None:
+        state = self.state()
+        self.apply(state, self.payload("PASS", [self.finding("F-1", "graded", severity="P2")]), 1)
+        self.assertEqual(state["finding_ledger"]["graded"]["deferred_reason"], "NON_BLOCKING_P2")
+        self.apply(state, self.payload("FAIL", [self.finding("F-1", "graded", severity="P0")]), 2)
+        entry = state["finding_ledger"]["graded"]
+        self.assertEqual(entry["status"], "OPEN")
+        self.assertIsNone(entry["deferred_reason"])
+        self.assertEqual(entry["latest_required_outcome"], "preserve the required behavior")
 
     def test_downgrade_to_p2_unblocks_with_a_recorded_reason_and_a_warning(self) -> None:
         state = self.state()

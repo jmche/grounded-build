@@ -3116,7 +3116,7 @@ def _normalized_text(value: Any) -> str:
 
 LEDGER_BOUND_FINDING_FIELDS = (
     "status", "deferred_reason", "required_outcome", "latest_required_outcome",
-    "obligation_revisions", "severity_history", "first_seen_round", "occurrences",
+    "obligation_revisions", "severity_history",
 )
 
 
@@ -3320,6 +3320,8 @@ def apply_convergence_policy(
                 )
             elif existing["status"] != "DEFERRED":
                 existing["status"] = "OPEN"
+            if existing["status"] == "OPEN":
+                existing["deferred_reason"] = None
             existing["blocking"] = existing["status"] == "OPEN"
             continue
 
@@ -3343,6 +3345,8 @@ def apply_convergence_policy(
                 deferred_reason = "LATE_NONQUALIFYING_DISCOVERY"
         ledger[fingerprint] = {
             **finding,
+            "latest_required_outcome": finding["required_outcome"],
+            "obligation_revisions": [],
             "batch": batch,
             "status": "OPEN" if blocking else "DEFERRED",
             "blocking": blocking,
