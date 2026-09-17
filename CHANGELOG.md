@@ -14,7 +14,11 @@ All notable changes use semantic versioning.
 - Corrected the 0.7.3 note that `bash` stays enabled in the DSH sandbox. The read boundary plugin
   denies every tool outside its read allowlist at execution time, bash included, and evidence
   digests are computed by the engine; the patch's disable list shapes the agent, it is not the
-  credential boundary. `SECURITY.md` was already accurate.
+  credential boundary. `SECURITY.md` was already accurate. Planning prompts no longer tell a dsh
+  slot to run `sha256sum` or reach the network with a shell.
+- Reconciliation reviews (`INTEGRATION_nn`) keep judging every criterion at the merged SHA, and
+  finalization and reconciliation take the last accepted stage's SHA, so a FINAL repair commit
+  finalizes. The `GRANT_ONE_REVIEW` menu uses the single round-limit function.
 - Added the `EXTEND_REVIEW_BUDGET` decision. When a batch's ordinary rounds are exhausted, including
   after a failed closeout, the user can add one more ordinary budget to the same batch with a
   recorded reason; the acceptance contract, finding ledger, accepted batches, and prior decisions
