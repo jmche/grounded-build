@@ -2170,6 +2170,14 @@ def build_prompt(
         "with the supplied fix delta and prior ledger obligations. Expand inspection in the fixed-SHA "
         "worktree whenever the delta changes or invalidates an authority, public contract, state or "
         "security boundary, batch scope, prior assumption, or affected consumer. "
+        + "Read prior verification requests in the assignment metadata. A superseded request "
+        "retires execution at an older SHA, not the reason verification was requested. Reassess "
+        "each outstanding reason against exact HEAD: request current-SHA evidence if still "
+        "material, or explain in the summary why it no longer requires execution. Historical "
+        "FAIL evidence cannot prove current HEAD. A failed current-SHA request blocks PASS; "
+        "report FAIL or NEEDS_USER_DECISION with the remaining issue instead. COMMAND criterion "
+        "results must cite current-SHA evidence matching their PASS or FAIL status. An undecidable "
+        "COMMAND criterion may be NOT_APPLICABLE in a non-PASS report without claiming it passed. "
         + "Set reviewer, reviewed_sha, base_sha, and batch exactly as assigned. Do not wrap JSON in Markdown.\n"
     )
 
@@ -2218,6 +2226,12 @@ def prepare_review_context(
             "authoritative_coverage_base_sha": base,
             "supplied_diff_base_sha": diff_base,
             "user_decisions": state.get("decisions", []),
+            "prior_verification_requests": [
+                copy.deepcopy(item) for item in state.get("verification_requests", [])
+                if item.get("batch") == batch and item.get("reviewed_sha") != head
+                and item.get("source") == "REVIEWER"
+                and item.get("status") in {"PENDING", "APPROVED", "RUNNING", "SUPERSEDED", "FAIL"}
+            ],
         },
     )
     legacy_ids = legacy_recovery_open_ids(state, batch)
@@ -3045,19 +3059,28 @@ def validate_review_payload(
         evidence_by_id = {
             item.get("evidence_id"): item
             for item in state.get("verification_evidence", [])
-            if item.get("reviewed_sha") == head and item.get("status") == "PASS"
+            if item.get("reviewed_sha") == head and item.get("status") in {"PASS", "FAIL"}
         }
+        if payload["verdict"] == "PASS" and any(
+            item.get("status") == "FAIL" for item in verification_requests_at(state, batch, head)
+        ):
+            raise WorkflowError(
+                "PASS is blocked by failed current-SHA verification; commit a fix and review the new SHA"
+            )
         for criterion in criteria:
             if criterion.get("evidence_kind") != "COMMAND":
                 continue
-            refs = by_id[criterion["id"]].get("evidence_ids", [])
-            if not refs or any(
+            result = by_id[criterion["id"]]
+            status = result["status"]
+            refs = result.get("evidence_ids", [])
+            if (status != "NOT_APPLICABLE" and not refs) or any(
                 ref not in evidence_by_id
                 or evidence_by_id[ref].get("criterion_id") != criterion["id"]
+                or (status != "NOT_APPLICABLE" and evidence_by_id[ref].get("status") != status)
                 for ref in refs
             ):
                 raise WorkflowError(
-                    f"COMMAND criterion {criterion['id']} lacks current-SHA PASS evidence"
+                    f"COMMAND criterion {criterion['id']} lacks current-SHA {status} evidence"
                 )
 
 
@@ -3470,6 +3493,12 @@ def apply_convergence_policy(
         effective_verdict = "FAIL"
     else:
         effective_verdict = "PASS"
+    if effective_verdict == "PASS" and (
+        any(item.get("status") != "PASS" for item in payload.get("criterion_results", []))
+        or any(item.get("status") == "FAIL" for item in verification_requests_at(state, batch, head))
+    ):
+        effective_verdict = "NEEDS_USER_DECISION"
+        decision_reasons.append("ACCEPTANCE_EVIDENCE_INCOMPLETE")
     result = {
         "effective_verdict": effective_verdict,
         "reported_verdict": payload["verdict"],
@@ -3487,6 +3516,97 @@ def apply_convergence_policy(
     state["finding_ledger"] = ledger
     state["batch_convergence"] = convergence_by_batch
     return result
+
+
+def review_matches_engine(state: dict[str, Any], review: dict[str, Any]) -> bool:
+    # Reviews predating epoch recording belong to the original engine, never a later migration.
+    return review.get("engine_epoch", 0) == state.get("engine_epoch", 0)
+
+
+def verification_request_is_current(state: dict[str, Any], record: dict[str, Any], head: str) -> bool:
+    pending_batch = current_batch(state)
+    if record.get("source") == "FINAL_CONTRACT":
+        final = state.get("final_verification") or {}
+        return bool(
+            pending_batch is None and final.get("status") == "PENDING"
+            and record.get("batch") == "__FINAL__"
+            and record.get("reviewed_sha") == head == final.get("reviewed_sha") == final_accepted_sha(state)
+            and record.get("request_key") in final.get("request_keys", [])
+        )
+    return record.get("batch") == pending_batch and record.get("reviewed_sha") == head
+
+
+def stale_verification_message(state: dict[str, Any], record: dict[str, Any]) -> str:
+    if record.get("source") == "FINAL_CONTRACT" and current_batch(state) is None:
+        return (
+            "final verification request does not authorize the active final stage; restore the accepted SHA "
+            f"{final_accepted_sha(state)} and use its active verification requests from status, "
+            "or supersede this run and review additional commits in a new run"
+        )
+    return (
+        "verification request does not authorize the current batch and HEAD; "
+        "run review for the current batch to refresh verification"
+    )
+
+
+def verification_requests_at(state: dict[str, Any], batch: str, head: str) -> list[dict[str, Any]]:
+    return [
+        item for item in state.get("verification_requests", [])
+        if item.get("batch") == batch and item.get("reviewed_sha") == head
+        and item.get("status") != "SUPERSEDED"
+    ]
+
+
+def verification_phase_status(state: dict[str, Any], batch: str, head: str) -> str:
+    requests = verification_requests_at(state, batch, head)
+    if any(item.get("status") == "FAIL" for item in requests):
+        return "CHANGES_REQUESTED"
+    if any(item.get("status") in {"PENDING", "APPROVED", "RUNNING"} for item in requests):
+        return "AWAITING_VERIFICATION"
+    return "IMPLEMENTING"
+
+
+def set_verification_phase(state: dict[str, Any], implementation: Path, record: dict[str, Any]) -> None:
+    if record.get("source") == "FINAL_CONTRACT":
+        state["status"] = "FINAL_VERIFICATION_REQUIRED"
+    else:
+        head = git(implementation, "rev-parse", "HEAD")
+        state["status"] = verification_phase_status(state, record["batch"], head)
+
+
+def refresh_verification_requests(
+    state: dict[str, Any], batch: str, head: str, dry_run: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    obsolete = [
+        item for item in state.get("verification_requests", [])
+        if item.get("batch") == batch and item.get("reviewed_sha") != head
+        and item.get("status") in {"PENDING", "APPROVED", "RUNNING"}
+    ]
+    reactivated = [
+        item for item in state.get("verification_requests", [])
+        if item.get("batch") == batch and item.get("reviewed_sha") == head
+        and item.get("status") == "SUPERSEDED"
+        and item.get("superseded_from_status") in {"PENDING", "APPROVED"}
+    ]
+    if obsolete or reactivated:
+        replacement = {
+            "batch": batch, "reviewed_sha": head,
+            "superseded_request_keys": [item["request_key"] for item in obsolete],
+            "reactivated_request_keys": [item["request_key"] for item in reactivated],
+        }
+        if dry_run:
+            emit({"status": "VERIFICATION_REFRESH_PREVIEW", "run_id": state["run_id"], **replacement})
+        for item in obsolete:
+            item["superseded_from_status"] = item["status"]
+            item["status"] = "SUPERSEDED"
+            item["superseded_at"] = utc_now()
+            item["superseded_by_sha"] = head
+        for item in reactivated:
+            item["status"] = item["superseded_from_status"]
+            item["reactivated_at"] = utc_now()
+        state["status"] = verification_phase_status(state, batch, head)
+        append_event(state, "VERIFICATION_REQUESTS_REFRESHED", replacement)
+    return obsolete, reactivated
 
 
 def register_verification_requests(
@@ -3891,6 +4011,10 @@ def command_verify(args: argparse.Namespace) -> None:
     if len(matches) != 1:
         raise WorkflowError(f"verification request not found: {args.request_id}")
     record = matches[0]
+    implementation = validate_implementation(state)
+    head = git(implementation, "rev-parse", "HEAD")
+    if not verification_request_is_current(state, record, head):
+        raise WorkflowError(stale_verification_message(state, record))
     if record["status"] not in {"PENDING", "APPROVED"}:
         raise WorkflowError(f"verification request is not retryable: {record['status']}")
     if args.reject_reason:
@@ -3915,13 +4039,7 @@ def command_verify(args: argparse.Namespace) -> None:
         record["status"] = "REJECTED"
         record["rejection_reason"] = args.reject_reason
         record["resolved_at"] = utc_now()
-        remaining = [
-            item for item in state.get("verification_requests", [])
-            if item is not record and item.get("batch") == record.get("batch")
-            and item.get("reviewed_sha") == record.get("reviewed_sha")
-            and item.get("status") in {"PENDING", "APPROVED", "RUNNING"}
-        ]
-        state["status"] = "AWAITING_VERIFICATION" if remaining else "IMPLEMENTING"
+        set_verification_phase(state, implementation, record)
         append_event(state, "VERIFICATION_REJECTED", {"request_id": args.request_id, "reason": args.reject_reason})
         save_state(state)
         emit({**preview, "status": "VERIFICATION_REQUEST_REJECTED"})
@@ -4006,6 +4124,7 @@ def command_verify(args: argparse.Namespace) -> None:
     if not bwrap:
         attempt.update({"status": "INFRA_ERROR", "error": "bwrap is required", "completed_at": utc_now()})
         record["status"] = "PENDING"
+        set_verification_phase(state, implementation, record)
         append_event(state, "VERIFICATION_INFRA_ERROR", attempt)
         save_state(state)
         emit({**preview, "status": "VERIFICATION_ERROR", "reason": attempt["error"], "retryable": True}, 4)
@@ -4050,7 +4169,7 @@ def command_verify(args: argparse.Namespace) -> None:
     except (WorkflowError, OSError) as exc:
         attempt.update({"status": "INFRA_ERROR", "error": str(exc), "completed_at": utc_now()})
         record["status"] = "PENDING"
-        state["status"] = "AWAITING_VERIFICATION"
+        set_verification_phase(state, implementation, record)
         append_event(state, "VERIFICATION_INFRA_ERROR", attempt)
         save_state(state)
         emit({**preview, "status": "VERIFICATION_ERROR", "reason": str(exc), "retryable": True}, 4)
@@ -4058,14 +4177,14 @@ def command_verify(args: argparse.Namespace) -> None:
     if timed_out:
         attempt.update({"status": "INFRA_ERROR", "error": f"timeout after {args.timeout}s", "completed_at": utc_now()})
         record["status"] = "PENDING"
-        state["status"] = "AWAITING_VERIFICATION"
+        set_verification_phase(state, implementation, record)
         append_event(state, "VERIFICATION_INFRA_ERROR", attempt)
         save_state(state)
         emit({**preview, "status": "VERIFICATION_ERROR", "reason": attempt["error"], "retryable": True}, 4)
     if resource_error:
         attempt.update({"status": "INFRA_ERROR", "error": resource_error, "completed_at": utc_now()})
         record["status"] = "PENDING"
-        state["status"] = "AWAITING_VERIFICATION"
+        set_verification_phase(state, implementation, record)
         append_event(state, "VERIFICATION_INFRA_ERROR", attempt)
         save_state(state)
         emit({**preview, "status": "VERIFICATION_ERROR", "reason": resource_error, "retryable": True}, 4)
@@ -4073,7 +4192,7 @@ def command_verify(args: argparse.Namespace) -> None:
     if returncode != request["expected_exit"] and stderr_text.lstrip().startswith("bwrap:"):
         attempt.update({"status": "INFRA_ERROR", "error": stderr_text.strip(), "completed_at": utc_now()})
         record["status"] = "PENDING"
-        state["status"] = "AWAITING_VERIFICATION"
+        set_verification_phase(state, implementation, record)
         append_event(state, "VERIFICATION_INFRA_ERROR", attempt)
         save_state(state)
         emit({**preview, "status": "VERIFICATION_ERROR", "reason": attempt["error"], "retryable": True}, 4)
@@ -4090,7 +4209,7 @@ def command_verify(args: argparse.Namespace) -> None:
     ):
         attempt.update({"status": "INFRA_ERROR", "error": stderr_text.strip(), "completed_at": utc_now()})
         record["status"] = "PENDING"
-        state["status"] = "AWAITING_VERIFICATION"
+        set_verification_phase(state, implementation, record)
         append_event(state, "VERIFICATION_INFRA_ERROR", attempt)
         save_state(state)
         emit({**preview, "status": "VERIFICATION_ERROR", "reason": attempt["error"], "retryable": True}, 4)
@@ -4136,7 +4255,7 @@ def command_verify(args: argparse.Namespace) -> None:
     if record.get("source") == "FINAL_CONTRACT":
         final_requests = [
             item for item in state["verification_requests"]
-            if item.get("source") == "FINAL_CONTRACT" and item.get("reviewed_sha") == record["reviewed_sha"]
+            if item.get("request_key") in state["final_verification"]["request_keys"]
         ]
         if status == "FAIL":
             last_batch = state["accepted_batches"].pop() if state["accepted_batches"] else None
@@ -4158,16 +4277,7 @@ def command_verify(args: argparse.Namespace) -> None:
         else:
             state["status"] = "FINAL_VERIFICATION_REQUIRED"
     else:
-        remaining = [
-            item for item in state.get("verification_requests", [])
-            if item is not record and item.get("batch") == record.get("batch")
-            and item.get("reviewed_sha") == record.get("reviewed_sha")
-            and item.get("status") in {"PENDING", "APPROVED", "RUNNING"}
-        ]
-        state["status"] = (
-            "AWAITING_VERIFICATION" if status == "PASS" and remaining
-            else ("IMPLEMENTING" if status == "PASS" else "CHANGES_REQUESTED")
-        )
+        set_verification_phase(state, implementation, record)
     append_event(state, "VERIFICATION_COMPLETED", {
         "request_key": args.request_id, "attempt": attempt_number,
         "evidence_id": evidence_id, "status": status, "reviewed_sha": record["reviewed_sha"],
@@ -4269,7 +4379,7 @@ def command_review(args: argparse.Namespace) -> None:
     # because the report no longer authorizes HEAD, and `review` used to refuse on status. The
     # batch is not accepted yet, so new work still belongs to it and earns a review round. The
     # guard below keeps a PASS that still describes HEAD from buying a second paid review.
-    if state.get("status") not in {"IMPLEMENTING", "CHANGES_REQUESTED", "AWAITING_ACCEPTANCE"}:
+    if state.get("status") not in {"IMPLEMENTING", "CHANGES_REQUESTED", "AWAITING_ACCEPTANCE", "AWAITING_VERIFICATION"}:
         raise WorkflowError(f"review is not allowed from workflow status {state.get('status')}")
     require_target_unchanged(project, state)
     implementation = validate_implementation(state)
@@ -4285,6 +4395,60 @@ def command_review(args: argparse.Namespace) -> None:
     round_limit = ordinary_review_round_limit(state, args.batch)
     implementation_head = git(implementation, "rev-parse", "HEAD")
     last_review = prior[-1] if prior else None
+    engine_revalidation = state.get("engine_revalidation") or {}
+    revalidating_engine = bool(
+        (
+            last_review and last_review.get("verdict") == "PASS"
+            and last_review.get("reviewed_sha") == implementation_head
+            and not review_matches_engine(state, last_review)
+        )
+        or (
+            engine_revalidation.get("required")
+            and engine_revalidation.get("batch") == args.batch
+            and engine_revalidation.get("reviewed_sha") == implementation_head
+        )
+    )
+    if (
+        state.get("status") != "AWAITING_ACCEPTANCE"
+        and last_review and last_review.get("verdict") == "PASS"
+        and last_review.get("reviewed_sha") == implementation_head
+        and review_matches_engine(state, last_review)
+        and not revalidating_engine
+        and all(
+            item.get("status") in {"PASS", "REJECTED"}
+            for item in verification_requests_at(state, args.batch, implementation_head)
+        )
+    ):
+        obsolete, reactivated = refresh_verification_requests(
+            state, args.batch, implementation_head, args.dry_run
+        )
+        if args.dry_run:
+            emit({
+                "status": "VERIFICATION_REFRESH_PREVIEW", "run_id": state["run_id"], "batch": args.batch,
+                "reviewed_sha": implementation_head, "report_path": last_review["report_path"],
+                "superseded_request_keys": [], "reactivated_request_keys": [],
+                "restore_status": "AWAITING_ACCEPTANCE",
+            })
+        if reactivated:
+            save_state(state)
+            emit({
+                "status": "VERIFICATION_REQUIRED", "run_id": state["run_id"],
+                "batch": args.batch, "reviewed_sha": implementation_head,
+                "requests": reactivated, "review_round_consumed": False, "source": "REACTIVATED",
+            }, 3)
+        state["status"] = "AWAITING_ACCEPTANCE"
+        append_event(state, "CURRENT_SHA_PASS_RESTORED", {
+            "batch": args.batch, "reviewed_sha": implementation_head,
+            "report_path": last_review["report_path"],
+        })
+        save_state(state)
+        emit({
+            "status": "REVIEW_PASS", "run_id": state["run_id"], "batch": args.batch,
+            "reviewed_sha": implementation_head, "report_path": last_review["report_path"],
+            "reviewer": last_review.get("reviewer"),
+            "reviewer_runtime": last_review.get("reviewer_runtime") or {}, "round": last_review["round"],
+            "reused": True, "review_round_consumed": False,
+        })
     post_pass_exemption = bool(
         round_number > round_limit
         and not legacy_recovery_round
@@ -4356,12 +4520,6 @@ def command_review(args: argparse.Namespace) -> None:
         base = str((state.get("integration") or {}).get("approved_target_sha") or base)
     if head == base:
         raise WorkflowError(f"batch {args.batch!r} has no committed changes relative to its base")
-    engine_revalidation = state.get("engine_revalidation") or {}
-    revalidating_engine = bool(
-        engine_revalidation.get("required")
-        and engine_revalidation.get("batch") == args.batch
-        and engine_revalidation.get("reviewed_sha") == head
-    )
     if prior and prior[-1]["verdict"] == "FAIL" and prior[-1]["reviewed_sha"] == head:
         raise WorkflowError("review requested changes but implementation HEAD has no new fix commit")
     if prior and prior[-1]["verdict"] == "PASS" and prior[-1]["reviewed_sha"] == head and not revalidating_engine:
@@ -4372,26 +4530,29 @@ def command_review(args: argparse.Namespace) -> None:
     review_mode, diff_base, review_mode_reason = select_review_transport(
         implementation, base, head, prior
     )
+    obsolete, reactivated = refresh_verification_requests(state, args.batch, head, args.dry_run)
+    if obsolete or reactivated:
+        save_state(state)
     contract_requests = register_missing_contract_verification(
         state, args.batch, round_number, base, head
     )
-    if contract_requests:
-        state["status"] = "AWAITING_VERIFICATION"
-        append_event(state, "CONTRACT_VERIFICATION_REQUIRED", {
+    if contract_requests or reactivated:
+        requests = contract_requests + reactivated
+        state["status"] = verification_phase_status(state, args.batch, head)
+        append_event(state, "CONTRACT_VERIFICATION_REQUIRED" if contract_requests else "VERIFICATION_REQUESTS_REACTIVATED", {
             "batch": args.batch, "round": round_number, "reviewed_sha": head,
-            "request_keys": [item["request_key"] for item in contract_requests],
+            "request_keys": [item["request_key"] for item in requests],
         })
         save_state(state)
         emit({
             "status": "VERIFICATION_REQUIRED", "run_id": state["run_id"],
             "batch": args.batch, "round": round_number, "reviewed_sha": head,
-            "requests": contract_requests, "review_round_consumed": False,
-            "source": "ACCEPTANCE_CONTRACT",
+            "requests": requests, "review_round_consumed": False,
+            "source": "ACCEPTANCE_CONTRACT" if contract_requests else "REACTIVATED",
         }, 3)
     unresolved_requests = [
-        item for item in state.get("verification_requests", [])
-        if item.get("batch") == args.batch and item.get("reviewed_sha") == head
-        and item.get("status") in {"PENDING", "APPROVED", "RUNNING"}
+        item for item in verification_requests_at(state, args.batch, head)
+        if item.get("status") in {"PENDING", "APPROVED", "RUNNING"}
     ]
     if unresolved_requests:
         raise WorkflowError("review is blocked by unresolved fixed-SHA verification requests")
@@ -4694,6 +4855,7 @@ def command_review(args: argparse.Namespace) -> None:
         )
     report_document = {
         **payload,
+        "engine_epoch": int(state.get("engine_epoch", 0)),
         "effective_verdict": policy["effective_verdict"],
         "policy": policy,
         "closeout_review": closeout_review,
@@ -4717,6 +4879,8 @@ def command_review(args: argparse.Namespace) -> None:
             "no_progress_streak": policy["no_progress_streak"],
             "report_path": str(report_path), "metadata_path": str(metadata_path),
             "invocation_id": invocation_id, "reviewer": state["reviewer"],
+            "reviewer_runtime": copy.deepcopy(state.get("reviewer_runtime") or {}),
+            "engine_epoch": int(state.get("engine_epoch", 0)),
             "review_mode": review_mode, "review_mode_reason": review_mode_reason,
             "supplied_diff_base_sha": diff_base,
             "supplied_diff_bytes": supplied_diff_bytes,
@@ -4752,7 +4916,7 @@ def command_review(args: argparse.Namespace) -> None:
         "FAIL": "CHANGES_REQUESTED",
         "NEEDS_USER_DECISION": "NEEDS_USER_DECISION",
     }[policy["effective_verdict"]]
-    if revalidating_engine:
+    if revalidating_engine or state.get("engine_revalidation"):
         state["engine_revalidation"] = None
         append_event(state, "ENGINE_REVALIDATION_COMPLETED", {
             "batch": args.batch, "reviewed_sha": head,
@@ -4764,12 +4928,12 @@ def command_review(args: argparse.Namespace) -> None:
         else:
             allowed = ["ABORT_RUN"]
             if any(
-                reason == "NO_PROGRESS_FOR_TWO_ROUNDS"
+                reason in {"NO_PROGRESS_FOR_TWO_ROUNDS", "ACCEPTANCE_EVIDENCE_INCOMPLETE"}
                 or reason.startswith("SEVERITY_UPGRADE:")
                 for reason in policy["decision_reasons"]
             ):
                 allowed.insert(0, "RETURN_TO_FIX")
-            if "REVIEWER_REQUESTED_DECISION" in policy["decision_reasons"] or any(
+            if {"REVIEWER_REQUESTED_DECISION", "ACCEPTANCE_EVIDENCE_INCOMPLETE"}.intersection(policy["decision_reasons"]) or any(
                 reason.startswith("CROSS_BATCH_MATERIAL_FINDING:")
                 for reason in policy["decision_reasons"]
             ):
@@ -4853,9 +5017,8 @@ def command_accept(args: argparse.Namespace) -> None:
     payload = read_json_object(report, "review report")
     head = git(implementation, "rev-parse", "HEAD")
     unresolved_verification = [
-        item for item in state.get("verification_requests", [])
-        if item.get("batch") == args.batch and item.get("reviewed_sha") == head
-        and item.get("status") not in {"PASS", "REJECTED"}
+        item for item in verification_requests_at(state, args.batch, head)
+        if item.get("status") not in {"PASS", "REJECTED"}
     ]
     if unresolved_verification:
         raise WorkflowError("cannot accept while fixed-SHA verification is unresolved or failing")
@@ -4877,6 +5040,8 @@ def command_accept(args: argparse.Namespace) -> None:
     batch_reviews = [item for item in state["reviews"] if item["batch"] == args.batch]
     if not batch_reviews or batch_reviews[-1]["report_path"] != str(report):
         raise WorkflowError("only the latest registered review can authorize acceptance")
+    if not review_matches_engine(state, batch_reviews[-1]):
+        raise WorkflowError("PASS belongs to an earlier engine; run review to revalidate before acceptance")
     state["accepted_batches"].append(args.batch)
     state["accepted_shas"][args.batch] = head
     next_batch = current_batch(state)

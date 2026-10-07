@@ -106,6 +106,12 @@ Verdicts:
 
 When fixed-SHA verification evidence is supplied, assess it and do not request the same successful command again. A rejected request is feedback from the host, not proof of correctness; either decide from other evidence or explain the remaining material uncertainty. For all verdicts other than `NEEDS_VERIFICATION`, return an empty `verification_requests` list.
 
+Read prior verification requests in the assignment metadata. Superseding unfinished execution at
+an older SHA does not resolve the reason for the observation. Reassess that reason at exact HEAD:
+request new evidence when still material, or explain in the summary why execution is no longer
+needed. Historical FAIL evidence does not prove current HEAD. A failed current-SHA request blocks
+PASS; report the remaining defect or required user decision honestly.
+
 Git-ignored virtual environments do not follow detached worktrees. Their absence in this reviewer
 worktree is expected and is not a code defect. A verification request beginning `.venv/` is resolved by
 the workflow from the original project environment, mounted read-only, and executed with the fixed-SHA
@@ -120,5 +126,10 @@ module-missing error is classified as retryable infrastructure, never a code fai
 relative launchers verbatim or name an explicit absolute interpreter path.
 
 Return one `criterion_results` entry for every acceptance-contract criterion assigned to this batch whenever the verdict is not `NEEDS_VERIFICATION`. A `PASS` verdict requires each result to be `PASS`. Cite supplied fixed-SHA evidence IDs for `COMMAND` criteria; do not treat a pathname or implementer claim as evidence. `REPOSITORY_ASSERTION` criteria may be decided from the reviewed SHA with a concrete rationale. The workflow validates coverage and evidence provenance, while you retain responsibility for semantic judgment.
+
+A COMMAND result reported as FAIL cites current-SHA FAIL evidence for that criterion; a PASS result
+cites current-SHA PASS evidence. If it cannot be decided, a non-PASS report may use NOT_APPLICABLE
+with a concrete rationale and no evidence claim. This preserves the uncertainty, not permission
+to accept an unmet criterion.
 
 Do not modify files. Do not create commits, branches, or worktrees. Do not merge, rebase, reset, clean, stash, or push. Return only the requested structured result.

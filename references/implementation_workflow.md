@@ -88,8 +88,10 @@ review. Target movement is integration divergence, not execution staleness.
 - Continue fixed-baseline execution if the target advances. Previously issued review approvals do not authorize the combined code; use reviewed reconciliation before integration.
 - If a skill update changes the frozen engine files, Implement rejects ordinary commands until the
   operator runs `migrate-engine --reason <reason> --actor <actor>` (preview first, then `--apply`).
-  Migration refuses active invocations, preserves frozen artifacts, and marks any current-SHA PASS
-  for one fresh review under the new engine before acceptance.
+  Migration refuses active invocations and preserves frozen artifacts. Reviews record their engine
+  epoch; a PASS from an earlier epoch requires a fresh review under the new engine before acceptance,
+  even when HEAD returns to that SHA after migration. Revalidation uses the existing review budgets.
+  A valid review of a new HEAD under the current engine also satisfies the migration's review obligation.
 - The ordinary cap is four valid review rounds per batch: one full discovery review and three bounded re-reviews. Reviewer infrastructure errors do not consume a round. Three separately audited exceptions may each add at most one ordinary round: a convergence-boundary grant, a review-budget grant, and a new-commit re-review after an effective PASS. A nonterminal typed decision applied only after those available rounds are exhausted authorizes one terminal closeout review bound to that decision, batch, and exact SHA. Infrastructure or malformed output does not consume the closeout; one valid non-PASS result does. Beyond that, only the user's explicit `EXTEND_REVIEW_BUDGET` decision, recorded with its reason and the open findings at that moment, adds another ordinary budget to the same batch; the loop is bounded by reasoned decisions, not by discarding the run.
 - Count every real reviewer invocation separately from valid quality rounds. Infrastructure failures consume invocation budget and remain auditable even though they do not consume repair budget.
 - Treat `plan/original.md` and `plan/batches.md` with their recorded digests as the run authority. The manifest defines this run's total included/excluded scope and batch mapping. A later edit or move of either source is informational; a changed snapshot is corruption.
@@ -473,6 +475,39 @@ Do not repair deferred findings by default. Consider a P2 only when the change i
 ## Execute reviewer-requested verification
 
 The reviewer may return `NEEDS_VERIFICATION` with argv-based requests. The workflow records them without consuming a valid review round. Preview the exact command before execution:
+
+If implementation HEAD changes while verification is pending, run
+`review --batch <batch-id> --dry-run` to preview replacement of obsolete requests, then repeat
+without `--dry-run`.
+The workflow marks only unfinished requests for older SHAs in that batch as `SUPERSEDED`, records
+the replacement SHA, and schedules the acceptance contract's commands at exact HEAD. Completed
+PASS/FAIL evidence remains unchanged. Outstanding reviewer-requested observations are carried in
+assignment metadata for reassessment at the new SHA, not silently waived or blindly replayed.
+Current-SHA pending requests still block review. A request for another batch or SHA cannot execute
+or reject work in the current phase. Refresh never transfers network authorization or resets budgets,
+and an already bound closeout authorization remains tied to its original SHA.
+Returning to a previously superseded SHA reactivates the original unfinished request, with its
+unchanged command, request identity, attempt history, and any authorization for that exact request.
+It does not create a fresh retry budget or apply that authorization to a different command.
+If exact HEAD already has the latest registered PASS and no current verification remains unmet,
+refresh restores `AWAITING_ACCEPTANCE` and returns the original report without another reviewer call.
+Engine-migration revalidation still requires its fresh review.
+For legacy runs already in `FINAL_VERIFICATION_REQUIRED`, commits after acceptance are outside the
+accepted batch. If HEAD moves, restore the accepted SHA named by the verification refusal to finish
+that run, or explicitly supersede it and review additional commits in a new run.
+If final verification fails and reopens a batch, review that current batch at the new fix SHA instead.
+Legacy final requests execute and update the phase only while their request keys belong to the active
+final-verification stage at its accepted SHA. Requests from an earlier final stage cannot reopen or
+replace a later acceptance, including when HEAD returns to their old SHA.
+
+A failed current-SHA request keeps the batch in `CHANGES_REQUESTED` even when a sibling passes.
+It blocks PASS and acceptance. A COMMAND criterion reported as FAIL cites its actual current-SHA
+FAIL evidence; it does not need PASS evidence to report a failure. When a COMMAND criterion cannot
+be decided, a non-PASS review may report `NOT_APPLICABLE` with a concrete rationale and no evidence
+claim. This does not waive the criterion: acceptance still requires every criterion to PASS.
+If finding deferral would otherwise yield an effective PASS while criteria or verification remain
+unsatisfied, the workflow returns `NEEDS_USER_DECISION` with `ACCEPTANCE_EVIDENCE_INCOMPLETE`.
+The report and findings remain intact; use the offered repair or decision-resume path.
 
 ```bash
 <controller-python> <skill-root>/scripts/workflow.py verify \

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -163,7 +164,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
                             "scope": ["tracked.txt"],
                             "rationale": "finite fixture observation",
                             "evidence_kind": "COMMAND" if command_contract else "REPOSITORY_ASSERTION",
-                            "argv": [sys.executable, "-c", "print('contract verified')"] if command_contract else [],
+                            "argv": json.loads(os.environ.get("FAKE_CONTRACT_ARGV", "null")) or [sys.executable, "-c", "print('contract verified')"] if command_contract else [],
                             "expected_exit": 0,
                         }} for batch in batches],
                         "issues": [{{
@@ -203,7 +204,8 @@ class WorkflowIntegrationTests(unittest.TestCase):
                         "verification_requests": requests,
                         "criterion_results": [] if requests else [{{
                             "criterion_id": item["id"],
-                            "status": "PASS", "evidence_ids": evidence_ids if item.get("evidence_kind") == "COMMAND" else [],
+                            "status": os.environ.get("FAKE_CRITERION_STATUS", "PASS"),
+                            "evidence_ids": evidence_ids if item.get("evidence_kind") == "COMMAND" and os.environ.get("FAKE_CRITERION_STATUS") != "NOT_APPLICABLE" else [],
                             "rationale": "fixture repository assertion passed",
                         }} for item in selected_criteria],
                     }}
@@ -382,6 +384,112 @@ class WorkflowIntegrationTests(unittest.TestCase):
             "status", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
         )
         self.assertIsNone(status["engine_revalidation"])
+
+    def migrate_fixture_engine(self, initialized: dict[str, object], revision: str = "new") -> Path:
+        copied = self.root / f"engine-{revision}"
+        shutil.copytree(SKILL_ROOT / "scripts", copied / "scripts")
+        shutil.copytree(SKILL_ROOT / "references", copied / "references")
+        engine = copied / "scripts" / "workflow.py"
+        engine.write_text(engine.read_text() + f"\n# Fixture engine revision {revision}.\n")
+        with mock.patch.dict(globals(), WORKFLOW=engine):
+            arguments = [
+                "migrate-engine", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+                "--reason", "reviewed engine update", "--actor", "test-suite",
+            ]
+            self.workflow(*arguments)
+            self.workflow(*arguments, "--apply")
+        return engine
+
+    def restore_fixture_head(self, initialized: dict[str, object], head: str) -> None:
+        implementation = str(initialized["implementation_worktree"])
+        branch = str(initialized["implementation_branch"])
+        self.run_command("git", "-C", implementation, "switch", "--detach", head)
+        self.run_command("git", "-C", implementation, "branch", "--force", branch, head)
+        self.run_command("git", "-C", implementation, "switch", branch)
+
+    def test_returning_to_pass_after_migration_at_other_sha_requires_fresh_review(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        first_sha = self.commit_batch_change(implementation)
+        common = ["--project", str(self.project), "--run-id", str(initialized["run_id"])]
+        first = self.workflow("review", *common, "--batch", "1")
+        self.commit_batch_change(implementation, "second revision\n")
+        self.verification_fixture(initialized, [["true"]])
+        self.environment.pop("FAKE_VERIFICATION_REQUESTS")
+        engine = self.migrate_fixture_engine(initialized)
+        self.restore_fixture_head(initialized, first_sha)
+        with mock.patch.dict(globals(), WORKFLOW=engine):
+            state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+            before = state_path.read_bytes()
+            self.workflow("review", *common, "--batch", "1", "--dry-run")
+            self.assertEqual(state_path.read_bytes(), before)
+            second = self.workflow("review", *common, "--batch", "1")
+            self.assertNotEqual(second["report_path"], first["report_path"])
+            state = json.loads(state_path.read_text())
+            self.assertEqual(state["reviews"][-1]["engine_epoch"], state["engine_epoch"])
+            self.assertEqual(state["usage"]["review_invocations_by_batch"]["1"], 3)
+            self.workflow("accept", *common, "--batch", "1", "--review-file", first["report_path"], expected=1)
+            self.workflow("accept", *common, "--batch", "1", "--review-file", second["report_path"])
+
+    def test_old_engine_pass_cannot_accept_directly_after_returning_to_its_sha(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        first_sha = self.commit_batch_change(implementation)
+        common = ["--project", str(self.project), "--run-id", str(initialized["run_id"])]
+        first = self.workflow("review", *common, "--batch", "1")
+        self.commit_batch_change(implementation, "second revision\n")
+        engine = self.migrate_fixture_engine(initialized)
+        self.restore_fixture_head(initialized, first_sha)
+        with mock.patch.dict(globals(), WORKFLOW=engine):
+            refused = self.workflow("accept", *common, "--batch", "1", "--review-file", first["report_path"], expected=1)
+            self.assertIn("engine", refused["error"])
+            second = self.workflow("review", *common, "--batch", "1")
+            self.workflow("accept", *common, "--batch", "1", "--review-file", second["report_path"])
+
+    def test_new_sha_review_satisfies_migration_revalidation_of_old_sha(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        common = ["--project", str(self.project), "--run-id", str(initialized["run_id"])]
+        self.workflow("review", *common, "--batch", "1")
+        engine = self.migrate_fixture_engine(initialized)
+        self.commit_batch_change(implementation, "new revision after migration\n")
+        with mock.patch.dict(globals(), WORKFLOW=engine):
+            second = self.workflow("review", *common, "--batch", "1")
+            self.workflow("accept", *common, "--batch", "1", "--review-file", second["report_path"])
+
+    def test_each_engine_migration_requires_its_own_review_and_preserves_usage(self) -> None:
+        initialized = self.initialize("codex")
+        self.commit_batch_change(Path(str(initialized["implementation_worktree"])))
+        common = ["--project", str(self.project), "--run-id", str(initialized["run_id"])]
+        self.workflow("review", *common, "--batch", "1")
+        for epoch in (1, 2):
+            engine = self.migrate_fixture_engine(initialized, str(epoch))
+            with mock.patch.dict(globals(), WORKFLOW=engine):
+                reviewed = self.workflow("review", *common, "--batch", "1")
+                state = json.loads((Path(str(initialized["run_directory"])) / "workflow.json").read_text())
+                self.assertEqual([item["engine_epoch"] for item in state["reviews"]], list(range(epoch + 1)))
+                self.assertEqual(state["usage"]["review_invocations_by_batch"]["1"], epoch + 1)
+                self.assertIsNone(state["engine_revalidation"])
+                if epoch == 2:
+                    self.workflow("accept", *common, "--batch", "1", "--review-file", reviewed["report_path"])
+
+    def test_engine_revalidation_cannot_reset_the_review_budget(self) -> None:
+        initialized = self.initialize("codex")
+        self.commit_batch_change(Path(str(initialized["implementation_worktree"])))
+        common = ["--project", str(self.project), "--run-id", str(initialized["run_id"])]
+        self.workflow("review", *common, "--batch", "1")
+        for epoch in range(1, 5):
+            engine = self.migrate_fixture_engine(initialized, str(epoch))
+            with mock.patch.dict(globals(), WORKFLOW=engine):
+                outcome = self.workflow("review", *common, "--batch", "1", expected=3 if epoch == 4 else 0)
+                if epoch == 4:
+                    self.assertEqual(outcome["reason"], "MAX_REVIEW_ROUNDS_EXCEEDED")
+                    state = json.loads((Path(str(initialized["run_directory"])) / "workflow.json").read_text())
+                    self.assertEqual(len(state["reviews"]), 4)
+                    self.assertEqual(state["usage"]["review_invocations_by_batch"]["1"], 4)
+                    self.assertEqual(state["reviews"][-1]["engine_epoch"], 3)
+                    self.assertEqual(state["status"], "NEEDS_USER_DECISION")
 
     def commit_batch_change(self, implementation: Path, content: str = "implemented\n") -> str:
         (implementation / "tracked.txt").write_text(content, encoding="utf-8")
@@ -2180,6 +2288,396 @@ class WorkflowIntegrationTests(unittest.TestCase):
             len([item for item in json.loads((Path(str(initialized["run_directory"])) / "workflow.json").read_text(encoding="utf-8"))["verification_requests"]]),
             1,
         )
+
+    def verification_fixture(self, initialized: dict, requests: list[list[str]]) -> list[dict]:
+        self.environment["FAKE_VERIFICATION_REQUESTS"] = json.dumps([
+            {"id": f"request-{index}", "argv": argv, "cwd": "repository",
+             "reason": f"observe request {index} at the assigned SHA", "expected_exit": 0}
+            for index, argv in enumerate(requests)
+        ])
+        required = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=3,
+        )
+        return required["requests"]
+
+    def execute_verification(self, initialized: dict, request: dict, expected: int = 0) -> dict:
+        arguments = [
+            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--request-id", request["request_key"], "--network-policy", "host",
+        ]
+        self.workflow(*arguments)
+        return self.workflow(
+            *arguments, "--network-reason", "test fixture", "--actor", "test-suite",
+            "--apply", expected=expected,
+        )
+
+    def check_verification_refresh(self, amend: bool) -> None:
+        self.environment["FAKE_CONTRACT_COMMAND"] = "1"
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        old_head = self.commit_batch_change(implementation)
+        arguments = [
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1",
+        ]
+        required = self.workflow(*arguments, expected=3)
+        old = required["requests"][0]
+        if amend:
+            self.run_command("git", "-C", str(implementation), "commit", "--amend", "-qm", "amended fix")
+        else:
+            self.commit_batch_change(implementation, "fixed\n")
+        head = self.run_command("git", "-C", str(implementation), "rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(old_head, head)
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        before = state_path.read_bytes()
+        preview = self.workflow(*arguments, "--dry-run")
+        self.assertEqual(preview["status"], "VERIFICATION_REFRESH_PREVIEW")
+        self.assertEqual(state_path.read_bytes(), before)
+        refreshed = self.workflow(*arguments, expected=3)
+        self.assertEqual(refreshed["reviewed_sha"], head)
+        new = refreshed["requests"][0]
+        self.assertNotEqual(new["request_key"], old["request_key"])
+        state = json.loads(state_path.read_text())
+        old_record = next(item for item in state["verification_requests"] if item["request_key"] == old["request_key"])
+        self.assertEqual(old_record["status"], "SUPERSEDED")
+        self.assertEqual(old_record["superseded_by_sha"], head)
+        self.assertEqual(state["usage"]["verification_attempts"], 0)
+        self.execute_verification(initialized, new)
+        reviewed = self.workflow(*arguments)
+        self.workflow(
+            "accept", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", "--review-file", str(reviewed["report_path"]),
+        )
+
+    def test_pending_verification_refreshes_after_new_commit(self) -> None:
+        self.check_verification_refresh(amend=False)
+
+    def test_pending_verification_refreshes_after_amend(self) -> None:
+        self.check_verification_refresh(amend=True)
+
+    def test_pending_current_sha_verification_still_blocks_review(self) -> None:
+        initialized = self.initialize("codex")
+        self.commit_batch_change(Path(str(initialized["implementation_worktree"])))
+        self.verification_fixture(initialized, [["true"]])
+        blocked = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=1,
+        )
+        self.assertIn("unresolved fixed-SHA verification", blocked["error"])
+
+    def test_repeated_refresh_preserves_budgets_and_request_network_authorization(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        old = self.verification_fixture(initialized, [["true"]])[0]
+        fake_bwrap = self.bin_dir / "bwrap"
+        fake_bwrap.write_text("#!/bin/sh\necho 'bwrap: fixture unavailable' >&2\nexit 1\n")
+        fake_bwrap.chmod(0o755)
+        self.execute_verification(initialized, old, expected=4)
+        fake_bwrap.unlink()
+        requests = [old]
+        arguments = ["review", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--batch", "1"]
+        for number in range(2):
+            self.run_command("git", "-C", str(implementation), "commit", "--amend", "-qm", f"fix amendment {number}")
+            self.workflow(*arguments, "--dry-run")
+            requests.append(self.workflow(*arguments, expected=3)["requests"][0])
+        state = json.loads((Path(str(initialized["run_directory"])) / "workflow.json").read_text())
+        self.assertEqual([item["status"] for item in state["verification_requests"]], ["SUPERSEDED", "SUPERSEDED", "PENDING"])
+        self.assertEqual(state["host_network_authorizations"].keys(), {old["request_key"]})
+        self.assertEqual(state["usage"]["verification_attempts"], 1)
+        self.assertEqual(state["usage"]["review_invocations_by_batch"]["1"], 3)
+        self.assertEqual(state["reviews"], [])
+        preview = self.workflow(
+            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--request-id", requests[-1]["request_key"], "--network-policy", "host",
+        )
+        self.assertFalse(preview["host_network_authorized"])
+        self.execute_verification(initialized, requests[-1])
+        self.environment.pop("FAKE_VERIFICATION_REQUESTS")
+        reviewed = self.workflow(*arguments)
+        self.assertEqual(reviewed["round"], 1)
+
+    def test_obsolete_verification_cannot_change_current_or_accepted_batch_state(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        requests = self.verification_fixture(initialized, [["false"], ["true"], ["true"]])
+        failed = self.execute_verification(initialized, requests[0], expected=2)
+        self.commit_batch_change(implementation, "fixed\n")
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        before = state_path.read_bytes()
+        stale = self.workflow(
+            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--request-id", requests[1]["request_key"], "--apply", expected=1,
+        )
+        self.assertIn("current batch and HEAD", stale["error"])
+        self.assertEqual(before, state_path.read_bytes())
+        self.environment.pop("FAKE_VERIFICATION_REQUESTS")
+        reviewed = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        prompt = Path(str(reviewed["report_path"])).parent / "prompt.md"
+        assignment_path = re.search(r"Assignment metadata and user decisions: `([^`]+)`", prompt.read_text()).group(1)
+        assignment = json.loads(Path(assignment_path).read_text())
+        prior = assignment["prior_verification_requests"]
+        self.assertEqual({item["request_key"] for item in prior}, {item["request_key"] for item in requests})
+        self.assertEqual(prior[0]["status"], "FAIL")
+        self.workflow(
+            "accept", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", "--review-file", str(reviewed["report_path"]),
+        )
+        before = state_path.read_bytes()
+        self.workflow(
+            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--request-id", requests[1]["request_key"], "--apply", expected=1,
+        )
+        self.assertEqual(before, state_path.read_bytes())
+        state = json.loads(before)
+        self.assertEqual(state["verification_evidence"][0]["status"], "FAIL")
+        self.assertEqual(state["verification_evidence"][0]["evidence_id"], failed["evidence"]["evidence_id"])
+        final = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--batch", "FINAL",
+        )
+        self.assertEqual(final["status"], "REVIEW_PASS")
+
+    def test_failed_command_evidence_supports_a_truthful_fail_review(self) -> None:
+        self.environment["FAKE_CONTRACT_COMMAND"] = "1"
+        self.environment["FAKE_CONTRACT_ARGV"] = json.dumps([
+            sys.executable, "-c", "from pathlib import Path; assert Path('tracked.txt').read_text().strip() == 'fixed'",
+        ])
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        arguments = ["review", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--batch", "1"]
+        required = self.workflow(*arguments, expected=3)
+        self.execute_verification(initialized, required["requests"][0], expected=2)
+        self.environment["FAKE_CRITERION_STATUS"] = "FAIL"
+        self.environment["FAKE_FINDINGS"] = json.dumps([{
+            "id": "command-failure", "fingerprint": "command:failed", "severity": "P1",
+            "novelty": "INITIAL_REVIEW", "location": "tracked.txt:1",
+            "required_outcome": "tracked.txt contains fixed", "details": "The required command exited one at the assigned SHA.",
+        }])
+        failed_review = self.workflow(*arguments, expected=2)
+        self.assertEqual(failed_review["status"], "REVIEW_FAIL")
+        report = json.loads(Path(str(failed_review["report_path"])).read_text())
+        self.assertEqual(report["criterion_results"][0]["status"], "FAIL")
+        self.environment.pop("FAKE_CRITERION_STATUS")
+        self.environment.pop("FAKE_FINDINGS")
+        self.environment["FAKE_RESOLVED_FINDING_IDS"] = json.dumps([failed_review["findings"][0]["id"]])
+        self.commit_batch_change(implementation, "fixed\n")
+        required = self.workflow(*arguments, expected=3)
+        self.execute_verification(initialized, required["requests"][0])
+        review = self.workflow(*arguments)
+        self.workflow(
+            "accept", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", "--review-file", str(review["report_path"]),
+        )
+
+    def test_mixed_verification_results_never_register_an_unacceptable_pass(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        requests = self.verification_fixture(initialized, [["false"], ["true"]])
+        self.execute_verification(initialized, requests[0], expected=2)
+        self.execute_verification(initialized, requests[1])
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        self.assertEqual(json.loads(state_path.read_text())["status"], "CHANGES_REQUESTED")
+        self.environment.pop("FAKE_VERIFICATION_REQUESTS")
+        rejected = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", expected=4,
+        )
+        self.assertIn("failed current-SHA verification", rejected["reason"])
+        self.assertEqual(json.loads(state_path.read_text())["reviews"], [])
+        self.commit_batch_change(implementation, "fixed\n")
+        review = self.workflow(
+            "review", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--batch", "1",
+        )
+        self.workflow(
+            "accept", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", "--review-file", str(review["report_path"]),
+        )
+
+    def test_nonblocking_findings_cannot_turn_failed_criteria_into_effective_pass(self) -> None:
+        self.environment["FAKE_CONTRACT_COMMAND"] = "1"
+        self.environment["FAKE_CONTRACT_ARGV"] = json.dumps([
+            sys.executable, "-c", "from pathlib import Path; assert Path('tracked.txt').read_text().strip() == 'fixed'",
+        ])
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        self.commit_batch_change(implementation)
+        arguments = ["review", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--batch", "1"]
+        request = self.workflow(*arguments, expected=3)["requests"][0]
+        self.execute_verification(initialized, request, expected=2)
+        self.environment["FAKE_CRITERION_STATUS"] = "FAIL"
+        self.environment["FAKE_FINDINGS"] = json.dumps([{
+            "id": "baseline-command", "fingerprint": "baseline:command", "severity": "P1", "novelty": "PRE_EXISTING",
+            "location": "tracked.txt:1", "required_outcome": "command exits zero", "details": "The criterion fails on baseline and current HEAD.",
+        }])
+        reviewed = self.workflow(*arguments, expected=3)
+        self.assertEqual(reviewed["status"], "NEEDS_USER_DECISION")
+        self.assertEqual(reviewed["reported_verdict"], "FAIL")
+        self.assertIn("ACCEPTANCE_EVIDENCE_INCOMPLETE", reviewed["decision_reasons"])
+        self.assertEqual(reviewed["findings"][0]["status"], "DEFERRED")
+        state = self.workflow("status", "--project", str(self.project), "--run-id", str(initialized["run_id"]))
+        pending = state["pending_decision"]
+        self.assertIn("RETURN_TO_FIX", pending["allowed_choices"])
+        self.assertIn("RESUME_WITH_DECISION", pending["allowed_choices"])
+        decision = [
+            "adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--decision-id", pending["decision_id"], "--choice", "RETURN_TO_FIX",
+            "--reason", "repair the required command", "--actor", "test-suite",
+        ]
+        self.workflow(*decision)
+        self.workflow(*decision, "--apply")
+        self.environment.pop("FAKE_FINDINGS")
+        self.environment.pop("FAKE_CRITERION_STATUS")
+        self.commit_batch_change(implementation, "fixed\n")
+        request = self.workflow(*arguments, expected=3)["requests"][0]
+        self.execute_verification(initialized, request)
+        reviewed = self.workflow(*arguments)
+        self.workflow(
+            "accept", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", "--review-file", str(reviewed["report_path"]),
+        )
+
+    def test_returning_to_old_sha_reactivates_exact_request_without_resetting_attempts(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        head = self.commit_batch_change(implementation)
+        old = self.verification_fixture(initialized, [["true"]])[0]
+        fake_bwrap = self.bin_dir / "bwrap"
+        fake_bwrap.write_text("#!/bin/sh\necho 'bwrap: fixture unavailable' >&2\nexit 1\n")
+        fake_bwrap.chmod(0o755)
+        for _ in range(3):
+            self.execute_verification(initialized, old, expected=4)
+        fake_bwrap.unlink()
+        self.commit_batch_change(implementation, "second revision\n")
+        arguments = ["review", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--batch", "1"]
+        self.workflow(*arguments, expected=3)
+        branch = str(initialized["implementation_branch"])
+        self.run_command("git", "-C", str(implementation), "switch", "--detach", head)
+        self.run_command("git", "-C", str(implementation), "branch", "--force", branch, head)
+        self.run_command("git", "-C", str(implementation), "switch", branch)
+        self.environment["FAKE_VERIFICATION_REQUESTS"] = json.dumps([{
+            "id": old["request"]["id"], "argv": ["false"], "cwd": "repository", "reason": "different command", "expected_exit": 0,
+        }])
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        before = state_path.read_bytes()
+        preview = self.workflow(*arguments, "--dry-run")
+        self.assertEqual(preview["reactivated_request_keys"], [old["request_key"]])
+        self.assertEqual(state_path.read_bytes(), before)
+        restored = self.workflow(*arguments, expected=3)["requests"][0]
+        self.assertEqual(restored["request_key"], old["request_key"])
+        self.assertEqual(restored["request"], old["request"])
+        verify = ["verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--request-id", old["request_key"], "--network-policy", "host"]
+        exhausted = self.workflow(*verify, expected=3)
+        self.assertEqual(exhausted["reason"], "VERIFICATION_ATTEMPT_BUDGET_EXHAUSTED")
+        pending = exhausted["pending_decision"]
+        decision = ["adjudicate", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--decision-id", pending["decision_id"], "--choice", "GRANT_ONE_VERIFICATION_ATTEMPT", "--reason", "infrastructure restored", "--actor", "test-suite"]
+        self.workflow(*decision)
+        self.workflow(*decision, "--apply")
+        preview = self.workflow(*verify)
+        self.assertEqual(preview["attempt"], 4)
+        self.assertTrue(preview["host_network_authorized"])
+        self.workflow(*verify, "--apply")
+        self.environment.pop("FAKE_VERIFICATION_REQUESTS")
+        reviewed = self.workflow(*arguments)
+        self.workflow(
+            "accept", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", "--review-file", str(reviewed["report_path"]),
+        )
+
+    def check_returning_to_passing_sha(self, outcome: str) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        head = self.commit_batch_change(implementation)
+        arguments = ["review", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--batch", "1"]
+        passing = self.workflow(*arguments)
+        self.commit_batch_change(implementation, "second revision\n")
+        old = self.verification_fixture(initialized, [["false" if outcome == "FAIL" else "true"]])[0]
+        if outcome != "PENDING":
+            self.execute_verification(initialized, old, expected=2 if outcome == "FAIL" else 0)
+        branch = str(initialized["implementation_branch"])
+        self.run_command("git", "-C", str(implementation), "switch", "--detach", head)
+        self.run_command("git", "-C", str(implementation), "branch", "--force", branch, head)
+        self.run_command("git", "-C", str(implementation), "switch", branch)
+        state_path = Path(str(initialized["run_directory"])) / "workflow.json"
+        before = state_path.read_bytes()
+        self.workflow(*arguments, "--dry-run")
+        self.assertEqual(state_path.read_bytes(), before)
+        restored = self.workflow(*arguments)
+        self.assertTrue(restored["reused"])
+        self.assertEqual(restored["report_path"], passing["report_path"])
+        self.assertEqual(restored["reviewer_runtime"], passing["reviewer_runtime"])
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state["status"], "AWAITING_ACCEPTANCE")
+        self.assertEqual(state["usage"]["review_invocations_by_batch"]["1"], 2)
+        self.assertEqual(len(state["reviews"]), 1)
+        self.assertEqual(next(item for item in state["verification_requests"] if item["request_key"] == old["request_key"])["status"], "SUPERSEDED" if outcome == "PENDING" else outcome)
+        self.workflow(
+            "accept", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--batch", "1", "--review-file", str(restored["report_path"]),
+        )
+
+    def test_returning_to_passing_sha_restores_acceptance_without_another_review(self) -> None:
+        self.check_returning_to_passing_sha("PENDING")
+
+    def test_returning_to_passing_sha_after_other_sha_verification_pass(self) -> None:
+        self.check_returning_to_passing_sha("PASS")
+
+    def test_returning_to_passing_sha_after_other_sha_verification_fail(self) -> None:
+        self.check_returning_to_passing_sha("FAIL")
+
+    def test_unavailable_command_can_request_user_decision_without_pass_evidence(self) -> None:
+        self.environment["FAKE_CONTRACT_COMMAND"] = "1"
+        initialized = self.initialize("codex")
+        self.commit_batch_change(Path(str(initialized["implementation_worktree"])))
+        arguments = ["review", "--project", str(self.project), "--run-id", str(initialized["run_id"]), "--batch", "1"]
+        required = self.workflow(*arguments, expected=3)
+        self.workflow(
+            "verify", "--project", str(self.project), "--run-id", str(initialized["run_id"]),
+            "--request-id", required["requests"][0]["request_key"], "--reject-reason", "fixture command unavailable", "--apply",
+        )
+        self.environment["FAKE_REVIEW_NEEDS_DECISION"] = "1"
+        self.environment["FAKE_CRITERION_STATUS"] = "NOT_APPLICABLE"
+        decision = self.workflow(*arguments, expected=3)
+        self.assertEqual(decision["status"], "NEEDS_USER_DECISION")
+
+    def test_head_advance_during_verification_preserves_evidence_without_old_phase(self) -> None:
+        initialized = self.initialize("codex")
+        implementation = Path(str(initialized["implementation_worktree"]))
+        old_head = self.commit_batch_change(implementation)
+        requests = self.verification_fixture(initialized, [
+            [sys.executable, "-c", "import time; print('verification-started', flush=True); time.sleep(2)"],
+            ["true"],
+        ])
+        command = [
+            sys.executable, str(WORKFLOW), "verify", "--project", str(self.project),
+            "--run-id", str(initialized["run_id"]), "--request-id", requests[0]["request_key"],
+            "--network-policy", "host", "--network-reason", "test fixture", "--actor", "test-suite", "--apply",
+        ]
+        self.workflow(*command[2:-5])
+        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.environment)
+        log = Path(str(initialized["run_directory"])) / "verification_runs" / requests[0]["request_key"] / "attempt_001" / "logs" / "stdout.log"
+        try:
+            deadline = time.monotonic() + 10
+            while not log.is_file() or "verification-started" not in log.read_text():
+                self.assertLess(time.monotonic(), deadline, "verification never started")
+                self.assertIsNone(process.poll(), "verifier exited before command started")
+                time.sleep(0.02)
+            self.commit_batch_change(implementation, "advanced while verification runs\n")
+            stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 0, stderr + stdout)
+            self.assertEqual(json.loads(stdout)["evidence"]["reviewed_sha"], old_head)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        state = json.loads((Path(str(initialized["run_directory"])) / "workflow.json").read_text())
+        self.assertEqual(state["status"], "IMPLEMENTING")
+        self.assertEqual(state["verification_requests"][1]["status"], "PENDING")
 
     def test_verification_infrastructure_error_is_retryable_and_audited(self) -> None:
         initialized = self.initialize("codex")
@@ -4417,6 +4915,79 @@ class ObligationDriftTests(ConvergencePolicyFindingBuilder):
 
 
 class ReviewerSchemaCompatibilityTests(unittest.TestCase):
+    def test_legacy_reviews_do_not_inherit_a_migrated_engine_epoch(self) -> None:
+        self.assertTrue(WORKFLOW_MODULE.review_matches_engine({}, {}))
+        self.assertFalse(WORKFLOW_MODULE.review_matches_engine({"engine_epoch": 1}, {}))
+        self.assertTrue(WORKFLOW_MODULE.review_matches_engine({"engine_epoch": 2}, {"engine_epoch": 2}))
+        self.assertFalse(WORKFLOW_MODULE.review_matches_engine({"engine_epoch": 2}, {"engine_epoch": 1}))
+
+    def test_stale_final_verification_names_the_accepted_sha_recovery(self) -> None:
+        head = "a" * 40
+        final = {"source": "FINAL_CONTRACT", "reviewed_sha": head}
+        state = {"batches": ["1"], "accepted_batches": ["1"], "accepted_shas": {"1": head}, "final_verification": {"status": "PENDING"}}
+        message = WORKFLOW_MODULE.stale_verification_message(state, final)
+        self.assertIn(f"restore the accepted SHA {head}", message)
+        self.assertIn("supersede this run", message)
+        self.assertNotIn("run review for the current batch", message)
+        pending = {**state, "accepted_batches": []}
+        reopened = WORKFLOW_MODULE.stale_verification_message(pending, final)
+        self.assertIn("run review for the current batch", reopened)
+        self.assertNotIn("restore the accepted SHA", reopened)
+        ordinary = WORKFLOW_MODULE.stale_verification_message(pending, {"source": "REVIEWER", "reviewed_sha": head})
+        self.assertIn("run review for the current batch", ordinary)
+        newer_head = "b" * 40
+        state["accepted_shas"]["1"] = newer_head
+        self.assertIn(f"restore the accepted SHA {newer_head}", WORKFLOW_MODULE.stale_verification_message(state, final))
+
+    def test_final_requests_belong_to_the_active_accepted_stage(self) -> None:
+        head, newer_head = "a" * 40, "b" * 40
+        record = {"source": "FINAL_CONTRACT", "batch": "__FINAL__", "reviewed_sha": head, "request_key": "old-final"}
+        final = {"status": "PENDING", "reviewed_sha": head, "request_keys": ["old-final"]}
+        state = {"batches": ["1"], "accepted_batches": ["1"], "accepted_shas": {"1": head}, "final_verification": final}
+        self.assertTrue(WORKFLOW_MODULE.verification_request_is_current(state, record, head))
+        self.assertFalse(WORKFLOW_MODULE.verification_request_is_current({**state, "accepted_batches": []}, record, head))
+        self.assertFalse(WORKFLOW_MODULE.verification_request_is_current(state, record, newer_head))
+        for replacement in (
+            {**final, "request_keys": ["new-final"]},
+            {**final, "reviewed_sha": newer_head},
+            {**final, "status": "FAIL"},
+        ):
+            with self.subTest(final=replacement):
+                self.assertFalse(WORKFLOW_MODULE.verification_request_is_current({**state, "final_verification": replacement}, record, head))
+        self.assertFalse(WORKFLOW_MODULE.verification_request_is_current({**state, "accepted_shas": {"1": newer_head}}, record, head))
+
+    def test_command_failure_evidence_must_match_status_sha_and_criterion(self) -> None:
+        head, base = "b" * 40, "a" * 40
+        payload = {
+            "reviewer": "codex", "reviewed_sha": head, "base_sha": base, "batch": "B01",
+            "verdict": "FAIL", "summary": "command failed", "findings": [],
+            "resolved_finding_ids": [], "verification_requests": [],
+            "criterion_results": [{"criterion_id": "C1", "status": "FAIL", "evidence_ids": ["EV1"]}],
+        }
+        evidence = {"evidence_id": "EV1", "criterion_id": "C1", "reviewed_sha": head, "status": "FAIL"}
+        state = {
+            "acceptance_contract": {"criteria": [{"id": "C1", "batch": "B01", "evidence_kind": "COMMAND"}]},
+            "verification_evidence": [evidence],
+        }
+        WORKFLOW_MODULE.validate_review_payload(payload, "codex", "B01", base, head, state)
+        for changed in ({"status": "PASS"}, {"reviewed_sha": base}, {"criterion_id": "C2"}, {"evidence_id": "EV2"}):
+            with self.subTest(changed=changed):
+                state["verification_evidence"] = [{**evidence, **changed}]
+                with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "lacks current-SHA FAIL evidence"):
+                    WORKFLOW_MODULE.validate_review_payload(payload, "codex", "B01", base, head, state)
+
+    def test_superseded_same_sha_requests_retain_registration_identity(self) -> None:
+        request = {"id": "criterion-C1", "argv": ["true"], "cwd": "repository", "reason": "criterion", "expected_exit": 0}
+        state = {
+            "acceptance_contract": {"criteria": [{"id": "C1", "batch": "B01", "evidence_kind": "COMMAND", "argv": ["true"], "rationale": "criterion", "expected_exit": 0}]},
+            "verification_requests": [{"batch": "B01", "reviewed_sha": "head", "criterion_id": "C1", "status": "SUPERSEDED", "request": request}],
+        }
+        registered = WORKFLOW_MODULE.register_missing_contract_verification(state, "B01", 1, "base", "head")
+        self.assertEqual(registered, [])
+        reviewer_state = {"verification_requests": [{"batch": "B01", "reviewed_sha": "head", "status": "SUPERSEDED", "request": request}]}
+        with self.assertRaisesRegex(WORKFLOW_MODULE.WorkflowError, "duplicate verification request for this SHA"):
+            WORKFLOW_MODULE.register_verification_requests(reviewer_state, {"verification_requests": [request]}, "B01", 1, "base", "head", Path("report.json"))
+
     def test_ready_contract_must_cover_every_batch(self) -> None:
         state = {"reviewer": "codex", "baseline_sha": "a" * 40, "batches": ["B01", "B02"]}
         payload = {

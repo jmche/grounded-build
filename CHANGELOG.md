@@ -2,6 +2,23 @@
 
 All notable changes use semantic versioning.
 
+## Unreleased
+
+- Bind PASS reuse and acceptance to the review's engine epoch, including returning to an earlier SHA
+  after migration at another HEAD. Fresh current-engine reviews satisfy migration revalidation without
+  resetting budgets. Legacy final-verification refusals name the accepted-SHA or new-run recovery.
+  Final requests remain bound to the active accepted stage and its exact request list; old siblings
+  cannot change a reopened batch or revoke a later acceptance.
+- Refresh pending verification after implementation HEAD changes, including amend, while preserving
+  completed evidence and carrying outstanding reviewer observations into the new-SHA assignment.
+  Obsolete requests cannot execute or change another batch's workflow phase.
+- Accept current-SHA FAIL evidence for failed COMMAND criterion reports and preserve undecidable
+  criteria in non-PASS reports. Current-SHA failed requests keep blocking PASS and acceptance even
+  after sibling requests pass.
+- Keep effective review verdicts consistent with criterion and verification outcomes after finding
+  deferral. Returning to an earlier SHA reactivates the original unfinished request and preserves its
+  command, retry budget, and exact-request authorization.
+
 ## [0.7.8] - 2026-09-17
 
 - Every review result now names its `reviewer` and `reviewer_runtime`, and carries a
