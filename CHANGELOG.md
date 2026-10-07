@@ -2,7 +2,7 @@
 
 All notable changes use semantic versioning.
 
-## Unreleased
+## [0.7.9] - 2026-10-07
 
 - Bind PASS reuse and acceptance to the review's engine epoch, including returning to an earlier SHA
   after migration at another HEAD. Fresh current-engine reviews satisfy migration revalidation without
