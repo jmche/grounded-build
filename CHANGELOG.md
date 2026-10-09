@@ -4,6 +4,9 @@ All notable changes use semantic versioning.
 
 ## Unreleased
 
+- Mark the command digest required in Claude/Codex probe schemas so Codex accepts the structured
+  output request. File-only adapters receive a schema without that field.
+
 - Declare the fixed worktree and invocation context read-only to Claude's inner sandbox, matching
   the outer mounts. Missing protected configuration files no longer require mount-point creation
   on a read-only filesystem. Existing repository configuration remains visible and unchanged.

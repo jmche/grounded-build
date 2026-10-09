@@ -488,7 +488,6 @@ PROBE_SCHEMA: dict[str, Any] = {
     "properties": {
         "provider": {"type": "string"}, "ready": {"type": "boolean"},
         "observed": {"type": "string"},
-        "command_sha256": {"type": "string"},
     },
     "required": ["provider", "ready", "observed"],
 }
@@ -531,9 +530,12 @@ def probe_provider(
         probe_input = context / "probe-input.txt"
         probe_input.write_text(probe_token + "\n", encoding="utf-8")
         requires_command = provider in {"claude", "codex"}
+        probe_schema = copy.deepcopy(PROBE_SCHEMA)
         expected_command_sha256 = None
         command_instruction = ""
         if requires_command:
+            probe_schema["properties"]["command_sha256"] = {"type": "string"}
+            probe_schema["required"].append("command_sha256")
             command_input = context / "probe-command.bin"
             command_input.write_bytes(secrets.token_bytes(1024))
             expected_command_sha256 = sha256_file(command_input)
@@ -549,7 +551,7 @@ def probe_provider(
             + command_instruction +
             "This is a capability check."
         )
-        command = agent_command(provider, workspace, context, PROBE_SCHEMA, raw, prompt, runtime)
+        command = agent_command(provider, workspace, context, probe_schema, raw, prompt, runtime)
         command = isolated_agent_command(
             command, {"agent_runtime": {provider: runtime or {}}}, root, workspace, context)
         result = run(command, cwd=workspace, timeout=timeout, env=agent_environment())
@@ -559,7 +561,7 @@ def probe_provider(
                     "detail": (result.stderr or "").strip()[-400:]}
         try:
             payload = extract_payload(provider, result, raw)
-            validate_json_schema(payload, PROBE_SCHEMA)
+            validate_json_schema(payload, probe_schema)
         except NoFinalAnswer as exc:
             return {"provider": provider, "ok": False, "reason": "no schema object",
                     "detail": str(exc)}

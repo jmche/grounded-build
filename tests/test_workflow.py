@@ -103,6 +103,12 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 prompt = (open(sys.argv[sys.argv.index("--prompt") + 1], encoding="utf-8").read()
                           if bridge else sys.argv[-1])
                 if "This is a capability check." in prompt:
+                    if "{name}" == "codex":
+                        with open(sys.argv[sys.argv.index("--output-schema") + 1]) as handle:
+                            schema = json.load(handle)
+                        missing = set(schema["properties"]) - set(schema["required"])
+                        if missing:
+                            raise SystemExit("Invalid schema: required must include " + ", ".join(sorted(missing)))
                     probe_path = re.search(r"Read (/.+?/probe-input\\.txt)\\.", prompt).group(1)
                     with open(probe_path, encoding="utf-8") as handle:
                         observed = handle.read().rstrip("\\n")

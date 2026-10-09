@@ -39,6 +39,11 @@ prompt = (Path(sys.argv[sys.argv.index("--prompt") + 1]).read_text(encoding="utf
           if bridge else sys.argv[-1])
 provider = re.search(r"provider=(claude|codex|dsh|other)", prompt).group(1)
 if "This is a capability check." in prompt:
+    if provider == "codex":
+        schema = json.loads(Path(sys.argv[sys.argv.index("--output-schema") + 1]).read_text())
+        missing = set(schema["properties"]) - set(schema["required"])
+        if missing:
+            raise SystemExit("Invalid schema: required must include " + ", ".join(sorted(missing)))
     ready = not any(Path(name).exists() for name in ("dirty-tracked.txt", "dirty-staged.txt", "dirty-untracked.txt"))
     probe_path = Path(re.search(r"Read (/.+?/probe-input\.txt)\.", prompt).group(1))
     probe = {"provider": provider, "ready": ready,
@@ -605,7 +610,7 @@ class PlanWorkflowTest(unittest.TestCase):
             "if '--version' in sys.argv:\n print('fake-agent 1.0'); raise SystemExit(0)\n"
             "if '--help' in sys.argv:\n"
             " print('--output-schema --output-last-message --ephemeral --sandbox --config'); raise SystemExit(0)\n"
-            "payload = {'provider': 'codex', 'ready': True, 'observed': 'not-read'}\n"
+            "payload = {'provider': 'codex', 'ready': True, 'observed': 'not-read', 'command_sha256': ''}\n"
             "with open(sys.argv[sys.argv.index('-o') + 1], 'w') as handle: json.dump(payload, handle)\n",
             encoding="utf-8")
         codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
@@ -643,6 +648,11 @@ class PlanWorkflowTest(unittest.TestCase):
                     self.assertTrue(checks["command_execution"])
                 else:
                     self.assertNotIn("command_execution", checks)
+
+    def test_codex_probe_schema_requires_every_declared_field(self) -> None:
+        result = self.call(
+            "preflight", "--project", str(self.project), "--backend", "codex", "--probe")
+        self.assertTrue(result["probes"]["codex"]["checks"]["command_execution"])
 
     def test_codex_host_can_skip_installed_probe_failed_claude_for_dsh(self) -> None:
         claude = self.bin / "claude"
