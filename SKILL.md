@@ -75,7 +75,9 @@ python3 <skill-root>/scripts/plan_workflow.py preflight \
 
 Use `--probe` for an early availability check. It makes one small paid, sandboxed call per selected
 adapter that authenticates, reads a controller-owned mounted file, and returns its contents in a
-schema object. Host-aware initialization repeats that check with the exact runtime it freezes, so a
+schema object. Claude and Codex must also execute a command that hashes a random binary challenge;
+DSH and generic bridges are checked only for their contracted file-reading capability.
+Host-aware initialization repeats that check with the exact runtime it freezes, so a
 preflight result cannot go stale or be applied to different model/provider settings.
 
 Planning defaults to Claude Opus and Codex `gpt-5.6-sol`; the dsh adapter reads its model from the

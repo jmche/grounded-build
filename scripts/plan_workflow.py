@@ -14,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -487,6 +488,7 @@ PROBE_SCHEMA: dict[str, Any] = {
     "properties": {
         "provider": {"type": "string"}, "ready": {"type": "boolean"},
         "observed": {"type": "string"},
+        "command_sha256": {"type": "string"},
     },
     "required": ["provider", "ready", "observed"],
 }
@@ -496,7 +498,7 @@ def probe_provider(
     provider: str, project: Path, timeout: int = 180,
     runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Can this CLI authenticate, read one mounted file, and return a schema object right now?
+    """Can this CLI read a mounted file and execute commands when its adapter permits them?
 
     Cheap, and deliberately narrow. It answers the question that cost the most to answer the
     expensive way: a codex whose credentials never reached the sandbox spent 22 minutes and five
@@ -505,7 +507,8 @@ def probe_provider(
 
     The file read is deliberate. The old probe asked the model not to inspect anything, so Codex
     could pass it even when every production read failed because its code-mode host was absent.
-    This remains a narrow capability check, not proof that a provider will complete a long review.
+    Claude and Codex must also hash a random binary file through their command tool. DSH and the
+    generic bridge retain their file-only contract. This is not proof of substantive review quality.
 
     It runs through the SAME bubblewrap composition as a real invocation, which is the only way it
     can see the failure it exists to catch: the credentials that went missing went missing because
@@ -527,10 +530,23 @@ def probe_provider(
         probe_token = secrets.token_hex(16)
         probe_input = context / "probe-input.txt"
         probe_input.write_text(probe_token + "\n", encoding="utf-8")
+        requires_command = provider in {"claude", "codex"}
+        expected_command_sha256 = None
+        command_instruction = ""
+        if requires_command:
+            command_input = context / "probe-command.bin"
+            command_input.write_bytes(secrets.token_bytes(1024))
+            expected_command_sha256 = sha256_file(command_input)
+            command_instruction = (
+                f"Use your command tool to execute sha256sum {shlex.quote(str(command_input))}. "
+                "Include command_sha256=<the digest printed by that command> in the schema object. "
+                "If execution fails, use an empty command_sha256; do not compute or guess it. "
+            )
         raw = root / "raw.json"
         prompt = (
             f"Read {probe_input}. Reply with the schema object only: provider={provider}, "
             "ready=true, observed=<the exact file contents without the trailing newline>. "
+            + command_instruction +
             "This is a capability check."
         )
         command = agent_command(provider, workspace, context, PROBE_SCHEMA, raw, prompt, runtime)
@@ -550,15 +566,24 @@ def probe_provider(
         except WorkflowError as exc:
             return {"provider": provider, "ok": False, "reason": "invalid schema object",
                     "detail": str(exc)}
-        ok = (
+        read_ok = (
             isinstance(payload, dict) and payload.get("ready") is True
             and payload.get("provider") == provider and payload.get("observed") == probe_token
         )
+        checks = {"file_read": read_ok}
+        if requires_command:
+            checks["command_execution"] = (
+                payload.get("command_sha256") == expected_command_sha256)
+        ok = all(checks.values())
+        reason = "read the mounted probe and delivered a schema object"
+        if not read_ok:
+            reason = "schema object did not reproduce the mounted probe contents"
+        elif requires_command:
+            reason = (
+                "read the mounted probe, executed a command, and delivered a schema object"
+                if ok else "command did not reproduce the challenge SHA-256")
         return {
-            "provider": provider, "ok": ok,
-            "reason": (
-                "read the mounted probe and delivered a schema object"
-                if ok else "schema object did not reproduce the mounted probe contents"),
+            "provider": provider, "ok": ok, "checks": checks, "reason": reason,
         }
 
 
@@ -1914,7 +1939,7 @@ def resolve_final_reviewer(
 def verify_provider_selection(
     provider: str, project: Path, runtime: dict[str, Any],
 ) -> dict[str, Any]:
-    """Verify static requirements and one real read using the exact runtime about to be frozen."""
+    """Verify static requirements and adapter tool capabilities using the runtime about to freeze."""
     capability = adapter_capabilities(provider)
     if not capability.get("ok"):
         return {
@@ -2500,7 +2525,11 @@ def isolated_agent_command(
                 "autoAllowBashIfSandboxed": True,
                 "excludedCommands": [],
                 "allowUnsandboxedCommands": False,
-                "filesystem": {"denyRead": [str(private_home)]},
+                "filesystem": {
+                    "denyRead": [str(private_home)],
+                    # Match the outer read-only mounts so absent protection targets need no stubs.
+                    "denyWrite": [str(worktree), str(context)],
+                },
             }
         }
         command[1:1] = ["--settings", json.dumps(sandbox_settings, separators=(",", ":"))]
@@ -5102,7 +5131,8 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument(
         "--probe", action="store_true",
         help="spend one small sandboxed call per provider to check it can authenticate, read a "
-             "mounted file, and return a schema object; exits 2 if any cannot")
+             "mounted file, execute a command for Claude/Codex, and return a schema object; "
+             "exits 2 if any cannot")
     add_model_selection(preflight)
     preflight.set_defaults(func=command_preflight)
 

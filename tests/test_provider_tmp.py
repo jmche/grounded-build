@@ -39,6 +39,10 @@ class ProviderTemporaryDirectoryTest(unittest.TestCase):
                 "import json, os, socket, sys\n"
                 "from pathlib import Path\n"
                 "tmp = Path(os.environ['TMPDIR'])\n"
+                "settings = json.loads(sys.argv[sys.argv.index('--settings') + 1])\n"
+                "denied = settings['sandbox']['filesystem']['denyWrite']\n"
+                "assert str(Path.cwd()) in denied\n"
+                "assert sys.argv[-2] in denied\n"
                 "path = tmp / 'claude-http-0123456789abcdef.sock'\n"
                 "with socket.socket(socket.AF_UNIX) as listener:\n"
                 "    listener.bind(str(path))\n"
@@ -49,7 +53,9 @@ class ProviderTemporaryDirectoryTest(unittest.TestCase):
                 "else:\n"
                 "    readonly = False\n"
                 "proof = {'socket_path': str(path), 'readonly': readonly,\n"
-                "         'host_canary_visible': Path(sys.argv[-1]).exists()}\n"
+                "         'host_canary_visible': Path(sys.argv[-1]).exists(),\n"
+                "         'project_settings': Path('.claude/settings.json').read_text()\n"
+                "             if Path('.claude/settings.json').exists() else None}\n"
                 "(tmp / 'socket-proof.json').write_text(json.dumps(proof))\n"
                 "print(json.dumps(proof))\n",
                 encoding="utf-8",
@@ -61,7 +67,11 @@ class ProviderTemporaryDirectoryTest(unittest.TestCase):
                 for mode in ("planning", "implementation-review"):
                     with self.subTest(mode=mode):
                         invocation = root / ("long-invocation-" + "x" * 120) / mode
-                        command = ["claude", "--disallowedTools", "Edit,Write", str(host_canary)]
+                        project_settings = workspace / ".claude" / "settings.json"
+                        if mode == "implementation-review":
+                            project_settings.parent.mkdir()
+                            project_settings.write_text('{"repository_config": true}', encoding="utf-8")
+                        command = ["claude", "--disallowedTools", "Edit,Write", str(context), str(host_canary)]
                         if mode == "planning":
                             wrapped = planning.isolated_agent_command(
                                 command, {}, invocation, workspace, context)
@@ -77,6 +87,11 @@ class ProviderTemporaryDirectoryTest(unittest.TestCase):
                         self.assertLess(len(os.fsencode(proof["socket_path"])), 108)
                         self.assertTrue(proof["readonly"])
                         self.assertFalse(proof["host_canary_visible"])
+                        if mode == "planning":
+                            self.assertIsNone(proof["project_settings"])
+                            self.assertFalse(project_settings.parent.exists())
+                        else:
+                            self.assertEqual(proof["project_settings"], project_settings.read_text())
                         self.assertEqual(
                             json.loads((invocation / "tmp" / "socket-proof.json").read_text()), proof)
                         self.assertEqual((invocation / "tmp").stat().st_mode & 0o777, 0o700)

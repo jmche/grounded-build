@@ -4,6 +4,13 @@ All notable changes use semantic versioning.
 
 ## Unreleased
 
+- Declare the fixed worktree and invocation context read-only to Claude's inner sandbox, matching
+  the outer mounts. Missing protected configuration files no longer require mount-point creation
+  on a read-only filesystem. Existing repository configuration remains visible and unchanged.
+- Require a command-produced random-file SHA-256 in Claude and Codex availability probes. A
+  readable adapter with an unusable command tool fails selection; DSH and generic bridges retain
+  their file-reading probe contract.
+
 - Mount each planning and implementation-review invocation's private temporary directory at a short
   sandbox-local path. Deep run directories no longer make Claude's network-bridge Unix socket paths
   exceed the Linux address limit; private scratch ownership and fail-closed sandbox settings remain.

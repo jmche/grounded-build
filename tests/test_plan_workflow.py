@@ -43,6 +43,12 @@ if "This is a capability check." in prompt:
     probe_path = Path(re.search(r"Read (/.+?/probe-input\.txt)\.", prompt).group(1))
     probe = {"provider": provider, "ready": ready,
              "observed": probe_path.read_text(encoding="utf-8").rstrip("\n")}
+    shell_match = re.search(r"sha256sum (/.+?/probe-command\.bin)", prompt)
+    probe_shell_ready = True
+    if shell_match:
+        probe["command_sha256"] = (
+            subprocess.check_output(["sha256sum", shell_match.group(1)], text=True).split()[0]
+            if probe_shell_ready else "command unavailable")
     if bridge:
         with open(sys.argv[sys.argv.index("--output") + 1], "w", encoding="utf-8") as handle:
             json.dump(probe, handle)
@@ -610,6 +616,33 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(result["status"], "PREFLIGHT_PROVIDER_UNUSABLE")
         self.assertFalse(result["probes"]["codex"]["ok"])
         self.assertIn("did not reproduce", result["probes"]["codex"]["reason"])
+
+    def test_preflight_rejects_readable_provider_without_command_execution(self) -> None:
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                adapter = self.bin / provider
+                adapter.write_text(
+                    FAKE_AGENT.replace("probe_shell_ready = True", "probe_shell_ready = False"),
+                    encoding="utf-8")
+                result = self.call(
+                    "preflight", "--project", str(self.project), "--backend", provider,
+                    "--probe", expect=2)
+                check = result["probes"][provider]
+                self.assertTrue(check["checks"]["file_read"])
+                self.assertFalse(check["checks"]["command_execution"])
+                self.assertIn("SHA-256", check["reason"])
+
+    def test_preflight_reports_adapter_specific_capabilities(self) -> None:
+        for provider in ("claude", "codex", "dsh", "other"):
+            with self.subTest(provider=provider):
+                result = self.call(
+                    "preflight", "--project", str(self.project), "--backend", provider, "--probe")
+                checks = result["probes"][provider]["checks"]
+                self.assertTrue(checks["file_read"])
+                if provider in ("claude", "codex"):
+                    self.assertTrue(checks["command_execution"])
+                else:
+                    self.assertNotIn("command_execution", checks)
 
     def test_codex_host_can_skip_installed_probe_failed_claude_for_dsh(self) -> None:
         claude = self.bin / "claude"
@@ -1930,6 +1963,8 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertFalse(sandbox["allowUnsandboxedCommands"])
         self.assertEqual(sandbox["excludedCommands"], [])
         self.assertEqual(sandbox["filesystem"]["denyRead"], [str(Path(preview["invocation"]).parent / "home")])
+        self.assertEqual(sandbox["filesystem"]["denyWrite"], [
+            self.get_state(claude_run)["worktree"], preview["context"]])
         invocation_root = str(Path(preview["invocation"]).parent)
         self.assertFalse(any(
             command[index:index + 3] == ["--bind", invocation_root, invocation_root]

@@ -81,6 +81,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 f"""\
                 #!/usr/bin/env python3
                 import json
+                import subprocess
                 import os
                 import re
                 import sys
@@ -106,6 +107,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
                     with open(probe_path, encoding="utf-8") as handle:
                         observed = handle.read().rstrip("\\n")
                     payload = {{"provider": "{name}", "ready": True, "observed": observed}}
+                    shell_match = re.search(r"sha256sum (/.+?/probe-command\\.bin)", prompt)
+                    if shell_match:
+                        payload["command_sha256"] = subprocess.check_output(
+                            ["sha256sum", shell_match.group(1)], text=True).split()[0]
                     if bridge or "{name}" == "codex":
                         flag = "--output" if bridge else "-o"
                         with open(sys.argv[sys.argv.index(flag) + 1], "w", encoding="utf-8") as handle:
