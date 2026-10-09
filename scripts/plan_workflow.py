@@ -2462,6 +2462,8 @@ def isolated_agent_command(
         raise WorkflowError(f"agent executable does not exist: {executable}")
     private_home = invocation_root / "home"
     private_tmp = invocation_root / "tmp"
+    # Provider sandboxes create Unix sockets under TMPDIR; invocation paths can exceed AF_UNIX limits.
+    sandbox_tmp = "/tmp/grounded-build"
     private_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
     other_runtime = ((state.get("agent_runtime") or {}).get("other") or {})
@@ -2611,7 +2613,7 @@ def isolated_agent_command(
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
         "--dir", str(invocation_root),
         "--bind", str(private_home), str(private_home),
-        "--bind", str(private_tmp), str(private_tmp),
+        "--bind", str(private_tmp), sandbox_tmp,
         "--dir", str(worktree), "--ro-bind", str(worktree), str(worktree),
         "--ro-bind", str(context), str(context),
         "--dir", str(common_git), "--ro-bind", str(common_git), str(common_git),
@@ -2645,7 +2647,7 @@ def isolated_agent_command(
     for source, destination in credential_mounts:
         wrapper.extend(["--ro-bind", str(source), str(destination)])
     wrapper.extend([
-        "--setenv", "HOME", str(private_home), "--setenv", "TMPDIR", str(private_tmp),
+        "--setenv", "HOME", str(private_home), "--setenv", "TMPDIR", sandbox_tmp,
         *extra_setenv,
         "--setenv", "PATH", "/usr/bin:/bin", "--chdir", str(worktree), "--", *inner_command,
     ])

@@ -2,6 +2,12 @@
 
 All notable changes use semantic versioning.
 
+## Unreleased
+
+- Mount each planning and implementation-review invocation's private temporary directory at a short
+  sandbox-local path. Deep run directories no longer make Claude's network-bridge Unix socket paths
+  exceed the Linux address limit; private scratch ownership and fail-closed sandbox settings remain.
+
 ## [0.7.9] - 2026-10-07
 
 - Bind PASS reuse and acceptance to the review's engine epoch, including returning to an earlier SHA
