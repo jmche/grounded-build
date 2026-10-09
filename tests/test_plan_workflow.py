@@ -654,6 +654,70 @@ class PlanWorkflowTest(unittest.TestCase):
             "preflight", "--project", str(self.project), "--backend", "codex", "--probe")
         self.assertTrue(result["probes"]["codex"]["checks"]["command_execution"])
 
+    def test_probe_uses_an_isolated_linked_worktree(self) -> None:
+        for provider in ("claude", "codex", "dsh", "other"):
+            with self.subTest(provider=provider):
+                script = self.bin / ("other-bridge" if provider == "other" else provider)
+                self.assertTrue(script.is_file())
+                original = script.read_text()
+                script.write_text(original.replace(
+                    'if "This is a capability check." in prompt:',
+                    'if "This is a capability check." in prompt:\n'
+                    '    assert Path(".git").is_file(), "probe must use a linked worktree"\n'
+                    '    common = Path(subprocess.check_output(["git", "rev-parse", "--git-common-dir"], text=True).strip()).resolve()\n'
+                    '    assert not common.is_relative_to(Path.cwd())\n'
+                    '    assert subprocess.check_output(["git", "ls-files"], text=True) == ""'))
+                try:
+                    result = self.call("preflight", "--project", str(self.project),
+                                       "--backend", provider, "--probe")
+                    self.assertTrue(result["probes"][provider]["ok"])
+                finally:
+                    script.write_text(original)
+
+    def test_investigation_prompt_distinguishes_design_choices_from_blockers(self) -> None:
+        initialized = self.call("init", "--project", str(self.project), "--request", str(self.request),
+                                "--backend", "auto", "--host-adapter", "claude",
+                                "--peer-reviewer", "codex", "--final-reviewer", "claude")
+        for slot in ("A", "B"):
+            with self.subTest(slot=slot):
+                preview = self.call("investigate", "--project", str(self.project),
+                                    "--run-id", initialized["run_id"], "--slot", slot, "--dry-run")
+                prompt = Path(preview["invocation"]).with_name("prompt.md").read_text()
+                self.assertIn("Design options that the later planner can choose", prompt)
+                self.assertIn("Only USER-owned questions may have blocking=true", prompt)
+                self.assertIn("do not hand unexamined code paths to the drafter", prompt)
+                self.assertIn("not by changing their labels", prompt.replace("\n", " "))
+                self.assertNotIn("question must be resolved before delivery", prompt)
+                command = preview["command"]
+                if slot == "A":
+                    schema = json.loads(command[command.index("--json-schema") + 1])
+                else:
+                    schema = json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
+                fields = schema["properties"]["unresolved_questions"]["items"]["properties"]
+                self.assertIn("blocking=false", fields["decision_owner"]["description"])
+                self.assertIn("Never clear a real blocker", fields["blocking"]["description"])
+
+    def test_question_contract_preserves_design_choices_and_real_blockers(self) -> None:
+        spec = importlib.util.spec_from_file_location("gb_question_ownership", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        question = {
+            "id": "A-Q1", "scope_id": "TARGET-001", "question": "Choose a report-copy path",
+            "decision_owner": "PLANNER", "blocking": False,
+            "question_kind": "DECISION_REQUIRED", "rationale": "Both allowlisted paths work",
+            "options": ["review/", "outputs/"], "evidence_ids": [],
+        }
+        module.validate_json_schema(question, module.QUESTION_SCHEMA)
+        module.validate_questions([question], set(), "investigation", allow_blocking_user=True)
+        question["blocking"] = True
+        with self.assertRaisesRegex(module.WorkflowError, "blocking AND owned by PLANNER"):
+            module.validate_questions([question], set(), "investigation", allow_blocking_user=True)
+        question.update(decision_owner="USER", question="Restore command execution or defer verification?",
+                        rationale="Command sandbox failed; verification remains unperformed")
+        module.validate_questions([question], set(), "investigation", allow_blocking_user=True)
+        with self.assertRaisesRegex(module.WorkflowError, "blocking user question"):
+            module.validate_questions([question], set(), "draft", allow_blocking_user=False)
+
     def test_codex_host_can_skip_installed_probe_failed_claude_for_dsh(self) -> None:
         claude = self.bin / "claude"
         claude.write_text(
@@ -1974,7 +2038,7 @@ class PlanWorkflowTest(unittest.TestCase):
         self.assertEqual(sandbox["excludedCommands"], [])
         self.assertEqual(sandbox["filesystem"]["denyRead"], [str(Path(preview["invocation"]).parent / "home")])
         self.assertEqual(sandbox["filesystem"]["denyWrite"], [
-            self.get_state(claude_run)["worktree"], preview["context"]])
+            self.get_state(claude_run)["worktree"], preview["context"], str(self.project / ".git")])
         invocation_root = str(Path(preview["invocation"]).parent)
         self.assertFalse(any(
             command[index:index + 3] == ["--bind", invocation_root, invocation_root]

@@ -4,6 +4,14 @@ All notable changes use semantic versioning.
 
 ## Unreleased
 
+- Include the external Git common directory in Claude's inner read-only policy, matching the
+  outer sandbox for linked worktrees used by planning and implementation review.
+- Run capability probes in disposable linked worktrees so external Git metadata participates in
+  the same isolation path as real assignments; the caller's checkout remains unexposed.
+- Clarify investigation question ownership in the delivered prompt and schema descriptions:
+  defer non-blocking design choices to drafting, investigate repository facts before delivery,
+  and preserve real capability or material blockers for an explicit operator decision.
+
 - Mark the command digest required in Claude/Codex probe schemas so Codex accepts the structured
   output request. File-only adapters receive a schema without that field.
 

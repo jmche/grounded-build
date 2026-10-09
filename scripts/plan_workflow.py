@@ -102,8 +102,16 @@ QUESTION_SCHEMA: dict[str, Any] = {
         "id": {"type": "string"},
         "scope_id": {"type": "string"},
         "question": {"type": "string"},
-        "decision_owner": {"type": "string", "enum": ["USER", "PLANNER"]},
-        "blocking": {"type": "boolean"},
+        "decision_owner": {"type": "string", "enum": ["USER", "PLANNER"],
+                           "description": (
+                               "USER owns external authorization, policy, or capability choices. "
+                               "PLANNER owns design options that can remain for drafting, with "
+                               "blocking=false. Investigate repository facts before delivery.")},
+        "blocking": {"type": "boolean",
+                     "description": (
+                         "true is allowed only with decision_owner=USER. Never clear a real "
+                         "blocker merely to pass validation; resolve repository unknowns or report "
+                         "the unavailable capability/material and the required operator action.")},
         "rationale": {"type": "string"},
         "options": {"type": "array", "items": {"type": "string"}},
         "evidence_ids": {"type": "array", "items": {"type": "string"}},
@@ -519,11 +527,18 @@ def probe_provider(
         root = Path(scratch)
         # A capability probe has no repository-shaped question. Giving it the caller's checkout
         # merely exposes dirty and untracked material to a model before a baseline is frozen.
-        workspace = root / "workspace"
-        workspace.mkdir(mode=0o700)
-        initialized = run(["git", "init", "-q"], cwd=workspace, timeout=30)
+        repository = root / "repository"
+        repository.mkdir(mode=0o700)
+        initialized = run(["git", "init", "-q"], cwd=repository, timeout=30)
         if initialized.returncode != 0:
             raise WorkflowError("could not create the empty capability-probe repository")
+        git(repository, "-c", "user.name=Capability Probe", "-c",
+            "user.email=probe@example.invalid", "-c", "commit.gpgSign=false",
+            "-c", "core.hooksPath=/dev/null", "commit", "-q", "--allow-empty", "-m", "probe baseline")
+        # Real planning/review uses a linked worktree with Git metadata outside its read-only root.
+        workspace = root / "workspace"
+        git(repository, "-c", "core.hooksPath=/dev/null", "worktree", "add", "-q",
+            "--detach", str(workspace))
         context = root / "context"
         context.mkdir(mode=0o700)
         probe_token = secrets.token_hex(16)
@@ -2507,6 +2522,11 @@ def isolated_agent_command(
     controller_inputs: list[Path] = []
     writable_outputs: list[Path] = []
     credential_mounts: list[tuple[Path, Path]] = []
+    common_value = git(worktree, "rev-parse", "--git-common-dir")
+    common_git = Path(common_value)
+    if not common_git.is_absolute():
+        common_git = worktree / common_git
+    common_git = common_git.resolve()
     profile = ((state.get("agent_runtime") or {}).get("codex") or {}).get("profile")
     for source in provider_trust_store(provider, profile):
         destination = sandbox_destination(source, private_home)
@@ -2530,7 +2550,7 @@ def isolated_agent_command(
                 "filesystem": {
                     "denyRead": [str(private_home)],
                     # Match the outer read-only mounts so absent protection targets need no stubs.
-                    "denyWrite": [str(worktree), str(context)],
+                    "denyWrite": list(dict.fromkeys(map(str, (worktree, context, common_git)))),
                 },
             }
         }
@@ -2595,10 +2615,6 @@ def isolated_agent_command(
             )
         command[-1:-1] = ["--patch", str(patch_path)]
         controller_inputs.extend([patch_path, boundary_path])
-    common_value = git(worktree, "rev-parse", "--git-common-dir")
-    common_git = Path(common_value)
-    if not common_git.is_absolute():
-        common_git = (worktree / common_git).resolve()
     inner_command = ["/opt/grounded-build-agent", *command[1:]]
     runtime_mounts: list[tuple[Path, Path]] = []
     extra_setenv: list[str] = []
@@ -4080,6 +4096,11 @@ def command_investigate(args: argparse.Namespace) -> None:
     prompt = (
         "You are independent evidence investigator {slot}. Read {context}/request.md and "
         "{context}/scope_contract.json, then inspect the complete relevant repository surface at baseline {sha}. "
+        "QUESTION OWNERSHIP. Investigate repository facts now; do not hand unexamined code paths to the drafter. "
+        "Design options that the later planner can choose are PLANNER-owned and blocking=false; explain their "
+        "constraints and tradeoffs without drafting the solution. Only USER-owned questions may have blocking=true. "
+        "If required material or command execution is unavailable, report the failure and the operator action "
+        "needed to proceed; do not claim verification or relabel a real blocker as a harmless design option. "
         "The frozen worktree IS the repository and nothing outside it is part of this baseline: {worktree} "
         "(read-only; the sandbox denies every other path). The ENGINE computes and records the digest of every "
         "repository file you cite, so you do not have to: cite the path and the engine binds it to the baseline "
@@ -4108,8 +4129,9 @@ def command_investigate(args: argparse.Namespace) -> None:
         "whether a deployed host can expose streamed progress); use MATERIAL_UNREADABLE only when a "
         "specific required file or context artifact cannot be read and --attach could supply it; use "
         "UNKNOWN when you cannot establish which case applies. "
-        "a blocking question may name USER as decision_owner, while a PLANNER-owned "
-        "question must be resolved before delivery. Batch all residual user choices instead of asking serially. "
+        "Before delivery, check every unresolved question: PLANNER requires blocking=false; USER owns any "
+        "remaining blocker and needs explicit options. Resolve repository unknowns by investigation, not by "
+        "changing their labels. Batch all residual user choices instead of asking serially. "
         "Trace symptoms to root cause where evidence permits; label hypotheses honestly. Rank first by scope gate, then "
         "user priority, severity, urgency, dependency/blocking effect, causal leverage, evidence strength, and effort. "
         "Keep verification priority separate from solution priority. {web_rule} Return only schema JSON with "

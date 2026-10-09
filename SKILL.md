@@ -77,6 +77,8 @@ Use `--probe` for an early availability check. It makes one small paid, sandboxe
 adapter that authenticates, reads a controller-owned mounted file, and returns its contents in a
 schema object. Claude and Codex must also execute a command that hashes a random binary challenge;
 DSH and generic bridges are checked only for their contracted file-reading capability.
+The probe uses a disposable linked worktree with an external Git common directory, matching the
+repository layout of planning and implementation review without exposing the caller's checkout.
 Host-aware initialization repeats that check with the exact runtime it freezes, so a
 preflight result cannot go stale or be applied to different model/provider settings.
 

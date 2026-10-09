@@ -29,6 +29,12 @@ class ProviderTemporaryDirectoryTest(unittest.TestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+            subprocess.run([
+                "git", "-C", str(workspace), "-c", "user.name=Probe", "-c",
+                "user.email=probe@example.invalid", "commit", "-q", "--allow-empty", "-m", "baseline",
+            ], check=True)
+            linked = root / "linked"
+            subprocess.run(["git", "-C", str(workspace), "worktree", "add", "-q", "--detach", str(linked)], check=True)
             context = root / "context"
             context.mkdir()
             host_canary = root / "host-only.txt"
@@ -36,13 +42,21 @@ class ProviderTemporaryDirectoryTest(unittest.TestCase):
             executable = root / "claude"
             executable.write_text(
                 "#!/usr/bin/env python3\n"
-                "import json, os, socket, sys\n"
+                "import json, os, socket, subprocess, sys\n"
                 "from pathlib import Path\n"
                 "tmp = Path(os.environ['TMPDIR'])\n"
                 "settings = json.loads(sys.argv[sys.argv.index('--settings') + 1])\n"
                 "denied = settings['sandbox']['filesystem']['denyWrite']\n"
                 "assert str(Path.cwd()) in denied\n"
                 "assert sys.argv[-2] in denied\n"
+                "common = Path(subprocess.check_output(['git', 'rev-parse', '--git-common-dir'], text=True).strip()).resolve()\n"
+                "assert any(common.is_relative_to(Path(parent)) for parent in denied), str(common)\n"
+                "try:\n"
+                "    (common / 'config.lock').write_text('unexpected')\n"
+                "except OSError:\n"
+                "    pass\n"
+                "else:\n"
+                "    raise AssertionError('Git metadata is writable')\n"
                 "path = tmp / 'claude-http-0123456789abcdef.sock'\n"
                 "with socket.socket(socket.AF_UNIX) as listener:\n"
                 "    listener.bind(str(path))\n"
@@ -64,21 +78,22 @@ class ProviderTemporaryDirectoryTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"PATH": f"{root}:{os.environ['PATH']}"}), \
                     mock.patch.object(planning, "provider_trust_store", return_value=[]), \
                     mock.patch.object(implementation, "planning_isolation_module", return_value=planning):
-                for mode in ("planning", "implementation-review"):
+                for mode, worktree in (("planning", workspace), ("planning-linked", linked),
+                                       ("implementation-review", linked)):
                     with self.subTest(mode=mode):
                         invocation = root / ("long-invocation-" + "x" * 120) / mode
-                        project_settings = workspace / ".claude" / "settings.json"
+                        project_settings = worktree / ".claude" / "settings.json"
                         if mode == "implementation-review":
                             project_settings.parent.mkdir()
                             project_settings.write_text('{"repository_config": true}', encoding="utf-8")
                         command = ["claude", "--disallowedTools", "Edit,Write", str(context), str(host_canary)]
-                        if mode == "planning":
+                        if mode.startswith("planning"):
                             wrapped = planning.isolated_agent_command(
-                                command, {}, invocation, workspace, context)
+                                command, {}, invocation, worktree, context)
                             environment = planning.agent_environment()
                         else:
                             wrapped, environment = implementation.isolated_reviewer_command(
-                                command, "claude", {}, invocation, workspace, context)
+                                command, "claude", {}, invocation, worktree, context)
                         self.assertGreater(len(os.fsencode(invocation / "tmp")), 144)
                         result = subprocess.run(
                             wrapped, env=environment, capture_output=True, text=True, timeout=30)
@@ -87,7 +102,7 @@ class ProviderTemporaryDirectoryTest(unittest.TestCase):
                         self.assertLess(len(os.fsencode(proof["socket_path"])), 108)
                         self.assertTrue(proof["readonly"])
                         self.assertFalse(proof["host_canary_visible"])
-                        if mode == "planning":
+                        if mode.startswith("planning"):
                             self.assertIsNone(proof["project_settings"])
                             self.assertFalse(project_settings.parent.exists())
                         else:
