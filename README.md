@@ -12,6 +12,10 @@ until explicit final integration.
 [![Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+![Grounded Build workflow: frozen Git SHA, two independent planners and cross-review, a reviewed plan, isolated batches with fixed-SHA review, and explicitly approved integration.](https://raw.githubusercontent.com/jmche/grounded-build/main/assets/readme/workflow.gif)
+
+[View the workflow without animation](https://github.com/jmche/grounded-build/blob/main/assets/readme/workflow.png).
+
 ## An executed example: accepted cancellation stays cancelled
 
 A task API returned `accepted: True` when a running task was cancelled. When the worker finished,
@@ -19,6 +23,14 @@ it overwrote the cancelled status and published its result. The five existing te
 
 This is a deliberately constructed example with a seeded defect, developed through actual
 Grounded Build runs. It contains no company code or data.
+
+![Executed synthetic cancellation case: before repair, an accepted cancellation becomes completed and publishes a late result; after repair, it remains cancelled with no result. Five baseline tests passed despite the defect; all 17 reviewed tests and the unchanged reproducer pass after repair.](https://raw.githubusercontent.com/jmche/grounded-build/main/assets/readme/cancellation.gif)
+
+The animation illustrates the recorded outcomes; its timing does not represent execution duration.
+[View the comparison without animation](https://github.com/jmche/grounded-build/blob/main/assets/readme/cancellation.png).
+
+<details>
+<summary>Test results, review findings, and the recorded workflow limitation</summary>
 
 | Observation | Original baseline | Reviewed implementation |
 |---|---|---|
@@ -38,6 +50,8 @@ bare `python3` commands that the verifier rejected. A user-approved, recorded re
 commands to an explicit interpreter. The producer-prompt omission remains unrepaired; this example
 does not claim an uninterrupted run or measured cost savings.
 
+</details>
+
 [Read the full case study, replay the source snapshots, and inspect the review and verification evidence](examples/task-cancellation/README.md).
 
 ## The problem it solves
@@ -51,25 +65,6 @@ Large agent-driven changes often fail for reasons that ordinary code review cann
 - a long conversation loses the decision that should govern the next action.
 
 Grounded Build makes those boundaries explicit and auditable.
-
-```text
-Your repository at one frozen SHA
-                 │
-        ┌────────┴────────┐
-        │                 │
- independent         independent
- investigation       investigation
-        │                 │
-        └──── evidence cross-review ────┐
-                                        │
-                              implementation plan
-                                        │
-                         run-owned implementation tree
-                                        │
-                         independent fixed-SHA review
-                                        │
-                              explicit integration
-```
 
 ## Install
 
