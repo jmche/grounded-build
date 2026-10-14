@@ -1,0 +1,72 @@
+{
+  "base_sha": "3179f2e596f580c4b90ddabccdab22783d9dadc0",
+  "batch": "B01",
+  "closeout_review": false,
+  "criterion_results": [
+    {
+      "criterion_id": "B01-C01",
+      "evidence_ids": [
+        "ev-73bc6ad2ef91"
+      ],
+      "rationale": "Fixed-SHA evidence reports all 14 discovered baseline and cancellation tests passing with exit 0.",
+      "status": "PASS"
+    },
+    {
+      "criterion_id": "B01-C02",
+      "evidence_ids": [
+        "ev-470b7463c6c7"
+      ],
+      "rationale": "Fixed-SHA evidence reports exit 0 and a final cancelled snapshot with result and error both None.",
+      "status": "PASS"
+    },
+    {
+      "criterion_id": "B01-C03",
+      "evidence_ids": [],
+      "rationale": "TaskService.cancel retains the existing lock while checking eligibility, changing status to cancelled, setting the task's existing cancel_event, and returning True.",
+      "status": "PASS"
+    },
+    {
+      "criterion_id": "B01-C04",
+      "evidence_ids": [],
+      "rationale": "Both success and Exception publication branches check for running status and publish terminal fields within the existing lock, so accepted cancellation remains final.",
+      "status": "PASS"
+    },
+    {
+      "criterion_id": "B01-C05",
+      "evidence_ids": [],
+      "rationale": "The new tests drive create, start, cancel, and get through TaskAPI; direct TaskService use is limited to bounded joins for observation and cleanup.",
+      "status": "PASS"
+    },
+    {
+      "criterion_id": "B01-C06",
+      "evidence_ids": [],
+      "rationale": "Running-task tests use Events and bounded waits, register cleanup immediately after start, release blocked workers during cleanup, join with finite timeouts, and assert worker wait results from the main test thread without sleep-based scheduling.",
+      "status": "PASS"
+    },
+    {
+      "criterion_id": "B01-C07",
+      "evidence_ids": [],
+      "rationale": "The authoritative Git range modifies only task_service.py and adds tests/test_cancellation.py, matching the frozen B01 path boundary.",
+      "status": "PASS"
+    }
+  ],
+  "effective_verdict": "PASS",
+  "engine_epoch": 0,
+  "findings": [],
+  "policy": {
+    "blocking_count": 0,
+    "blocking_fingerprints": [],
+    "decision_reasons": [],
+    "deferred_findings": [],
+    "effective_verdict": "PASS",
+    "no_progress_streak": 0,
+    "reported_verdict": "PASS",
+    "warnings": []
+  },
+  "resolved_finding_ids": [],
+  "reviewed_sha": "9fe48e48bd5d98419034fb1e6d2b00bf34f2aafc",
+  "reviewer": "codex",
+  "summary": "PASS. The reviewed change repairs the responsible cancellation and worker-publication boundaries, adds deterministic API-level coverage with bounded thread cleanup, preserves ordinary terminal behavior and public signatures, and stays within the frozen B01 path scope. Both fixed-SHA acceptance commands passed, and the supplied finding ledger contains no prior findings.",
+  "verdict": "PASS",
+  "verification_requests": []
+}

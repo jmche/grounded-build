@@ -1,0 +1,8 @@
+{'accepted': True, 'after_worker_exit': {'id': '1', 'status': 'completed', 'result': 'late result', 'error': None}}
+Traceback (most recent call last):
+  File "<demo>/reproduce_cancel.py", line 36, in <module>
+    reproduce()
+  File "<demo>/reproduce_cancel.py", line 31, in reproduce
+    assert final["status"] == "cancelled", "Late worker completion replaced accepted cancellation"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Late worker completion replaced accepted cancellation

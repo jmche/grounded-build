@@ -12,6 +12,34 @@ until explicit final integration.
 [![Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+## An executed example: accepted cancellation stays cancelled
+
+A task API returned `accepted: True` when a running task was cancelled. When the worker finished,
+it overwrote the cancelled status and published its result. The five existing tests still passed.
+
+This is a deliberately constructed example with a seeded defect, developed through actual
+Grounded Build runs. It contains no company code or data.
+
+| Observation | Original baseline | Reviewed implementation |
+|---|---|---|
+| Status after an accepted cancellation and worker exit | `completed` | `cancelled` |
+| Late worker result | Published | Suppressed |
+| Unit tests | 5 pass | 17 pass |
+| Unchanged cancellation reproducer | Fails | Passes |
+| Independent implementation review | Not an implementation candidate | B01, B02, and final review: PASS |
+
+Cross-review caught a missing snapshot-isolation requirement in one draft. The integrated plan also
+required test wait outcomes to be asserted outside cancelled workers, where discarded exceptions
+could otherwise hide coordination failures. Two implementation batches then repaired cancellation
+and snapshot isolation, with tests run at fixed commits in offline sandboxes.
+
+The run also exposed a Grounded Build contract-delivery issue: three acceptance-contract calls used
+bare `python3` commands that the verifier rejected. A user-approved, recorded recovery bound the
+commands to an explicit interpreter. The producer-prompt omission remains unrepaired; this example
+does not claim an uninterrupted run or measured cost savings.
+
+[Read the full case study, replay the source snapshots, and inspect the review and verification evidence](examples/task-cancellation/README.md).
+
 ## The problem it solves
 
 Large agent-driven changes often fail for reasons that ordinary code review cannot see:

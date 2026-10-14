@@ -1,0 +1,83 @@
+{
+  "accepted_finding_ids": [
+    "F-17d03e1bcd215b8d",
+    "F-253f92adf8817464",
+    "F-446ca2822216f07d",
+    "F-520de2f06e762701",
+    "F-5e617e3e05496baf",
+    "F-8815ec4830214403",
+    "F-b34f64665c1a764f",
+    "F-b69fcff8209085cf",
+    "F-c7bdf14bdd9594a0"
+  ],
+  "baseline_sha": "3179f2e596f580c4b90ddabccdab22783d9dadc0",
+  "finding_aliases": [
+    {
+      "alias_finding_ids": [
+        "F-b34f64665c1a764f"
+      ],
+      "canonical_finding_id": "F-446ca2822216f07d",
+      "evidence_ids": [
+        "A-E1",
+        "A-E2",
+        "B-E2",
+        "B-E13"
+      ],
+      "rationale": "Both findings identify the same TaskService.cancel defect: accepted running cancellation changes status without setting the worker's existing event."
+    },
+    {
+      "alias_finding_ids": [
+        "F-8815ec4830214403"
+      ],
+      "canonical_finding_id": "F-b69fcff8209085cf",
+      "evidence_ids": [
+        "A-E1",
+        "A-E4",
+        "A-E6",
+        "B-E11",
+        "B-E13"
+      ],
+      "rationale": "Both findings trace the same unconditional _run publication branches that overwrite an accepted cancellation after a late return or exception."
+    },
+    {
+      "alias_finding_ids": [
+        "F-17d03e1bcd215b8d"
+      ],
+      "canonical_finding_id": "F-c7bdf14bdd9594a0",
+      "evidence_ids": [
+        "A-E3",
+        "A-E4",
+        "A-E5",
+        "B-E8",
+        "B-E12"
+      ],
+      "rationale": "Both findings concern the same missing deterministic API-level regression surface for running cancellation and serialized orderings."
+    }
+  ],
+  "findings": [
+    {
+      "claim": "The proposed sleep check is not a valid acceptance command because grep is given the tests directory without recursive traversal.",
+      "evidence": "target_plan.md Batch 1 acceptance uses `grep -n \"sleep\" tests/`; tests/ is a directory.",
+      "id": "A-R1",
+      "required_change": "Replace it with a recursive no-match check or make absence of sleep-based scheduling an explicit test-review condition.",
+      "severity": "P2"
+    }
+  ],
+  "new_findings": [],
+  "plan_markdown": "# TARGET-001 implementation plan\n\nBaseline: `3179f2e596f580c4b90ddabccdab22783d9dadc0`. Scope is limited to TARGET-001. The baseline suite passes five tests, while `python3 reproduce_cancel.py` exits nonzero because a late result replaces accepted cancellation. [A-E5, A-E6]\n\n## Root cause\n\n`TaskAPI.cancel` delegates to `TaskService.cancel`. Cancellation and worker publication use the same lock, but cancellation only writes `cancelled` and never signals the supplied event. Both `_run` terminal branches later publish unconditionally. The earliest repair boundary is therefore `TaskService`: signal as part of accepted cancellation and allow `_run` to publish only while the task still owns `running`. [A-E1, A-E2]\n\n## Batch 1 — Serialize cancellation and add cancellation regressions\n\nFiles: `task_service.py` and a test module under `tests/`.\n\n1. In `TaskService.cancel`, preserve the signature, unknown-id `KeyError`, and eligibility rule. While holding `_lock`, transition a queued or running task to `cancelled`, set its existing `cancel_event`, and return `True`. Any later cancellation returns `False`.\n2. In both `_run` publication branches, reacquire `_lock` and publish `completed`/`result` or `failed`/`error` only when `task.status == \"running\"`. If cancellation won the lock first, discard the late return or exception and leave the cancelled state, result, and error unchanged.\n3. Do not add a second lock, force thread termination, broaden exception handling, call another locking service method while holding `_lock`, or change public signatures.\n4. Add deterministic `unittest` cases exercised through `TaskAPI`. Use entered/release `Event` objects, bounded waits, and `TaskService.join` for cleanup; release workers in `finally` or cleanup handlers. Cover:\n   - cooperative running cancellation observes the supplied event and remains cancelled;\n   - a non-cooperative late return publishes no result;\n   - a late exception publishes no error;\n   - cancellation-first remains final after worker exit;\n   - completion-first and failure-first remain unchanged and reject cancellation;\n   - repeated cancellation returns false before and after worker exit;\n   - queued cancellation prevents execution and unknown ids still raise `KeyError`.\n5. Demonstrate consequence by confirming the new running-cancellation cases fail against the baseline implementation before applying the service repair.\n\nBatch acceptance: `python3 -m unittest discover -s tests -v` exits 0 with all old and new tests, every started worker joined within its bound, and no sleep-based scheduling assertion. Then `python3 reproduce_cancel.py` exits 0 and reports a final cancelled task with no result. Allow at most two targeted correction attempts after the first failing run; otherwise stop and preserve the failing output.\n\n## Batch 2 — Detach mutable snapshot results and align documentation\n\nFiles: `task_service.py`, the cancellation test module, and `README.md`. Depends on Batch 1 passing.\n\n1. In `TaskService.snapshot`, capture the task fields consistently under `_lock`, then return a fresh dictionary whose result is detached with `copy.deepcopy` after releasing the lock. Keeping user-defined copy behavior outside the non-reentrant service lock avoids executing it while locked. Use only the standard-library `copy` module.\n2. Add an API-level test that completes with `{\"k\": [1]}`, mutates the result obtained from one `api.get`, and verifies a later `api.get` still returns `{\"k\": [1]}`. Retain the existing top-level dictionary-detachment and ordinary scalar success/failure tests. Record that deep-copying may reject an intrinsically uncopyable result rather than silently returning an alias; do not perform copying under the service lock.\n3. Minimally update only README.md's seeded-baseline wording so it describes the repaired behavior and no longer says the reproducer is expected to fail.\n\nFinal acceptance: run `python3 -m unittest discover -s tests -v` and `python3 reproduce_cancel.py`; both must exit 0. Review the tests to confirm all waits and joins are bounded and no scheduling assertion uses `time.sleep`. `git diff --name-only` must contain only `task_service.py`, the selected test file, and `README.md`.\n\n## Preserved boundaries\n\nQueued cancellation, repeated-cancel false, unknown-id `KeyError`, ordinary success and failure, synchronous API signatures, in-memory storage, and cooperative thread execution remain unchanged. Simultaneous contention needs no production test seam: deterministic cancellation-first and completion/failure-first sequences prove both serialized outcomes. Do not address `BaseException` handling, add dependencies, networking, persistence, retries, publication, push, or automatic rollback. If rollback is later requested, reverse only the implementation patch while preserving external audit records. CLI-reported use may be recorded; otherwise cost remains unknown.",
+  "plan_scope_ids": [
+    "TARGET-001"
+  ],
+  "provider": "codex",
+  "rejected_finding_ids": [
+    "F-39dc2ca20534c4c3"
+  ],
+  "reviewer_slot": "A",
+  "round": 2,
+  "scope_digest": "b9a41ed8acc2bedf3ffafa4f2ce835f8af07ca9fef4a8804b1093c6780840a1f",
+  "slot": "A",
+  "summary": "PASS after integrating the supported cancellation, regression, snapshot-isolation, and documentation work. Repository inspection and both baseline commands confirm the claimed defect and existing behavior. The BaseException observation is rejected because it is explicitly outside TARGET-001. Three evidence-backed duplicate pairs are aliased. The peer plan's non-recursive grep check was corrected; no blocking user decision remains.",
+  "target": "draft-B",
+  "unresolved_questions": [],
+  "verdict": "PASS"
+}

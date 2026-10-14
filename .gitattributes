@@ -1,0 +1,3 @@
+# Preserve the exact bytes of recorded output and unified-diff context lines.
+examples/task-cancellation/evidence/implementation.patch whitespace=-blank-at-eol
+examples/task-cancellation/evidence/host-observations/b02-before-repair.txt whitespace=-blank-at-eol

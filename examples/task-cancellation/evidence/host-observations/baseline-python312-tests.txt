@@ -1,0 +1,10 @@
+test_failure (test_existing_behavior.ExistingBehaviorTests.test_failure) ... ok
+test_queued_cancellation (test_existing_behavior.ExistingBehaviorTests.test_queued_cancellation) ... ok
+test_snapshot_dictionary_is_detached (test_existing_behavior.ExistingBehaviorTests.test_snapshot_dictionary_is_detached) ... ok
+test_success (test_existing_behavior.ExistingBehaviorTests.test_success) ... ok
+test_unknown_task (test_existing_behavior.ExistingBehaviorTests.test_unknown_task) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.001s
+
+OK

@@ -1,0 +1,19 @@
+test_cancellation_wins_before_worker_completion (test_cancellation.CancellationTests.test_cancellation_wins_before_worker_completion) ... ok
+test_completion_wins_before_cancellation (test_cancellation.CancellationTests.test_completion_wins_before_cancellation) ... ok
+test_cooperative_cancellation_signals_worker (test_cancellation.CancellationTests.test_cooperative_cancellation_signals_worker) ... ok
+test_failure_wins_before_cancellation (test_cancellation.CancellationTests.test_failure_wins_before_cancellation) ... ok
+test_late_exception_cannot_publish (test_cancellation.CancellationTests.test_late_exception_cannot_publish) ... ok
+test_noncooperative_late_return_cannot_publish (test_cancellation.CancellationTests.test_noncooperative_late_return_cannot_publish) ... ok
+test_queued_cancellation_never_executes (test_cancellation.CancellationTests.test_queued_cancellation_never_executes) ... ok
+test_repeated_running_cancellation_before_and_after_exit (test_cancellation.CancellationTests.test_repeated_running_cancellation_before_and_after_exit) ... ok
+test_unknown_ids_raise_key_error (test_cancellation.CancellationTests.test_unknown_ids_raise_key_error) ... ok
+test_failure (test_existing_behavior.ExistingBehaviorTests.test_failure) ... ok
+test_queued_cancellation (test_existing_behavior.ExistingBehaviorTests.test_queued_cancellation) ... ok
+test_snapshot_dictionary_is_detached (test_existing_behavior.ExistingBehaviorTests.test_snapshot_dictionary_is_detached) ... ok
+test_success (test_existing_behavior.ExistingBehaviorTests.test_success) ... ok
+test_unknown_task (test_existing_behavior.ExistingBehaviorTests.test_unknown_task) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 0.002s
+
+OK

@@ -1,0 +1,118 @@
+{
+  "accepted_batches": [
+    "B01",
+    "B02",
+    "FINAL"
+  ],
+  "baseline_sha": "3179f2e596f580c4b90ddabccdab22783d9dadc0",
+  "candidate_sha": "7371c7d143846215402c6a935f69d56d66e09b37",
+  "deferred_findings": [],
+  "excluded_source_changes_at_initialization": [],
+  "implementation_run_id": "20261013-092627-implementation_plan-fe845e",
+  "implementation_status_at_export": "READY_TO_FINALIZE",
+  "implementer": "codex",
+  "integration_completed_at_export": false,
+  "plan_digest": "b9d5e5243b5e44f19bc1a2bc8bb4c501665b848296a21eeb89d8f6be61f329b4",
+  "planning_model_diversity": true,
+  "planning_planners": {
+    "A": "codex",
+    "B": "claude"
+  },
+  "planning_provider_diversity": true,
+  "planning_run_id": "20261013-175302-201aa8",
+  "planning_runtime": {
+    "claude": {
+      "adapter": "claude",
+      "cli_version": "2.1.296 (Claude Code)",
+      "identity_source": "grounded_build_default",
+      "model": "opus",
+      "model_family": "claude",
+      "model_provider": "anthropic",
+      "profile": null
+    },
+    "codex": {
+      "adapter": "codex",
+      "cli_version": "codex-cli 0.162.1",
+      "identity_source": "grounded_build_default",
+      "model": "gpt-5.6-sol",
+      "model_family": "gpt",
+      "model_provider": null,
+      "profile": null
+    }
+  },
+  "reviewer": "codex",
+  "reviewer_runtime": {
+    "adapter": "codex",
+    "cli_version": "codex-cli 0.162.1",
+    "identity_source": "grounded_build_default",
+    "model": "gpt-5.6-sol",
+    "model_family": "gpt",
+    "model_provider": null,
+    "profile": null
+  },
+  "reviews": [
+    {
+      "artifact": "evidence/reviews/B01-round-1.json",
+      "batch": "B01",
+      "duration_seconds": 59.839,
+      "review_mode": "FULL",
+      "reviewed_sha": "9fe48e48bd5d98419034fb1e6d2b00bf34f2aafc",
+      "reviewer": "codex",
+      "reviewer_runtime": {
+        "adapter": "codex",
+        "cli_version": "codex-cli 0.162.1",
+        "identity_source": "grounded_build_default",
+        "model": "gpt-5.6-sol",
+        "model_family": "gpt",
+        "model_provider": null,
+        "profile": null
+      },
+      "round": 1,
+      "supplied_diff_bytes": 7018,
+      "verdict": "PASS"
+    },
+    {
+      "artifact": "evidence/reviews/B02-round-1.json",
+      "batch": "B02",
+      "duration_seconds": 56.19,
+      "review_mode": "FULL",
+      "reviewed_sha": "7371c7d143846215402c6a935f69d56d66e09b37",
+      "reviewer": "codex",
+      "reviewer_runtime": {
+        "adapter": "codex",
+        "cli_version": "codex-cli 0.162.1",
+        "identity_source": "grounded_build_default",
+        "model": "gpt-5.6-sol",
+        "model_family": "gpt",
+        "model_provider": null,
+        "profile": null
+      },
+      "round": 1,
+      "supplied_diff_bytes": 4402,
+      "verdict": "PASS"
+    },
+    {
+      "artifact": "evidence/reviews/FINAL-round-1.json",
+      "batch": "FINAL",
+      "duration_seconds": 67.234,
+      "review_mode": "FULL",
+      "reviewed_sha": "7371c7d143846215402c6a935f69d56d66e09b37",
+      "reviewer": "codex",
+      "reviewer_runtime": {
+        "adapter": "codex",
+        "cli_version": "codex-cli 0.162.1",
+        "identity_source": "grounded_build_default",
+        "model": "gpt-5.6-sol",
+        "model_family": "gpt",
+        "model_provider": null,
+        "profile": null
+      },
+      "round": 1,
+      "supplied_diff_bytes": 10808,
+      "verdict": "PASS"
+    }
+  ],
+  "supplementary_instruction_snapshots": [],
+  "synthetic_case": true,
+  "worktrees_retained": true
+}

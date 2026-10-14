@@ -1,0 +1,187 @@
+{
+  "baseline_sha": "3179f2e596f580c4b90ddabccdab22783d9dadc0",
+  "evidence": [
+    {
+      "claim": "TaskService passes a cancellation event to workers, but cancel only changes status; worker return and exception paths unconditionally publish terminal state.",
+      "content_sha256": "3aa26458a0f13b54a300b46a59077cfd07e819b0dc70ca7b68dfadbc2568b008",
+      "id": "A-E1",
+      "locator": "task_service.py:39-64",
+      "retrieved_at": "2026-10-13T08:54:33Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "TaskAPI routes cancellation through TaskService.cancel and returns its accepted decision with a snapshot.",
+      "content_sha256": "ae9f2901741b7b959e1b48e61816297d7856f78352d6eea0205ddea0e3875ae7",
+      "id": "A-E2",
+      "locator": "task_api.py:4-18",
+      "retrieved_at": "2026-10-13T08:54:33Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "Existing tests cover success, failure, queued cancellation, repeated queued cancellation, unknown ids, and detached snapshot dictionaries, but not running-task cancellation races.",
+      "content_sha256": "71a38a69873dc235ba5ac02ef3aa8428980c6d6b707a480a1f65cafe816eb5f5",
+      "id": "A-E3",
+      "locator": "tests/test_existing_behavior.py:7-49",
+      "retrieved_at": "2026-10-13T08:54:33Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "The deterministic reproducer cancels a running task through TaskAPI, releases its worker, joins it, and asserts cancellation remains final without a result.",
+      "content_sha256": "afe594aa4d72edf337bca6c53e6d6ec0c630a865741c4c81c023edd88ef9d30f",
+      "id": "A-E4",
+      "locator": "reproduce_cancel.py:7-32",
+      "retrieved_at": "2026-10-13T08:54:33Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "The baseline unit suite completed successfully: five tests passed with exit status 0.",
+      "content_sha256": "925e1f9cc29dcdedacc9b8310e8b64ed5e8642d70b75e060c8dbc434e2cb584f",
+      "id": "A-E5",
+      "locator": "python3 -m unittest discover -s tests -v",
+      "retrieved_at": "2026-10-13T08:54:33Z",
+      "scope_id": "TARGET-001",
+      "source_type": "COMMAND",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "The baseline reproducer exited 1 after accepted cancellation was replaced by completed status and the late result was published.",
+      "content_sha256": "36fbdc96f9552bed94b1310fc7ef34d118f295730a08fff9f5ac2d9b2f27b862",
+      "id": "A-E6",
+      "locator": "python3 reproduce_cancel.py",
+      "retrieved_at": "2026-10-13T08:54:33Z",
+      "scope_id": "TARGET-001",
+      "source_type": "COMMAND",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    }
+  ],
+  "findings": [
+    {
+      "affected_surfaces": [
+        "TaskService.cancel",
+        "Task.cancel_event",
+        "TaskAPI.cancel"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Set the existing event while holding the service lock; this is the smallest change and couples signal acceptance to the state decision.",
+        "A private transition helper could centralize status and signalling invariants, but adds refactoring surface to this small service."
+      ],
+      "causal_chain": [
+        "TaskAPI.cancel delegates to TaskService.cancel.",
+        "TaskService accepts a running task and records cancelled under its lock.",
+        "The accepted path never sets task.cancel_event.",
+        "The cooperative worker therefore receives no cancellation signal."
+      ],
+      "evidence_ids": [
+        "A-E1",
+        "A-E2"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "A-F1",
+      "lane": "STOP_THE_LINE",
+      "problem": "Accepted running-task cancellation does not signal the event supplied to the cooperative worker.",
+      "recommended_solution": "Repair the existing TaskService cancellation boundary so accepting running cancellation sets the worker's existing event as part of the same locked decision.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P1",
+      "urgency": "U0",
+      "verification": [
+        "Use TaskAPI with bounded events to start a cooperative worker, accept cancellation, observe its supplied event, release it, and join it.",
+        "Assert repeated cancellation returns false and the final snapshot remains cancelled with no result or error."
+      ]
+    },
+    {
+      "affected_surfaces": [
+        "TaskService._run",
+        "TaskService.cancel",
+        "TaskAPI.cancel",
+        "reproduce_cancel.py"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Guard both worker publication branches with the current status under the existing lock; this is minimal and preserves signatures.",
+        "Centralize terminal transitions in a private compare-and-set-style helper; this makes the invariant explicit but is a broader internal change."
+      ],
+      "causal_chain": [
+        "Cancellation and worker publication each acquire the same lock.",
+        "Cancellation can acquire it first and record cancelled.",
+        "After the operation returns or raises, _run acquires the lock and writes completed or failed without checking the current state.",
+        "The late write replaces accepted cancellation and may publish a result or error.",
+        "The baseline reproducer observes completed with a late result and fails."
+      ],
+      "evidence_ids": [
+        "A-E1",
+        "A-E4",
+        "A-E6"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "A-F2",
+      "lane": "STOP_THE_LINE",
+      "problem": "Worker completion has unconditional publication authority, so cancellation is not a final serialized terminal decision.",
+      "recommended_solution": "Make worker result and error publication conditional on still owning the running state under the same service lock, leaving accepted cancellation immutable.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P1",
+      "urgency": "U0",
+      "verification": [
+        "Re-run python3 reproduce_cancel.py and require exit status 0.",
+        "Coordinate cancellation-before-return and cancellation-before-exception cases; join workers with bounded waits and assert cancelled with no result or error.",
+        "Coordinate completion-before-cancellation and failure-before-cancellation cases; assert the terminal outcome remains unchanged and cancellation returns false."
+      ]
+    },
+    {
+      "affected_surfaces": [
+        "tests/test_existing_behavior.py",
+        "reproduce_cancel.py",
+        "TaskAPI"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Extend the unittest suite with event-coordinated API scenarios and retain the reproducer as a focused regression command.",
+        "Shared synchronization helpers may reduce repetition, but abstraction should not obscure which side wins each serialized ordering."
+      ],
+      "causal_chain": [
+        "The current suite verifies five ordinary and queued behaviors and passes.",
+        "The reproducer covers only a non-cooperative late return and currently fails.",
+        "No committed test covers cooperative signalling, late exception, or both completion/cancellation orderings.",
+        "Consequently the full required cancellation contract is not regression-protected."
+      ],
+      "evidence_ids": [
+        "A-E3",
+        "A-E4",
+        "A-E5",
+        "A-E6"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "A-F3",
+      "lane": "MUST_RESOLVE",
+      "problem": "The baseline acceptance surface lacks deterministic API-level coverage for several required running-cancellation semantics.",
+      "recommended_solution": "Add bounded, event-coordinated TaskAPI tests for cooperative cancellation, ignored cancellation with late return and exception, both decision orderings, and preserved existing behaviors; ensure every started worker is released and joined.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P1",
+      "urgency": "U1",
+      "verification": [
+        "Run python3 -m unittest discover -s tests -v.",
+        "Run python3 reproduce_cancel.py.",
+        "Confirm tests use synchronization events and bounded joins rather than sleep-based scheduling assertions."
+      ]
+    }
+  ],
+  "provider": "codex",
+  "scope_digest": "b9a41ed8acc2bedf3ffafa4f2ce835f8af07ca9fef4a8804b1093c6780840a1f",
+  "slot": "A",
+  "summary": "The frozen baseline has one incomplete TaskService cancellation boundary with two proven mechanisms: accepted running cancellation never sets the worker event, and both worker publication branches can overwrite cancellation. Existing ordinary, queued, unknown-id, repeated-cancel, and detached-snapshot checks pass, while the required reproducer fails by publishing a late result. No external research or user decision is needed.",
+  "unresolved_questions": []
+}

@@ -1,0 +1,43 @@
+{
+  "baseline": {
+    "files": {
+      ".gitignore": "9010c2fe0bd4c8ed4dbf01b9b7d1d7def7bd9bdb613892167a25a8f0c8e773d4",
+      "AGENTS.md": "2e0b405c71a6738ed7c5ee5291bc900cf2c08cadc48da60d2afed2eef26b755c",
+      "README.md": "5945cb3292588203901a6e06d1a58bb866abf0d9088b2fcc718697142b9fa6dc",
+      "reproduce_cancel.py": "afe594aa4d72edf337bca6c53e6d6ec0c630a865741c4c81c023edd88ef9d30f",
+      "request.md": "3ac4f6f5bf046cb4c334cd055844492d27977f72deafbe1469a61d847146bd93",
+      "task_api.py": "ae9f2901741b7b959e1b48e61816297d7856f78352d6eea0205ddea0e3875ae7",
+      "task_service.py": "3aa26458a0f13b54a300b46a59077cfd07e819b0dc70ca7b68dfadbc2568b008",
+      "tests/test_existing_behavior.py": "71a38a69873dc235ba5ac02ef3aa8428980c6d6b707a480a1f65cafe816eb5f5"
+    },
+    "git_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+  },
+  "batch-01": {
+    "files": {
+      ".gitignore": "9010c2fe0bd4c8ed4dbf01b9b7d1d7def7bd9bdb613892167a25a8f0c8e773d4",
+      "AGENTS.md": "2e0b405c71a6738ed7c5ee5291bc900cf2c08cadc48da60d2afed2eef26b755c",
+      "README.md": "5945cb3292588203901a6e06d1a58bb866abf0d9088b2fcc718697142b9fa6dc",
+      "reproduce_cancel.py": "afe594aa4d72edf337bca6c53e6d6ec0c630a865741c4c81c023edd88ef9d30f",
+      "request.md": "3ac4f6f5bf046cb4c334cd055844492d27977f72deafbe1469a61d847146bd93",
+      "task_api.py": "ae9f2901741b7b959e1b48e61816297d7856f78352d6eea0205ddea0e3875ae7",
+      "task_service.py": "735476412ccdc5dd57320bee0334508cab72b84effff26446bd15dfd6bbd04eb",
+      "tests/test_cancellation.py": "8ba410725d80acbfc955eeb29d4bee283b963dc08cc4c8d78112b3e8fea4e584",
+      "tests/test_existing_behavior.py": "71a38a69873dc235ba5ac02ef3aa8428980c6d6b707a480a1f65cafe816eb5f5"
+    },
+    "git_commit": "9fe48e48bd5d98419034fb1e6d2b00bf34f2aafc"
+  },
+  "reviewed": {
+    "files": {
+      ".gitignore": "9010c2fe0bd4c8ed4dbf01b9b7d1d7def7bd9bdb613892167a25a8f0c8e773d4",
+      "AGENTS.md": "2e0b405c71a6738ed7c5ee5291bc900cf2c08cadc48da60d2afed2eef26b755c",
+      "README.md": "6dd8d556a0b903dc7fa5b902a5d58bb01d6ed9e74ff3dac6acd88adf1ea2e86b",
+      "reproduce_cancel.py": "afe594aa4d72edf337bca6c53e6d6ec0c630a865741c4c81c023edd88ef9d30f",
+      "request.md": "3ac4f6f5bf046cb4c334cd055844492d27977f72deafbe1469a61d847146bd93",
+      "task_api.py": "ae9f2901741b7b959e1b48e61816297d7856f78352d6eea0205ddea0e3875ae7",
+      "task_service.py": "b3272c53cfce7a075597b1a7cdc826e25e5a5936e5dbab7cc6c9d2a20ac6eefb",
+      "tests/test_cancellation.py": "7f9a29b95f5b9b57cbd8ecbce33c0fe8334b6f0b38296882094e0e0efcc1822c",
+      "tests/test_existing_behavior.py": "71a38a69873dc235ba5ac02ef3aa8428980c6d6b707a480a1f65cafe816eb5f5"
+    },
+    "git_commit": "7371c7d143846215402c6a935f69d56d66e09b37"
+  }
+}

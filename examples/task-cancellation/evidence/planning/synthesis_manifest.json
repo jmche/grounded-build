@@ -1,0 +1,87 @@
+{
+  "baseline_sha": "3179f2e596f580c4b90ddabccdab22783d9dadc0",
+  "scope_digest": "b9a41ed8acc2bedf3ffafa4f2ce835f8af07ca9fef4a8804b1093c6780840a1f",
+  "plan_sha256": "b9d5e5243b5e44f19bc1a2bc8bb4c501665b848296a21eeb89d8f6be61f329b4",
+  "batch_manifest_sha256": "271b275caf3e5c0e5320de0752f5109cd1feaf62d589442ba0ff8d845bcabaea",
+  "plan_scope_ids": ["TARGET-001"],
+  "finding_dispositions": [
+    {
+      "finding_id": "F-14bdafad7a2e4fe6",
+      "disposition": "ACCEPTED",
+      "rationale": "Treat swallowed worker-side coordination failures as a strongly inferred test-design risk. New workers record wait outcomes for main-thread assertions, so accepted cancellation cannot hide a test timeout.",
+      "evidence_ids": ["B-E1", "B-E7"],
+      "batch_ids": ["B01"]
+    },
+    {
+      "finding_id": "F-17d03e1bcd215b8d",
+      "disposition": "ACCEPTED",
+      "rationale": "Add missing API cancellation and serialized-ordering coverage with failing-first observations and bounded cleanup. This duplicates A's coverage observation without increasing the distinct-defect count.",
+      "evidence_ids": ["B-E8", "A-E3", "A-E5", "A-E6"],
+      "batch_ids": ["B01"]
+    },
+    {
+      "finding_id": "F-253f92adf8817464",
+      "disposition": "ACCEPTED",
+      "rationale": "Correct README statements directly invalidated by the repair while retaining the seeded-baseline disclosure and immutable historical records.",
+      "evidence_ids": ["B-E9"],
+      "batch_ids": ["B02"]
+    },
+    {
+      "finding_id": "F-39dc2ca20534c4c3",
+      "disposition": "REJECTED",
+      "rationale": "Reject inclusion, not the observation: the Exception-only catch is visible in repository evidence, but changing non-Exception BaseException handling belongs to OUT_OF_SCOPE-001 and is not required by the frozen request.",
+      "evidence_ids": ["B-E1", "B-E15"],
+      "batch_ids": []
+    },
+    {
+      "finding_id": "F-446ca2822216f07d",
+      "disposition": "ACCEPTED",
+      "rationale": "Set the worker Event inside the accepted cancellation decision under the existing lock, and prove the worker observes it. Same defect as B's missing-signal observation.",
+      "evidence_ids": ["A-E1", "A-E2", "B-E2"],
+      "batch_ids": ["B01"]
+    },
+    {
+      "finding_id": "F-520de2f06e762701",
+      "disposition": "ACCEPTED",
+      "rationale": "Requirement 6 covers nested mutable results. Deep-copy the result outside the lock; document identity/copyability limits, test ordinary nested data and explicit copy failure, and do not silently return an alias.",
+      "evidence_ids": ["B-E4", "B-E8"],
+      "batch_ids": ["B02"]
+    },
+    {
+      "finding_id": "F-5e617e3e05496baf",
+      "disposition": "ACCEPTED",
+      "rationale": "Accept as preservation evidence, not new defects. Keep all five baseline tests and test terminal false decisions, unknown ids, ordinary success/failure, and queued cancellation across both batches.",
+      "evidence_ids": ["B-E3", "B-E8", "A-E5"],
+      "batch_ids": ["B01", "B02"]
+    },
+    {
+      "finding_id": "F-8815ec4830214403",
+      "disposition": "ACCEPTED",
+      "rationale": "Condition both worker publication branches on the running state under the cancellation lock. Same defect as A's unconditional-publication observation; never replace this repair with snapshot filtering.",
+      "evidence_ids": ["B-E1", "A-E1", "A-E6"],
+      "batch_ids": ["B01"]
+    },
+    {
+      "finding_id": "F-b34f64665c1a764f",
+      "disposition": "ACCEPTED",
+      "rationale": "Set the existing cancellation Event as part of accepted queued/running cancellation and add the cooperative-worker observation. Preserve this duplicate signal finding's provenance.",
+      "evidence_ids": ["B-E2", "A-E1", "A-E2"],
+      "batch_ids": ["B01"]
+    },
+    {
+      "finding_id": "F-b69fcff8209085cf",
+      "disposition": "ACCEPTED",
+      "rationale": "Make terminal publication conditional under the existing lock so cancellation-first stays cancelled and completion/failure-first rejects cancellation unchanged; cover both success and exception branches.",
+      "evidence_ids": ["A-E1", "A-E4", "A-E6"],
+      "batch_ids": ["B01"]
+    },
+    {
+      "finding_id": "F-c7bdf14bdd9594a0",
+      "disposition": "ACCEPTED",
+      "rationale": "Add consequential cancellation regressions in the same batch as the repair, retaining the original reproducer and unchanged baseline tests. This closes A's P1 acceptance-coverage finding.",
+      "evidence_ids": ["A-E3", "A-E4", "A-E5", "A-E6"],
+      "batch_ids": ["B01"]
+    }
+  ],
+  "unresolved_questions": []
+}

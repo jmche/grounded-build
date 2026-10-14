@@ -1,0 +1,52 @@
+{
+  "baseline_sha": "3179f2e596f580c4b90ddabccdab22783d9dadc0",
+  "blocking_finding_ids_checked": [
+    "F-446ca2822216f07d",
+    "F-8815ec4830214403",
+    "F-b34f64665c1a764f",
+    "F-b69fcff8209085cf",
+    "F-c7bdf14bdd9594a0"
+  ],
+  "candidate_batch_manifest_sha256": "271b275caf3e5c0e5320de0752f5109cd1feaf62d589442ba0ff8d845bcabaea",
+  "candidate_plan_sha256": "b9d5e5243b5e44f19bc1a2bc8bb4c501665b848296a21eeb89d8f6be61f329b4",
+  "candidate_synthesis_manifest_sha256": "a8b90f9afead08003337ff10917e62ef0e66a4890ce2f9ebe05516780fc27360",
+  "criteria": [
+    {
+      "criterion": "REQUEST_COVERAGE",
+      "evidence": "implementation_plan.md:62-123 covers signalling, late return/exception, both orderings, repeated/queued cancellation, unknown IDs, ordinary outcomes, snapshot isolation, and bounded API-level tests.",
+      "status": "PASS"
+    },
+    {
+      "criterion": "SCOPE_CONTROL",
+      "evidence": "implementation_plan.md:9-18 and 142-145 limit changes to three named files, reject BaseException expansion, and preserve the synchronous in-memory standard-library design.",
+      "status": "PASS"
+    },
+    {
+      "criterion": "EVIDENCE_AND_ROOT_CAUSE",
+      "evidence": "task_service.py:39-59 confirms unconditional terminal publication and missing Event.set; implementation_plan.md:25-55 identifies both boundaries without overstating execution evidence.",
+      "status": "PASS"
+    },
+    {
+      "criterion": "DEPENDENCY_ORDER",
+      "evidence": "B01 repairs cancellation and adds consequential tests; B02 explicitly depends on accepted B01 before snapshot and README work (implementation_plan.md:57-123).",
+      "status": "PASS"
+    },
+    {
+      "criterion": "BUDGET_BOUNDS",
+      "evidence": "implementation_plan.md:125-140 caps targeted corrections at two per batch, preserves engine review budgets, and correctly marks unspecified cost/time as unknown.",
+      "status": "PASS"
+    },
+    {
+      "criterion": "BATCH_ACCEPTANCE",
+      "evidence": "batches.md:7-44 defines exactly two bounded batches; each names finite commands, observable states, joined workers, file-scope inspection, and fixed dependency/acceptance conditions.",
+      "status": "PASS"
+    }
+  ],
+  "findings": [],
+  "provider": "codex",
+  "reviewer_slot": "F",
+  "scope_digest": "b9a41ed8acc2bedf3ffafa4f2ce835f8af07ca9fef4a8804b1093c6780840a1f",
+  "summary": "PASS. Review is bound to scope b9a41ed8acc2bedf3ffafa4f2ce835f8af07ca9fef4a8804b1093c6780840a1f, plan b9d5e5243b5e44f19bc1a2bc8bb4c501665b848296a21eeb89d8f6be61f329b4, batches 271b275caf3e5c0e5320de0752f5109cd1feaf62d589442ba0ff8d845bcabaea, and synthesis a8b90f9afead08003337ff10917e62ef0e66a4890ce2f9ebe05516780fc27360 at baseline 3179f2e596f580c4b90ddabccdab22783d9dadc0. No supported P0/P1 finding remains.",
+  "target": "candidate-round-1",
+  "verdict": "PASS"
+}

@@ -1,0 +1,94 @@
+test_cancellation_wins_before_worker_completion (test_cancellation.CancellationTests.test_cancellation_wins_before_worker_completion) ... FAIL
+test_completion_wins_before_cancellation (test_cancellation.CancellationTests.test_completion_wins_before_cancellation) ... ok
+test_cooperative_cancellation_signals_worker (test_cancellation.CancellationTests.test_cooperative_cancellation_signals_worker) ... FAIL
+test_failure_wins_before_cancellation (test_cancellation.CancellationTests.test_failure_wins_before_cancellation) ... ok
+test_late_exception_cannot_publish (test_cancellation.CancellationTests.test_late_exception_cannot_publish) ... FAIL
+test_noncooperative_late_return_cannot_publish (test_cancellation.CancellationTests.test_noncooperative_late_return_cannot_publish) ... FAIL
+test_queued_cancellation_never_executes (test_cancellation.CancellationTests.test_queued_cancellation_never_executes) ... ok
+test_repeated_running_cancellation_before_and_after_exit (test_cancellation.CancellationTests.test_repeated_running_cancellation_before_and_after_exit) ... FAIL
+test_unknown_ids_raise_key_error (test_cancellation.CancellationTests.test_unknown_ids_raise_key_error) ... ok
+test_failure (test_existing_behavior.ExistingBehaviorTests.test_failure) ... ok
+test_queued_cancellation (test_existing_behavior.ExistingBehaviorTests.test_queued_cancellation) ... ok
+test_snapshot_dictionary_is_detached (test_existing_behavior.ExistingBehaviorTests.test_snapshot_dictionary_is_detached) ... ok
+test_success (test_existing_behavior.ExistingBehaviorTests.test_success) ... ok
+test_unknown_task (test_existing_behavior.ExistingBehaviorTests.test_unknown_task) ... ok
+
+======================================================================
+FAIL: test_cancellation_wins_before_worker_completion (test_cancellation.CancellationTests.test_cancellation_wins_before_worker_completion)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<demo>/tests/test_cancellation.py", line 95, in test_cancellation_wins_before_worker_completion
+    self.assertEqual(self.api.get(task_id), response["task"])
+AssertionError: {'id': '1', 'status': 'completed', 'result': 'late result', 'error': None} != {'id': '1', 'status': 'cancelled', 'result': None, 'error': None}
+- {'error': None, 'id': '1', 'result': 'late result', 'status': 'completed'}
+?                                      ^^^^ --------              ^^^ ^^
+
++ {'error': None, 'id': '1', 'result': None, 'status': 'cancelled'}
+?                                      ^^^               ^^^^ ^
+
+
+======================================================================
+FAIL: test_cooperative_cancellation_signals_worker (test_cancellation.CancellationTests.test_cooperative_cancellation_signals_worker)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<demo>/tests/test_cancellation.py", line 64, in test_cooperative_cancellation_signals_worker
+    self.assertEqual(waits, [True, True])
+AssertionError: Lists differ: [False, True] != [True, True]
+
+First differing element 0:
+False
+True
+
+- [False, True]
++ [True, True]
+
+======================================================================
+FAIL: test_late_exception_cannot_publish (test_cancellation.CancellationTests.test_late_exception_cannot_publish)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<demo>/tests/test_cancellation.py", line 85, in test_late_exception_cannot_publish
+    self._assert_cancelled(task_id)
+  File "<demo>/tests/test_cancellation.py", line 42, in _assert_cancelled
+    self.assertEqual(self.api.get(task_id), {
+AssertionError: {'id': '1', 'status': 'failed', 'result': None, 'error': 'ValueError'} != {'id': '1', 'status': 'cancelled', 'result': None, 'error': None}
+- {'error': 'ValueError', 'id': '1', 'result': None, 'status': 'failed'}
+?           ^^^^^ ------                                        ^ ^
+
++ {'error': None, 'id': '1', 'result': None, 'status': 'cancelled'}
+?           ^^^                                         ^ ^^^^
+
+
+======================================================================
+FAIL: test_noncooperative_late_return_cannot_publish (test_cancellation.CancellationTests.test_noncooperative_late_return_cannot_publish)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<demo>/tests/test_cancellation.py", line 75, in test_noncooperative_late_return_cannot_publish
+    self._assert_cancelled(task_id)
+  File "<demo>/tests/test_cancellation.py", line 42, in _assert_cancelled
+    self.assertEqual(self.api.get(task_id), {
+AssertionError: {'id': '1', 'status': 'completed', 'result': 'late result', 'error': None} != {'id': '1', 'status': 'cancelled', 'result': None, 'error': None}
+- {'error': None, 'id': '1', 'result': 'late result', 'status': 'completed'}
+?                                      ^^^^ --------              ^^^ ^^
+
++ {'error': None, 'id': '1', 'result': None, 'status': 'cancelled'}
+?                                      ^^^               ^^^^ ^
+
+
+======================================================================
+FAIL: test_repeated_running_cancellation_before_and_after_exit (test_cancellation.CancellationTests.test_repeated_running_cancellation_before_and_after_exit)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<demo>/tests/test_cancellation.py", line 128, in test_repeated_running_cancellation_before_and_after_exit
+    self.assertEqual(self.api.cancel(task_id), repeated)
+AssertionError: {'acc[35 chars]'status': 'completed', 'result': 'late result', 'error': None}} != {'acc[35 chars]'status': 'cancelled', 'result': None, 'error': None}}
+  {'accepted': False,
++  'task': {'error': None, 'id': '1', 'result': None, 'status': 'cancelled'}}
+-  'task': {'error': None,
+-           'id': '1',
+-           'result': 'late result',
+-           'status': 'completed'}}
+
+----------------------------------------------------------------------
+Ran 14 tests in 1.005s
+
+FAILED (failures=5)

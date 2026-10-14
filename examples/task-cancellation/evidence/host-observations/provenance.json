@@ -1,0 +1,56 @@
+[
+  {
+    "artifact": "evidence/host-observations/baseline-python312-tests.txt",
+    "exported_sha256": "a449d28bc6b20d8dad4447b69ae891e4253056987797983c8a856cc5a5054029",
+    "original_sha256": "a449d28bc6b20d8dad4447b69ae891e4253056987797983c8a856cc5a5054029",
+    "transformation": "Exact local demo path prefixes replaced with <demo>; all outcomes retained."
+  },
+  {
+    "artifact": "evidence/host-observations/baseline-python312-reproduction.txt",
+    "exported_sha256": "b6068b33e620aea39941187d311f5da0841648f2321cfd244b88b47ffa5a1eda",
+    "original_sha256": "7c81ca9730713c3ac303fb209a54863e348440de3aaf0cff8f27c7302c904c73",
+    "transformation": "Exact local demo path prefixes replaced with <demo>; all outcomes retained."
+  },
+  {
+    "artifact": "evidence/host-observations/implementation-baseline-reproduction.txt",
+    "exported_sha256": "b6068b33e620aea39941187d311f5da0841648f2321cfd244b88b47ffa5a1eda",
+    "original_sha256": "aa87bfa2273bbab5aedb9b47dbe1f1cec62f8adcfdc7fd148ac3a62adb968b9f",
+    "transformation": "Exact local demo path prefixes replaced with <demo>; all outcomes retained."
+  },
+  {
+    "artifact": "evidence/host-observations/b01-before-repair.txt",
+    "exported_sha256": "3479870cb103886558aa079f6820689e986649cb82b26314d9b19129e2d03efe",
+    "original_sha256": "d5cf7df0b785baa7f8a7aaaa57bf18d99178821647fa2819d6f16d3988b81976",
+    "transformation": "Exact local demo path prefixes replaced with <demo>; all outcomes retained."
+  },
+  {
+    "artifact": "evidence/host-observations/b01-after-repair.txt",
+    "exported_sha256": "236b23cb11351608901b3e1f537c39e89f37ec2bc8f06c39f794c81a6c4285e8",
+    "original_sha256": "236b23cb11351608901b3e1f537c39e89f37ec2bc8f06c39f794c81a6c4285e8",
+    "transformation": "Exact local demo path prefixes replaced with <demo>; all outcomes retained."
+  },
+  {
+    "artifact": "evidence/host-observations/b01-reproduction-passing.txt",
+    "exported_sha256": "4ebf0c6594be13eaa3fbd7fa508bb28e4c1d416a76e2278403a1ea5191aaabba",
+    "original_sha256": "4ebf0c6594be13eaa3fbd7fa508bb28e4c1d416a76e2278403a1ea5191aaabba",
+    "transformation": "Exact local demo path prefixes replaced with <demo>; all outcomes retained."
+  },
+  {
+    "artifact": "evidence/host-observations/b02-before-repair.txt",
+    "exported_sha256": "335eaeea91158f21be7889fca8671094fe792c36f85ce857ac756afc139f3c88",
+    "original_sha256": "5a2b6f3cabe98f23966d6734b134985288c04e435fa6c2dc01dfa0dcfd32be85",
+    "transformation": "Exact local demo path prefixes replaced with <demo>; all outcomes retained."
+  },
+  {
+    "artifact": "evidence/host-observations/b02-after-repair.txt",
+    "exported_sha256": "4440d7d8d36a05bebd6b67891a117c7e820c2f56ff190895e5ad5ba447557ca9",
+    "original_sha256": "4440d7d8d36a05bebd6b67891a117c7e820c2f56ff190895e5ad5ba447557ca9",
+    "transformation": "Exact local demo path prefixes replaced with <demo>; all outcomes retained."
+  },
+  {
+    "artifact": "evidence/host-observations/b02-reproduction-passing.txt",
+    "exported_sha256": "4ebf0c6594be13eaa3fbd7fa508bb28e4c1d416a76e2278403a1ea5191aaabba",
+    "original_sha256": "4ebf0c6594be13eaa3fbd7fa508bb28e4c1d416a76e2278403a1ea5191aaabba",
+    "transformation": "Exact local demo path prefixes replaced with <demo>; all outcomes retained."
+  }
+]

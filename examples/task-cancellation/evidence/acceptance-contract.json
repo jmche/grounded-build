@@ -1,0 +1,240 @@
+{
+  "criteria": [
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "batch": "B01",
+      "evidence_kind": "COMMAND",
+      "expected_exit": 0,
+      "expected_result": "The complete discovered test suite reports success, including the baseline tests and the deterministic API-level cancellation cases declared for B01.",
+      "id": "B01-C01",
+      "observation": "Run the discovered unittest suite at the reviewed B01 SHA.",
+      "rationale": "This is the batch's declared regression and acceptance command.",
+      "scope": [
+        "tests/test_existing_behavior.py",
+        "tests/test_cancellation.py",
+        "task_service.py",
+        "task_api.py"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "reproduce_cancel.py"
+      ],
+      "batch": "B01",
+      "evidence_kind": "COMMAND",
+      "expected_exit": 0,
+      "expected_result": "The reproducer completes without assertion failure and reports an accepted cancellation whose post-worker snapshot has status cancelled and result None.",
+      "id": "B01-C02",
+      "observation": "Run the unchanged cancellation reproducer at the reviewed B01 SHA.",
+      "rationale": "The reproducer exercises the reported late-publication defect through TaskAPI.",
+      "scope": [
+        "reproduce_cancel.py",
+        "task_api.py",
+        "task_service.py"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B01",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "For an eligible queued or running task, TaskService.cancel changes status to cancelled and sets that task's existing cancel_event within the same existing lock before returning True.",
+      "id": "B01-C03",
+      "observation": "The accepted-cancellation transaction in TaskService.cancel at the reviewed B01 SHA.",
+      "rationale": "TaskService.cancel is the earliest responsible production boundary for cooperative signalling and the serialized cancellation decision.",
+      "scope": [
+        "task_service.py:TaskService.cancel"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B01",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "Each success or Exception publication branch changes terminal fields only when status is still running, with the status check and publication performed under the existing lock; a prior cancellation therefore leaves status cancelled and result and error None.",
+      "id": "B01-C04",
+      "observation": "The two terminal publication branches in TaskService._run at the reviewed B01 SHA.",
+      "rationale": "The worker writers are the earliest production boundary capable of overwriting an accepted cancellation.",
+      "scope": [
+        "task_service.py:TaskService._run"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B01",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "Every behavior-driving create, start, cancel, and get operation in the new cancellation tests uses TaskAPI; direct service use is limited to bounded join-based worker observation and cleanup.",
+      "id": "B01-C05",
+      "observation": "The production-boundary calls made by tests/test_cancellation.py at the reviewed B01 SHA.",
+      "rationale": "The request requires consequential API-level coverage rather than testing only internal methods.",
+      "scope": [
+        "tests/test_cancellation.py",
+        "task_api.py"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B01",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "Running-task tests coordinate with Events and finite waits, register cleanup for each started worker, release blocking workers during cleanup, use finite joins, assert recorded worker wait outcomes in the main test thread, and contain no sleep-based scheduling assertion.",
+      "id": "B01-C06",
+      "observation": "Worker coordination and cleanup in tests/test_cancellation.py at the reviewed B01 SHA.",
+      "rationale": "These properties make cancellation ordering tests deterministic and prevent leaked worker threads after assertion failures.",
+      "scope": [
+        "tests/test_cancellation.py"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B01",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "The B01 diff from its parent changes only task_service.py and the new tests/test_cancellation.py.",
+      "id": "B01-C07",
+      "observation": "The path set in the exact reviewed B01 diff.",
+      "rationale": "The frozen manifest limits B01 to two paths and excludes unrelated changes.",
+      "scope": [
+        "task_service.py",
+        "tests/test_cancellation.py"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "batch": "B02",
+      "evidence_kind": "COMMAND",
+      "expected_exit": 0,
+      "expected_result": "The complete discovered test suite reports success, including all B01 cases, nested-result isolation through get and cancel responses, and explicit deepcopy-failure propagation.",
+      "id": "B02-C01",
+      "observation": "Run the discovered unittest suite at the reviewed B02 SHA.",
+      "rationale": "This is the batch's declared regression and acceptance command.",
+      "scope": [
+        "tests/test_existing_behavior.py",
+        "tests/test_cancellation.py",
+        "task_service.py",
+        "task_api.py"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [
+        "/usr/bin/python3",
+        "reproduce_cancel.py"
+      ],
+      "batch": "B02",
+      "evidence_kind": "COMMAND",
+      "expected_exit": 0,
+      "expected_result": "The unchanged reproducer completes without assertion failure and reports cancellation as final with no published result after worker exit.",
+      "id": "B02-C02",
+      "observation": "Run the unchanged cancellation reproducer at the reviewed B02 SHA.",
+      "rationale": "B02 must preserve the accepted B01 cancellation repair.",
+      "scope": [
+        "reproduce_cancel.py",
+        "task_api.py",
+        "task_service.py"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B02",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "TaskService.snapshot captures the task fields consistently under _lock, releases that lock, and applies copy.deepcopy to the captured result before returning the snapshot.",
+      "id": "B02-C03",
+      "observation": "The snapshot construction boundary in TaskService.snapshot at the reviewed B02 SHA.",
+      "rationale": "This is the earliest production boundary that can prevent ordinary nested mutable results from aliasing authoritative state without running user copy hooks under the service lock.",
+      "scope": [
+        "task_service.py:TaskService.snapshot"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B02",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "A copy.deepcopy exception raised by a result propagates from TaskAPI.get and from the snapshot phase of TaskAPI.cancel; no fallback returns the original aliased result.",
+      "id": "B02-C04",
+      "observation": "Snapshot error handling reachable through TaskAPI at the reviewed B02 SHA.",
+      "rationale": "The plan explicitly selects propagation as the compatibility behavior for intrinsically uncopyable results.",
+      "scope": [
+        "task_service.py:TaskService.snapshot",
+        "task_api.py:TaskAPI.get",
+        "task_api.py:TaskAPI.cancel"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B02",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "The README describes running cancellation as repaired, states that the unchanged reproducer now passes, and retains the cooperative-thread, deliberately seeded defect, and no-company-material disclosures.",
+      "id": "B02-C05",
+      "observation": "The cancellation and demonstration statements in README.md at the reviewed B02 SHA.",
+      "rationale": "The declared documentation change must replace obsolete present-tense baseline claims without overstating thread cancellation or provenance.",
+      "scope": [
+        "README.md"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B02",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "The README states that snapshot results use standard-library deepcopy semantics, that result identity across snapshots is not preserved, and that copy failures propagate rather than returning an aliased value.",
+      "id": "B02-C06",
+      "observation": "The snapshot compatibility description in README.md at the reviewed B02 SHA.",
+      "rationale": "The plan requires the selected result-copy behavior and limitation to be visible to consumers.",
+      "scope": [
+        "README.md"
+      ],
+      "source": "DECLARED"
+    },
+    {
+      "argv": [],
+      "batch": "B02",
+      "evidence_kind": "REPOSITORY_ASSERTION",
+      "expected_exit": 0,
+      "expected_result": "The B02 diff from its B01 parent changes only task_service.py, tests/test_cancellation.py, and README.md.",
+      "id": "B02-C07",
+      "observation": "The path set in the exact reviewed B02 diff.",
+      "rationale": "The frozen manifest limits B02 to three paths and excludes unrelated changes.",
+      "scope": [
+        "task_service.py",
+        "tests/test_cancellation.py",
+        "README.md"
+      ],
+      "source": "DECLARED"
+    }
+  ],
+  "digest": "abea5823c78bfb1a7393db65cca73fca361436ec01fd0fa16bfcc12eceb4ed26",
+  "status": "ADJUDICATED"
+}

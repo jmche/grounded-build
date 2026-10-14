@@ -1,0 +1,506 @@
+{
+  "baseline_sha": "3179f2e596f580c4b90ddabccdab22783d9dadc0",
+  "evidence": [
+    {
+      "claim": "_run fetches the task under lock, runs operation(task.cancel_event) unlocked, then unconditionally writes status failed/error or completed/result under lock with no check of current status.",
+      "content_sha256": "3aa26458a0f13b54a300b46a59077cfd07e819b0dc70ca7b68dfadbc2568b008",
+      "id": "B-E1",
+      "locator": "task_service.py:39-51",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "cancel under lock raises KeyError for unknown ids, returns False unless status is queued or running, otherwise sets status cancelled and returns True; it never calls task.cancel_event.set().",
+      "content_sha256": "3aa26458a0f13b54a300b46a59077cfd07e819b0dc70ca7b68dfadbc2568b008",
+      "id": "B-E2",
+      "locator": "task_service.py:53-59",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "start only transitions queued to running under the lock and creates a daemon Thread; a task cancelled while queued makes start return False, so its operation never runs.",
+      "content_sha256": "3aa26458a0f13b54a300b46a59077cfd07e819b0dc70ca7b68dfadbc2568b008",
+      "id": "B-E3",
+      "locator": "task_service.py:29-37",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "snapshot builds a new dict under lock but places task.result by reference (no copy of the result object).",
+      "content_sha256": "3aa26458a0f13b54a300b46a59077cfd07e819b0dc70ca7b68dfadbc2568b008",
+      "id": "B-E4",
+      "locator": "task_service.py:61-64",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "All task state is guarded by one non-reentrant threading.Lock; Task holds operation, status, result, error, a per-task cancel_event and thread. join(task_id, timeout=2) raises TimeoutError if the thread is still alive.",
+      "content_sha256": "3aa26458a0f13b54a300b46a59077cfd07e819b0dc70ca7b68dfadbc2568b008",
+      "id": "B-E5",
+      "locator": "task_service.py:1-20",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "TaskAPI is a thin delegate: create, start, cancel, get. cancel returns accepted plus task by calling service.cancel and then service.snapshot as two separate lock acquisitions. TaskAPI has no join method.",
+      "content_sha256": "ae9f2901741b7b959e1b48e61816297d7856f78352d6eea0205ddea0e3875ae7",
+      "id": "B-E6",
+      "locator": "task_api.py:1-18",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "The reproduction uses a worker that ignores cancel_event (blocks on a release Event, returns 'late result'), cancels via TaskAPI.cancel while running, joins via service.join, then asserts final status is cancelled and result is None.",
+      "content_sha256": "afe594aa4d72edf337bca6c53e6d6ec0c630a865741c4c81c023edd88ef9d30f",
+      "id": "B-E7",
+      "locator": "reproduce_cancel.py:7-32",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "The existing 5 tests cover success, failure, queued cancellation (including repeat false), unknown ids on get/start/cancel, and top-level snapshot dict detachment. None covers running cancellation, event signalling, late return, late exception or completion/cancel ordering. Tests call service.join directly.",
+      "content_sha256": "71a38a69873dc235ba5ac02ef3aa8428980c6d6b707a480a1f65cafe816eb5f5",
+      "id": "B-E8",
+      "locator": "tests/test_existing_behavior.py:1-49",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "The README 'Seeded baseline' section states that running cancellation changes visible status only, the worker is not signalled, late completion can overwrite cancelled, and reproduce_cancel.py is expected to fail on the baseline.",
+      "content_sha256": "5945cb3292588203901a6e06d1a58bb866abf0d9088b2fcc718697142b9fa6dc",
+      "id": "B-E9",
+      "locator": "README.md:12-28",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "AGENTS.md requires stdlib only, an in-memory synchronous API, cooperative cancellation, preserved signatures, bounded synchronization, worker cleanup, cancellation exercised through TaskAPI, and the two acceptance commands. .scratch/ is reserved for temporary work.",
+      "content_sha256": "2e0b405c71a6738ed7c5ee5291bc900cf2c08cadc48da60d2afed2eef26b755c",
+      "id": "B-E10",
+      "locator": "AGENTS.md:1-15",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "Ran in the frozen worktree with PYTHONDONTWRITEBYTECODE=1 on Python 3.12.3: exit 1. Printed accepted True with after_worker_exit status 'completed', result 'late result'; AssertionError at reproduce_cancel.py line 31 'Late worker completion replaced accepted cancellation'. Output digest not computed.",
+      "content_sha256": "",
+      "id": "B-E11",
+      "locator": "python3 reproduce_cancel.py",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "COMMAND",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "Ran in the frozen worktree: 5 tests, all ok, exit 0. Output digest not computed.",
+      "content_sha256": "",
+      "id": "B-E12",
+      "locator": "python3 -m unittest discover -s tests -v",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "COMMAND",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "Ad hoc stdin probe via TaskAPI (nothing written): a running worker cancelled with accepted True saw cancel_event.is_set() False, then raised RuntimeError; the final snapshot was status 'failed', error 'RuntimeError'. A second cancel returned accepted False. Output digest not computed.",
+      "content_sha256": "",
+      "id": "B-E13",
+      "locator": "python3 - (inline probe P1: cancel a running worker, release it, worker raises RuntimeError)",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "COMMAND",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "Same probe: for a completed task whose result is {'k':[1]}, appending through api.get(t)['result'] changed the stored result to {'k':[1,2]}; the object is identical across snapshots. Output digest not computed.",
+      "content_sha256": "",
+      "id": "B-E14",
+      "locator": "python3 - (inline probe P2: mutate a mutable result through a snapshot)",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "COMMAND",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "Same probe: a worker raising SystemExit (a BaseException, not caught by 'except Exception') leaves the task status 'running' permanently after the thread exits. Output digest not computed.",
+      "content_sha256": "",
+      "id": "B-E15",
+      "locator": "python3 - (inline probe P3: worker raises SystemExit)",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "OUT_OF_SCOPE-001",
+      "source_type": "COMMAND",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": "Same probe: inspect.signature gives TaskAPI create(self, operation), start(self, task_id), cancel(self, task_id), get(self, task_id); TaskService submit(self, operation), start/cancel/snapshot(self, task_id), join(self, task_id, timeout=2). After a queued cancel the task's event is unset and thread is None. Output digest not computed.",
+      "content_sha256": "",
+      "id": "B-E16",
+      "locator": "python3 - (inline probe P4: signatures and queued-cancel state)",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "COMMAND",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    },
+    {
+      "claim": ".gitignore ignores __pycache__/ and .scratch/. The repository tracks exactly 8 files; there is no CI config, packaging or other consumer of TaskService beyond task_api.py, reproduce_cancel.py and the tests.",
+      "content_sha256": "9010c2fe0bd4c8ed4dbf01b9b7d1d7def7bd9bdb613892167a25a8f0c8e773d4",
+      "id": "B-E17",
+      "locator": ".gitignore:1-2",
+      "retrieved_at": "2026-10-13T08:53:44Z",
+      "scope_id": "TARGET-001",
+      "source_type": "REPOSITORY",
+      "status": "VERIFIED",
+      "version_or_commit": "3179f2e596f580c4b90ddabccdab22783d9dadc0"
+    }
+  ],
+  "findings": [
+    {
+      "affected_surfaces": [
+        "task_service.py TaskService._run",
+        "TaskAPI.get and TaskAPI.cancel snapshots",
+        "reproduce_cancel.py assertions at lines 31-32"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Status check in _run (publish only if still 'running'): smallest change, reuses the existing lock.",
+        "Shared private finalize/transition helper for cancel and _run: single decision point, slightly more code.",
+        "Filtering in snapshot instead: rejected as symptom handling; authoritative state would still be overwritten."
+      ],
+      "causal_chain": [
+        "Authority: request.md req 3-4 make accepted cancellation final and require one serialized decision.",
+        "TaskAPI.cancel -> TaskService.cancel sets status 'cancelled' under the lock (task_service.py:53-59).",
+        "The worker thread in _run later returns or raises and re-acquires the lock (task_service.py:44-51).",
+        "Earliest divergence: _run's terminal write is unconditional; it never checks that status is still 'running'.",
+        "Symptom: snapshot shows completed/'late result' (repro exit 1) or failed/RuntimeError (probe P1)."
+      ],
+      "evidence_ids": [
+        "B-E1",
+        "B-E2",
+        "B-E7",
+        "B-E11",
+        "B-E13"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "B-F1",
+      "lane": "MUST_RESOLVE",
+      "problem": "A worker's late return or late exception overwrites an accepted cancellation and publishes result/error (violates req 3 and 4).",
+      "recommended_solution": "Make the terminal transition in _run conditional on the task state under the same lock that cancel uses, so whichever takes the lock first decides and the loser publishes nothing. Mechanism is the planner's choice.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P1",
+      "urgency": "U1",
+      "verification": [
+        "python3 reproduce_cancel.py exits 0 after the fix (exits 1 at baseline).",
+        "API-level tests: non-cooperative late return and late exception both leave status cancelled, result None.",
+        "Completion-wins test: join, then cancel returns accepted False and the completed result is unchanged."
+      ]
+    },
+    {
+      "affected_surfaces": [
+        "task_service.py TaskService.cancel",
+        "Cooperative worker operations receiving the Event"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Set inside the lock: atomic with the status change; simplest.",
+        "Set after releasing the lock: leaves a brief window where status is cancelled but the event is unset; no benefit here.",
+        "Whether to also set it for queued cancellation is unobservable (the operation never runs); either is acceptable."
+      ],
+      "causal_chain": [
+        "Authority: request.md req 2.",
+        "_run passes task.cancel_event to the operation (task_service.py:43).",
+        "TaskService.cancel mutates only task.status and never calls cancel_event.set() (task_service.py:53-59).",
+        "Probe P1: the worker read is_set() False after accepted True."
+      ],
+      "evidence_ids": [
+        "B-E2",
+        "B-E1",
+        "B-E13",
+        "B-E9"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "B-F2",
+      "lane": "MUST_RESOLVE",
+      "problem": "Accepted cancellation of a running task never signals the Event handed to the worker (violates req 2), so a cooperative worker cannot observe cancellation.",
+      "recommended_solution": "Set the task's cancel_event as part of the accepted-cancellation decision in TaskService.cancel. Event.set runs no user code, so doing it under the lock is safe.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P1",
+      "urgency": "U1",
+      "verification": [
+        "API-level test: worker signals 'entered', then blocks on cancel_event.wait(bounded); after TaskAPI.cancel it wakes, the thread joins within the bound, and status stays cancelled.",
+        "Consequential check: the test fails if the set() call is removed."
+      ]
+    },
+    {
+      "affected_surfaces": [
+        "tests/ (new test module or additions)",
+        "Worker thread cleanup in tests via service.join(timeout) or bounded Thread.join"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Sequenced orderings (no production seam): deterministic and no API change, but does not exercise true simultaneous contention.",
+        "Private test hook in _run: can pin the interleaving, but adds production surface the request does not ask for.",
+        "TaskAPI has no join; tests must use service.join (as existing tests do) or keep their own thread-exit Events."
+      ],
+      "causal_chain": [
+        "Authority: request.md acceptance section lists the required deterministic API-level checks.",
+        "tests/test_existing_behavior.py holds only 5 tests: success, failure, queued cancel, unknown id, dict detachment.",
+        "The baseline defect therefore passes the suite (5 ok) while the repro fails."
+      ],
+      "evidence_ids": [
+        "B-E8",
+        "B-E6",
+        "B-E5",
+        "B-E10",
+        "B-E12"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "B-F3",
+      "lane": "MUST_RESOLVE",
+      "problem": "Required acceptance coverage is absent: no test exercises running cancellation, the cooperative signal, late return, late exception, or either completion/cancellation ordering. The service has no seam between the operation returning and the terminal lock acquisition.",
+      "recommended_solution": "Add event-coordinated unittest cases driven through TaskAPI covering the request's list. Use entered/release Events and bounded joins, and release workers in finally/addCleanup. The two orderings can be sequenced deterministically without a new seam: completion-first is join then cancel; cancel-first is cancel while the worker is blocked, then release.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P2",
+      "urgency": "U2",
+      "verification": [
+        "python3 -m unittest discover -s tests -v passes with the existing 5 tests plus the new ones.",
+        "No time.sleep in tests; every wait/join has a timeout and is asserted.",
+        "New running-cancel tests fail against baseline task_service.py."
+      ]
+    },
+    {
+      "affected_surfaces": [
+        "task_service.py TaskService.snapshot",
+        "TaskAPI.get and TaskAPI.cancel return values"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Leave as is: zero risk to ordinary completion; mutable results stay aliased.",
+        "copy.deepcopy(result) in snapshot: closes aliasing, but can raise for uncopyable results (locks, generators), copies under the lock, and changes result identity.",
+        "Deepcopy once at publish time plus per snapshot: strongest isolation, highest cost and the same failure mode."
+      ],
+      "causal_chain": [
+        "snapshot returns {'result': task.result} by reference (task_service.py:64).",
+        "Probe P2: appending via a snapshot changed the result seen by later snapshots.",
+        "The existing test only checks top-level key reassignment, so it passes."
+      ],
+      "evidence_ids": [
+        "B-E4",
+        "B-E14",
+        "B-E8"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "B-F4",
+      "lane": "INVESTIGATE_IF_BUDGET",
+      "problem": "The snapshot dict is fresh, but its 'result' value is the stored object itself, so a caller can mutate a stored mutable result through a snapshot. Whether req 6 ('snapshots are copies') requires more than the top-level dict is an interpretation question.",
+      "recommended_solution": "Planner decides whether req 6 is already met by the top-level copy or needs a deep copy of result; record the interpretation explicitly either way.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P2",
+      "urgency": "U2",
+      "verification": [
+        "If changed: test that mutating a snapshot's mutable result does not alter a later snapshot; existing test_success equality still passes.",
+        "If unchanged: the plan states that req 6 is satisfied by top-level dict detachment (existing test)."
+      ]
+    },
+    {
+      "affected_surfaces": [
+        "task_service.py start, cancel, snapshot",
+        "task_api.py"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Switching to RLock is unnecessary for the required behavior."
+      ],
+      "causal_chain": [
+        "start gates on status == 'queued' under the lock, so a cancelled queued task never spawns a thread.",
+        "cancel returns False for any status outside queued/running.",
+        "self._tasks[task_id] raises KeyError in start, cancel, snapshot and join."
+      ],
+      "evidence_ids": [
+        "B-E3",
+        "B-E2",
+        "B-E8",
+        "B-E12",
+        "B-E16"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "B-F5",
+      "lane": "RECORD_ONLY",
+      "problem": "Behaviors required by req 1 and 5 already hold at baseline and must be preserved: queued cancel prevents execution, repeated cancel is false, unknown ids raise KeyError, success and failure are observable. Public signatures are as listed in B-E16.",
+      "recommended_solution": "No change; treat these as regression guards. Keep the non-reentrant Lock in mind: do not call snapshot or other locking methods while holding the lock.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P2",
+      "urgency": "U3",
+      "verification": [
+        "The existing 5 tests remain green unchanged."
+      ]
+    },
+    {
+      "affected_surfaces": [
+        "README.md"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Update: docs match behavior; small extra diff.",
+        "Leave: strict minimal diff, but the README contradicts the repaired behavior."
+      ],
+      "causal_chain": [
+        "README.md lines 14-16 and 24 document the baseline behavior.",
+        "The fix inverts those statements."
+      ],
+      "evidence_ids": [
+        "B-E9"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "B-F6",
+      "lane": "RECORD_ONLY",
+      "problem": "The README 'Seeded baseline' section describes the defect in the present tense and says the reproduction is expected to fail; it becomes inaccurate once the fix lands.",
+      "recommended_solution": "Planner decides whether a minimal README wording update belongs in the implementation batch or stays untouched as a historical baseline description.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P2",
+      "urgency": "U3",
+      "verification": [
+        "If updated: README statements match the post-fix output of both acceptance commands."
+      ]
+    },
+    {
+      "affected_surfaces": [
+        "task_service.py TaskService._run"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Fixing it would be an unrequested behavior change (PROPOSED_EXTENSION needing a user decision)."
+      ],
+      "causal_chain": [
+        "_run catches only Exception (task_service.py:44).",
+        "SystemExit ends the thread with no terminal write (probe P3)."
+      ],
+      "evidence_ids": [
+        "B-E15",
+        "B-E1"
+      ],
+      "evidence_status": "VERIFIED",
+      "id": "B-F7",
+      "lane": "RECORD_ONLY",
+      "problem": "A worker that raises a BaseException which is not an Exception (e.g. SystemExit) leaves the task 'running' forever. The request does not cover this; it must not enter the plan without authorization.",
+      "recommended_solution": "Record only; do not change it under TARGET-001.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "OUT_OF_SCOPE-001",
+      "severity": "P2",
+      "urgency": "U3",
+      "verification": [
+        "None planned."
+      ]
+    }
+  ],
+  "provider": "claude",
+  "scope_digest": "b9a41ed8acc2bedf3ffafa4f2ce835f8af07ca9fef4a8804b1093c6780840a1f",
+  "slot": "B",
+  "summary": "Slot B, baseline 3179f2e. All 8 tracked files read; both acceptance commands and one ad hoc probe were run in the frozen worktree (Python 3.12.3, no bytecode written, worktree still clean). COMMAND receipts carry no digest because I did not hash command output.\n\nThe seeded defect is reproduced and its root cause is proven in `task_service.py`, a deterministic producer:\n- **Late publish (req 3, 4):** `_run` (lines 39-51) writes `failed` or `completed` under the lock without checking the current status. `python3 reproduce_cancel.py` exits 1 with the final snapshot `completed` / `'late result'` after an accepted cancellation. The probe showed a late exception likewise turns `cancelled` into `failed` / `RuntimeError`.\n- **No signal (req 2):** `cancel` (lines 53-59) only sets the status and never sets `task.cancel_event`. The probe's worker saw `is_set() == False` after an accepted cancellation.\n\nAlready satisfied at baseline and to be preserved: queued cancellation prevents execution, repeated cancellation returns false, unknown ids raise `KeyError`, ordinary success and failure are observable, and the snapshot dict is detached. The 5 existing tests pass (exit 0).\n\nGaps and constraints for the planner:\n- **Snapshot aliasing (req 6):** the snapshot dict is new, but `result` is the same object, so a caller can mutate a stored mutable result through it. Whether req 6 covers this is an interpretation left to the planner.\n- **Missing tests:** nothing in `tests/` covers running-task cancellation, late return, late exception, or either completion/cancellation ordering.\n- **Lock:** `threading.Lock` is non-reentrant, and `TaskAPI.cancel` takes it twice (cancel, then snapshot).\n- **Test seam:** there is no hook between the operation returning and `_run` re-acquiring the lock.\n\nRecorded only: the README \"Seeded baseline\" section will go stale after the fix, and a worker raising a `BaseException` such as `SystemExit` leaves the task `running` forever (out of scope). No USER-owned blockers; four PLANNER-owned questions, all non-blocking.",
+  "unresolved_questions": [
+    {
+      "blocking": false,
+      "decision_owner": "PLANNER",
+      "evidence_ids": [
+        "B-E4",
+        "B-E14",
+        "B-E8"
+      ],
+      "id": "B-Q1",
+      "options": [
+        "Keep top-level copy and state the interpretation",
+        "Deep copy result in snapshot",
+        "Deep copy at publish and at snapshot"
+      ],
+      "question": "Does req 6 require isolating the result object (deep copy) or is the existing top-level snapshot dict copy sufficient?",
+      "question_kind": "DECISION_REQUIRED",
+      "rationale": "Baseline returns a new dict but aliases result (B-E4, B-E14). Deepcopy can raise on uncopyable results and changes identity semantics of ordinary completion.",
+      "scope_id": "TARGET-001"
+    },
+    {
+      "blocking": false,
+      "decision_owner": "PLANNER",
+      "evidence_ids": [
+        "B-E1",
+        "B-E6",
+        "B-E8"
+      ],
+      "id": "B-Q2",
+      "options": [
+        "Sequence through TaskAPI plus service.join only",
+        "Add a private test-only hook in TaskService"
+      ],
+      "question": "How should the two completion/cancellation orderings be made deterministic in tests: by sequencing through existing API calls only, or with a private seam in _run?",
+      "question_kind": "DECISION_REQUIRED",
+      "rationale": "There is no hook between the operation returning and the terminal lock acquisition (B-E1). Sequencing (join then cancel; cancel then release) is deterministic without touching production surface but does not exercise live contention.",
+      "scope_id": "TARGET-001"
+    },
+    {
+      "blocking": false,
+      "decision_owner": "PLANNER",
+      "evidence_ids": [
+        "B-E1",
+        "B-E13"
+      ],
+      "id": "B-Q3",
+      "options": [
+        "Suppress all late writes including error",
+        "Suppress status and result only"
+      ],
+      "question": "After accepted cancellation, should a late exception also leave error as None (not only status and result)?",
+      "question_kind": "DECISION_REQUIRED",
+      "rationale": "Req 3 names status and result explicitly. Baseline writes error on a late exception (B-E13). Suppressing all terminal writes is the natural reading, but the error field is not literally named.",
+      "scope_id": "TARGET-001"
+    },
+    {
+      "blocking": false,
+      "decision_owner": "PLANNER",
+      "evidence_ids": [
+        "B-E9"
+      ],
+      "id": "B-Q4",
+      "options": [
+        "Minimal README update in batch 2",
+        "Leave README unchanged"
+      ],
+      "question": "Should the README 'Seeded baseline' wording be updated in the implementation batch?",
+      "question_kind": "DECISION_REQUIRED",
+      "rationale": "The text becomes inaccurate after the fix (B-E9); the request forbids unrelated refactors but does not address docs.",
+      "scope_id": "TARGET-001"
+    }
+  ]
+}

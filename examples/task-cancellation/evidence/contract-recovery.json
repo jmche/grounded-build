@@ -1,0 +1,32 @@
+{
+  "approved_change": "Only four Python executable bindings changed from python3 to /usr/bin/python3.",
+  "criterion_semantics_retained": true,
+  "rejected_deliveries": [
+    {
+      "completed_at": "2026-10-13T09:28:42.098823+00:00",
+      "error": "executable 'python3' is a bare interpreter that the verification sandbox resolves to a system interpreter without the project environment. Use `.venv/bin/python ...` (resolved from the original project and mounted read-only) or an explicit absolute runtime path.",
+      "invocation_id": "contract-001",
+      "reviewer": "claude",
+      "started_at": "2026-10-13T09:26:49.100877+00:00",
+      "status": "CONTRACT_ERROR"
+    },
+    {
+      "completed_at": "2026-10-13T09:32:28.683672+00:00",
+      "error": "executable 'python3' is a bare interpreter that the verification sandbox resolves to a system interpreter without the project environment. Use `.venv/bin/python ...` (resolved from the original project and mounted read-only) or an explicit absolute runtime path.",
+      "invocation_id": "contract-002",
+      "reviewer": "claude",
+      "started_at": "2026-10-13T09:30:34.822286+00:00",
+      "status": "CONTRACT_ERROR"
+    },
+    {
+      "completed_at": "2026-10-13T09:36:15.486735+00:00",
+      "error": "executable 'python3' is a bare interpreter that the verification sandbox resolves to a system interpreter without the project environment. Use `.venv/bin/python ...` (resolved from the original project and mounted read-only) or an explicit absolute runtime path.",
+      "invocation_id": "contract-003",
+      "reviewer": "codex",
+      "started_at": "2026-10-13T09:34:03.648081+00:00",
+      "status": "CONTRACT_ERROR"
+    }
+  ],
+  "remaining_issue": "The contract producer prompt omission was not repaired in this demonstration.",
+  "result": "ADJUDICATED"
+}

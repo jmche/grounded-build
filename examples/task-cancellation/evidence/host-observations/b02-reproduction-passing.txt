@@ -1,0 +1,1 @@
+{'accepted': True, 'after_worker_exit': {'id': '1', 'status': 'cancelled', 'result': None, 'error': None}}

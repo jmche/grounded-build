@@ -1,0 +1,26 @@
+{
+  "implementation_code_review_seconds_sum": 183.26299999999998,
+  "implementation_rejected_claude_deliveries": [
+    {
+      "cli_reported_cost_usd": 0.619332,
+      "invocation": "invocation_001"
+    },
+    {
+      "cli_reported_cost_usd": 0.5268816000000001,
+      "invocation": "invocation_002"
+    }
+  ],
+  "notes": [
+    "Planning wall_seconds sums invocation durations; concurrent calls overlap.",
+    "CLI-reported cost is partial usage metadata, not a complete measured bill.",
+    "Codex review metadata reports duration but does not report monetary cost.",
+    "No end-to-end speed, token saving, or defect-reduction benchmark is claimed."
+  ],
+  "planning_reported_usage": {
+    "reported_cost_usd": 1.9730105999999998,
+    "reported_turns": 18,
+    "scratch_bytes_removed": 261792654,
+    "wall_seconds": 842.819
+  },
+  "total_task_cost_usd": null
+}

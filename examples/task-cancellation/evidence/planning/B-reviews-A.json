@@ -1,0 +1,213 @@
+{
+  "accepted_finding_ids": [
+    "F-17d03e1bcd215b8d",
+    "F-253f92adf8817464",
+    "F-39dc2ca20534c4c3",
+    "F-446ca2822216f07d",
+    "F-520de2f06e762701",
+    "F-5e617e3e05496baf",
+    "F-8815ec4830214403",
+    "F-b34f64665c1a764f",
+    "F-b69fcff8209085cf",
+    "F-c7bdf14bdd9594a0"
+  ],
+  "baseline_sha": "3179f2e596f580c4b90ddabccdab22783d9dadc0",
+  "finding_aliases": [
+    {
+      "alias_finding_ids": [
+        "F-b69fcff8209085cf"
+      ],
+      "canonical_finding_id": "F-8815ec4830214403",
+      "evidence_ids": [
+        "A-E1",
+        "B-E1",
+        "A-E6",
+        "B-E11"
+      ],
+      "rationale": "Both name the same defect and repair: _run at task_service.py:44-51 publishes failed/completed under the lock without checking status, overwriting accepted cancellation; fix is a status guard in both branches."
+    },
+    {
+      "alias_finding_ids": [
+        "F-446ca2822216f07d"
+      ],
+      "canonical_finding_id": "F-b34f64665c1a764f",
+      "evidence_ids": [
+        "A-E1",
+        "A-E2",
+        "B-E2",
+        "B-E13"
+      ],
+      "rationale": "Both name the same defect and repair: TaskService.cancel at task_service.py:53-59 never sets task.cancel_event; fix is to set it under the lock on acceptance."
+    },
+    {
+      "alias_finding_ids": [
+        "F-c7bdf14bdd9594a0"
+      ],
+      "canonical_finding_id": "F-17d03e1bcd215b8d",
+      "evidence_ids": [
+        "A-E3",
+        "A-E4",
+        "B-E8",
+        "B-E7"
+      ],
+      "rationale": "Both name the same gap: the 5 existing tests and the reproducer do not cover cooperative signalling, late exception or the two orderings required by request.md acceptance; fix is event-coordinated TaskAPI-level tests."
+    }
+  ],
+  "findings": [
+    {
+      "claim": "Draft A narrows requirement 6 to 'snapshot dictionary mutation' and plans no result isolation, though a caller can mutate a stored mutable result through a snapshot at baseline. It records no interpretation and does not disposition F-520de2f06e762701.",
+      "evidence": "request.md:22; task_service.py:64 returns task.result by reference; B-E4, B-E14; target_plan.md 'Decidable completion observations'.",
+      "id": "B-R1",
+      "required_change": "Add snapshot result isolation with a failing-first test (integrated Batch 2), or state explicitly that top-level copy is the chosen reading and why.",
+      "severity": "P1"
+    },
+    {
+      "claim": "Draft A's Batch 1 acceptance cannot detect a missing cancel_event.set(): the reproducer's worker ignores the event and the 5 baseline tests do not cover running cancellation.",
+      "evidence": "reproduce_cancel.py:13-17; tests/test_existing_behavior.py; B-E7, B-E8.",
+      "id": "B-R2",
+      "required_change": "Put the cancellation tests in the same batch as the fix and run them once against the unmodified service to show they fail.",
+      "severity": "P2"
+    },
+    {
+      "claim": "Draft A's stop rule reruns only the failed command after a targeted fix, so a fix that breaks the other command goes unseen in that batch.",
+      "evidence": "target_plan.md Batch 1 and Batch 2 'Finite batch acceptance'.",
+      "id": "B-R3",
+      "required_change": "After any fix, rerun both acceptance commands; keep a fixed attempt cap.",
+      "severity": "P2"
+    },
+    {
+      "claim": "'Without live worker threads' and 'no sleeps as scheduling assertions' have no decidable check in draft A.",
+      "evidence": "target_plan.md Batch 2 acceptance; task_service.py:66-72 join raises TimeoutError when alive (B-E5).",
+      "id": "B-R4",
+      "required_change": "Require service.join in cleanup for every started task (raises if alive) and a grep for 'sleep' under tests/ that prints nothing.",
+      "severity": "P2"
+    },
+    {
+      "claim": "Draft A's completion-wins ordering covers only success; a failed terminal state followed by cancel is not tested, and the cancel response snapshot is not asserted.",
+      "evidence": "target_plan.md Batch 2 step 4; request.md:18-19; task_api.py:15 (B-E6).",
+      "id": "B-R5",
+      "required_change": "Add failed-then-cancel and assert the snapshot inside the cancel response in both orderings.",
+      "severity": "P2"
+    },
+    {
+      "claim": "Draft A does not name the new test file or bound the diff, and does not disposition the README statements that become false after the fix.",
+      "evidence": "target_plan.md 'Files: tests under tests/'; README.md:14-16, 24 (B-E9).",
+      "id": "B-R6",
+      "required_change": "Name tests/test_cancellation.py, add a git status file-set check per batch, and decide the README wording explicitly.",
+      "severity": "P2"
+    },
+    {
+      "claim": "Draft A's factual claims RF-001 to RF-006 hold at baseline; no factual error found.",
+      "evidence": "Re-ran at 3179f2e: 5 tests OK; reproducer AssertionError at line 31; temp-copy probe of guard plus event set gives cancelled/None/None, exit 0. A-E1 to A-E6, B-E11, B-E12.",
+      "id": "B-R7",
+      "required_change": "None; retain A's root cause, repair boundary and stop-on-second-failure rule.",
+      "severity": "P2"
+    }
+  ],
+  "new_findings": [
+    {
+      "affected_surfaces": [
+        "tests/test_cancellation.py worker operations",
+        "reproduce_cancel.py worker pattern (unchanged, release is set in finally)"
+      ],
+      "alternatives_and_tradeoffs": [
+        "Record wait results and assert in the main thread: no production change; slightly more test code.",
+        "Keep raising in workers: simpler, but timeouts are swallowed once cancellation is accepted.",
+        "Expose discarded errors from the service: unrequested production surface; rejected."
+      ],
+      "causal_chain": [
+        "Authority: request.md acceptance requires deterministic, event-coordinated checks with bounded waits.",
+        "_run catches Exception from the operation (task_service.py:44).",
+        "The planned guard discards that exception when status is already cancelled.",
+        "A worker-side wait timeout raised as an exception after cancellation therefore leaves no observable trace.",
+        "The main thread sees cancelled/None/None, the same as the passing outcome."
+      ],
+      "evidence_ids": [
+        "B-E1",
+        "B-E7",
+        "B-E13"
+      ],
+      "evidence_status": "STRONGLY_INFERRED",
+      "id": "B-F8",
+      "lane": "MUST_RESOLVE",
+      "problem": "After the fix, any exception raised by a worker whose task was already cancelled is discarded. A test worker that signals a coordination timeout by raising (the reproduce_cancel.py:15-16 pattern) would then fail silently, so a test could pass without the intended interleaving having happened.",
+      "recommended_solution": "In new tests, workers never raise on a wait timeout. They append each wait result to a list captured by the test, and the main thread asserts those values after the bounded join. The late-exception test raises only after its recorded release wait succeeded.",
+      "root_cause_status": "PROVEN",
+      "scope_id": "TARGET-001",
+      "severity": "P2",
+      "urgency": "U2",
+      "verification": [
+        "Review each new worker: no raise on wait timeout; every wait result is asserted by the main thread.",
+        "python3 -m unittest discover -s tests -v exits 0."
+      ]
+    }
+  ],
+  "plan_markdown": "# Integrated plan (draft_02, slot B): TARGET-001 cancellation boundary\n\nBaseline `3179f2e596f580c4b90ddabccdab22783d9dadc0`. Scope: TARGET-001 only. Two batches. No implementation during planning.\n\n## Root cause (proven)\n- **Late publish**: `TaskService._run` (`task_service.py:44-51`) writes `failed`/`completed` under `_lock` without checking the current status, so it overwrites an accepted `cancelled`. [A-E1, B-E1, A-E6, B-E11]\n- **No signal**: `TaskService.cancel` (`task_service.py:53-59`) never calls `task.cancel_event.set()`. [B-E2, B-E13]\n- Cancel and publication already share one non-reentrant `Lock`, so the repair is a status check under that lock. No new authority, no thread termination. [B-E5]\n- Filtering in `snapshot` instead is rejected: stored state would still be overwritten.\n\n## Batch 1 (P1, STOP_THE_LINE): serialized decision, signal, regression tests\nFiles: `task_service.py`, new `tests/test_cancellation.py`. Depends on nothing.\n\n**Order of work**\n1. Run `python3 reproduce_cancel.py`; expect exit 1 with the line-31 assertion.\n2. Write `tests/test_cancellation.py` first. Run the suite against the unmodified service: the running-cancellation tests (cooperative, late return, late exception, cancellation-wins) must fail and the 5 existing tests must pass. This shows the assertions are consequential.\n3. Apply the code change.\n\n**Code**\n1. `cancel`: inside the existing `with self._lock`, after `task.status = \"cancelled\"`, call `task.cancel_event.set()`, then `return True`. This applies to queued and running alike. `Event.set` runs no user code, so it is safe under the lock. `KeyError`, eligibility set and return values are unchanged.\n2. `_run`: in both the `except Exception` and `else` branches, under the lock, publish only if `task.status == \"running\"`; otherwise write nothing. A cancelled task keeps `result is None` and `error is None`.\n3. No change to `submit`, `start`, `join`, `task_api.py`, signatures, the `Lock` type, or the `except Exception` breadth. Never call a locking method while holding `_lock`.\n\n**Tests** (all create/start/cancel/get through `TaskAPI`; `service.join` only for bounded cleanup)\nShared rules:\n- `entered`/`release` Events; every `wait` has a timeout.\n- A worker never raises on a wait timeout. It appends the wait result to a list and the main thread asserts it. After the fix, an exception raised by a cancelled worker is discarded, so a worker-side timeout would otherwise be invisible.\n- `release.set()` and `service.join(task_id)` run in `finally`/`addCleanup`. `join` raises `TimeoutError` if the thread is alive, which is the decidable \"no live worker\" check.\n- No `time.sleep`.\n\nCases:\n- `test_cooperative_cancellation`: worker sets `entered`, then `cancel_event.wait(2)` and records the result. Assert accepted, the response snapshot is `cancelled`, the worker saw the event set, final `cancelled`, `result is None`, `error is None`.\n- `test_noncooperative_late_return`: worker ignores the event and returns a value after `release`. Final `cancelled`, `result is None`.\n- `test_late_exception`: worker raises after `release`. Final `cancelled`, `error is None`, `result is None`.\n- `test_cancellation_wins`: cancel while blocked, release, join; state stays `cancelled`; a later cancel returns `accepted False`.\n- `test_completion_wins`: start, join, record the snapshot; cancel returns `accepted False`; the response snapshot and a later `get` equal the recorded one. Repeat for a failed task (`failed`, error name unchanged).\n- `test_repeated_cancellation`: second cancel of a running-then-cancelled task returns `accepted False`, both before and after worker exit.\n- `test_queued_cancellation_never_runs`: cancel queued, `start` returns `False`, operation never ran.\n- `test_unknown_ids`: `get`, `start`, `cancel` raise `KeyError`.\n\n**Acceptance (finite, decidable)**\n- `python3 -m unittest discover -s tests -v` exits 0: 5 existing tests plus the new ones, none skipped.\n- `python3 reproduce_cancel.py` exits 0 and prints `status: cancelled`, `result: None`.\n- `grep -rn \"sleep\" tests/` prints nothing.\n- `git status --short` shows only `task_service.py` and `tests/test_cancellation.py`.\n\n## Batch 2 (P2, MUST_RESOLVE): snapshot result isolation and README accuracy\nFiles: `task_service.py`, `tests/test_cancellation.py`, `README.md`. Depends on Batch 1 acceptance.\n\n1. `snapshot`: read the fields under the lock, release it, then return the dict with `copy.deepcopy(result)`. Copying outside the lock keeps a user `__deepcopy__` from running under it. Stdlib `copy` only. `result` is written once, so reading the reference under the lock is enough. [B-E4, B-E14]\n   - Known limit, stated not hidden: a result that cannot be deep-copied makes `get`/`cancel` raise the copy error; no silent fallback to the aliased object. Result equality is preserved; identity is not.\n2. `test_snapshot_result_is_detached`: complete a task returning `{\"k\": [1]}`, mutate through `api.get(...)[\"result\"]`, assert a later `api.get` still returns `{\"k\": [1]}`. Run it before the code change and expect it to fail.\n3. `README.md`: reword only the \"Seeded baseline\" statements (lines 14-16, 24) so they describe the baseline as past behavior and say the reproduction now passes. No other edits. [B-E9]\n\n**Acceptance**\n- Both commands exit 0, including the new snapshot test; `test_success` and `test_snapshot_dictionary_is_detached` still pass.\n- `git status --short` for this batch shows only the three files above.\n\n## Limits per batch\n- After any fix, rerun both acceptance commands, not only the one that failed.\n- At most 2 fix attempts after the first failing acceptance run; then stop and report the failing output unchanged.\n- No elapsed-time or token budget is required. Record CLI-reported use if available; otherwise mark cost unknown.\n\n## Preserved and not planned\n- Unchanged regression guards: queued cancel, repeated false, `KeyError`, success, failure, signatures. [B-E3, B-E8, B-E12, B-E16]\n- Orderings are sequenced (join then cancel; cancel then release). Live contention is not exercised, because no seam exists between operation return and lock acquisition and adding one is unrequested production surface. [B-E1, B-E6]\n- A worker raising a non-`Exception` `BaseException` still leaves `running` at baseline; recorded only, not changed. [B-E15]\n- Threads are never forcibly stopped; a non-cooperative worker runs to its end and is only denied publication.\n- Rollback only on request, by reverse patch to the baseline, keeping audit records.\n- No push, publication, dependencies, persistence, networking or retries.",
+  "plan_scope_ids": [
+    "TARGET-001"
+  ],
+  "provider": "claude",
+  "rejected_finding_ids": [],
+  "reviewer_slot": "B",
+  "round": 2,
+  "scope_digest": "b9a41ed8acc2bedf3ffafa4f2ce835f8af07ca9fef4a8804b1093c6780840a1f",
+  "slot": "B",
+  "summary": "Draft A's root cause and core repair are correct and re-verified at 3179f2e: the 5 baseline tests pass, reproduce_cancel.py fails at line 31, and a temp-copy probe of the status guard plus event set (outside the repo) makes the reproducer exit 0. Verdict is FAIL because draft A silently narrows requirement 6 to the top-level snapshot dict while the baseline still lets callers mutate a stored mutable result through a snapshot (B-E14), and it does not disposition that ledger finding. Other gaps are advisory: Batch 1 has no check for requirement 2, the rerun rule covers only the failed command, 'no live worker threads' and 'no sleeps' are not decidable as written, and the failed-then-cancel ordering is missing. The integrated plan keeps A's repair and stop rule, moves the tests into Batch 1, adds result isolation and a minimal README correction in Batch 2, and adds one new test-design finding. No blocking user question; three planner-owned choices are recorded. Not re-checked: the peer's recorded output digests.",
+  "target": "draft-A",
+  "unresolved_questions": [
+    {
+      "blocking": false,
+      "decision_owner": "PLANNER",
+      "evidence_ids": [
+        "B-E4",
+        "B-E14",
+        "B-E8"
+      ],
+      "id": "B-Q1",
+      "options": [
+        "Deep copy result in snapshot, outside the lock (chosen)",
+        "Keep top-level copy and state the interpretation",
+        "Deep copy at publish and at snapshot"
+      ],
+      "question": "Does requirement 6 require isolating the result object, or is the top-level snapshot dict copy enough?",
+      "question_kind": "DECISION_REQUIRED",
+      "rationale": "Baseline aliases a mutable result (B-E14). The plan chooses deepcopy outside the lock and states the limit: an uncopyable result makes get/cancel raise. request.md lets planners choose implementation details.",
+      "scope_id": "TARGET-001"
+    },
+    {
+      "blocking": false,
+      "decision_owner": "PLANNER",
+      "evidence_ids": [
+        "B-E1",
+        "B-E6",
+        "B-E8"
+      ],
+      "id": "B-Q2",
+      "options": [
+        "Sequence through TaskAPI plus service.join (chosen)",
+        "Add a private test-only hook in TaskService"
+      ],
+      "question": "Should the two orderings be made deterministic by sequencing through existing calls, or by a private seam in _run?",
+      "question_kind": "DECISION_REQUIRED",
+      "rationale": "No hook exists between operation return and lock acquisition. Sequencing needs no production change but does not exercise live contention; the plan chooses sequencing, as draft A does.",
+      "scope_id": "TARGET-001"
+    },
+    {
+      "blocking": false,
+      "decision_owner": "PLANNER",
+      "evidence_ids": [
+        "B-E9"
+      ],
+      "id": "B-Q3",
+      "options": [
+        "Minimal README update in Batch 2 (chosen)",
+        "Leave README unchanged"
+      ],
+      "question": "Should the README 'Seeded baseline' wording be corrected in Batch 2?",
+      "question_kind": "DECISION_REQUIRED",
+      "rationale": "Lines 14-16 become false after the fix. The plan chooses a minimal rewording of those statements only; leaving the README untouched is the strict-minimal alternative.",
+      "scope_id": "TARGET-001"
+    }
+  ],
+  "verdict": "FAIL"
+}

@@ -1,0 +1,12 @@
+{
+  "status": "FINALIZED",
+  "finalized": true,
+  "final_sha": "7371c7d143846215402c6a935f69d56d66e09b37",
+  "target_sha": "7371c7d143846215402c6a935f69d56d66e09b37",
+  "target_branch": "main",
+  "original_worktree_clean_now": true,
+  "accepted_batches": ["B01", "B02", "FINAL"],
+  "deferred_findings": [],
+  "worktrees_removed": false,
+  "publication_performed": false
+}
